@@ -387,9 +387,9 @@ public:
 
     /// <summary>
     /// PLAN §5.3 query source: samples features from the playback's saved
-    /// pre-aim/pre-IK search snapshot (bone-LOCAL matrices) instead of the
-    /// displayed pose, so aim and foot IK never feed back into the next
-    /// frame's candidate costs. Composes with the shared sampler FK, then
+    /// pre-layer/pre-IK search snapshot (bone-LOCAL matrices) instead of the
+    /// displayed pose, so the layer and foot IK never feed back into the
+    /// next frame's candidate costs. Composes with the shared sampler FK, then
     /// runs the same feature core as the live path (no duplicated math).
     /// Falls back to SampleLivePoseWithSchema when no snapshot exists yet.
     /// </summary>

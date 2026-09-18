@@ -321,7 +321,7 @@ bool MotionMatchingSampler::ComposeModelPose(
 
     // Snapshot-copy guarantee (PLAN §16): outModelPose is resized and filled
     // element-wise — never an alias into locals/model storage — so callers
-    // may mutate locals (IK/aim writeback) without corrupting saved poses.
+    // may mutate locals (IK/layer writeback) without corrupting saved poses.
     // Row-vector FK: childLocal * parentWorld (see note above).
     outModelPose.Resize(nodeCount);
     for (int32 i = 0; i < nodeCount; i++)

@@ -34,7 +34,7 @@ bool MotionMatchingQuery::SamplePoseFeatures(
 
 // Shared feature core (PLAN §5.3 fix): bone WORLD matrices supplied by the
 // caller — either read live from the animated model or composed from the
-// playback's pre-aim/pre-IK search snapshot. One definition, no copies:
+// playback's pre-layer/pre-IK search snapshot. One definition, no copies:
 // mirror the baker exactly (world * rootInverse, translation = root-relative
 // position in the root frame; backward velocity; schema-axis contacts via
 // metadata offsets). Missing optional upper-body nodes sample zeros (same

@@ -106,9 +106,9 @@ public class MotionMatchingController : Script
     [EditorOrder(45), EditorDisplay("Playback"), Tooltip("Enable foot IK (locks engage only while moving/turning).")]
     public bool EnableFootIK = true;
 
-    // NOTE: overlay decisions (aim pitch, head visibility, FP gating) live
+    // NOTE: layer decisions (procedural angle, bone gate) live
     // in the input provider now (P4/P6). The shell forwards its decided
-    // AimPitchDeg/HideHead verbatim; see MotionMatchingFrameInput.
+    // LayerAngleDeg/GateBone verbatim; see MotionMatchingFrameInput.
 
     // Switch penalty added to any different-clip winner (continuity block).
     // Rev-3 cost units (N1b shrank dissimilarity ~100x): 0.0025 restores the
@@ -317,16 +317,16 @@ public class MotionMatchingController : Script
     public int JumpCount;
 
     [EditorOrder(91), EditorDisplay("Telemetry"), ReadOnly]
-    public float AimPitch;
+    public float LayerAngle;
 
     [EditorOrder(92), EditorDisplay("Telemetry"), ReadOnly]
-    public float AimSpine;
+    public float LayerPrimary;
 
     [EditorOrder(93), EditorDisplay("Telemetry"), ReadOnly]
-    public float AimHead;
+    public float LayerSecondary;
 
     [EditorOrder(93), EditorDisplay("Telemetry"), ReadOnly]
-    public bool HeadHidden;
+    public bool LayerGateApplied;
 
     [EditorOrder(94), EditorDisplay("Telemetry"), ReadOnly]
     public bool FootLockL;
@@ -470,8 +470,8 @@ public class MotionMatchingController : Script
             CurrentYaw = input.CurrentYaw,
             IsGrounded = input.IsGrounded,
             IsSprinting = input.IsSprinting,
-            AimPitchDeg = input.AimPitchDeg,
-            HideHead = input.HideHead,
+            LayerAngleDeg = input.LayerAngleDeg,
+            GateBone = input.GateBone,
             ScopeConstrained = input.HasScope,
             AllowedTagSet = input.AllowedTagSet ?? string.Empty,
             ExcludedTagSet = input.ExcludedTagSet ?? string.Empty,
@@ -561,10 +561,10 @@ public class MotionMatchingController : Script
         SettleCount = _policy.SettleCount;
         RecoveryCount = _policy.RecoveryCount;
         JumpCount = _policy.JumpCount;
-        AimPitch = _policy.LastAimRequested;
-        AimSpine = _policy.LastAimSpine;
-        AimHead = _policy.LastAimHead;
-        HeadHidden = _policy.LastHeadHidden;
+        LayerAngle = _policy.LastLayerRequested;
+        LayerPrimary = _policy.LastLayerPrimary;
+        LayerSecondary = _policy.LastLayerSecondary;
+        LayerGateApplied = _policy.LastLayerGateApplied;
         FootLockL = _policy.LastFootLockL;
         FootLockR = _policy.LastFootLockR;
         FootCorrL = _policy.LastFootCorrL;

@@ -32,13 +32,13 @@ struct MOTIONMATCHING_API MotionMatchingPlayerSnapshot
     API_FIELD() bool IsGrounded = false;
     API_FIELD() bool IsSprinting = false;
     /// <summary>
-    /// Provider-decided procedural overlay inputs (degrees + head visibility).
-    /// Computed game-side (camera, locomotion and FP rules live outside the
-    /// core); playback forwards them to the overlay function verbatim. The
-    /// core never sees camera state.
+    /// Provider-decided procedural layer inputs (angle degrees + bone gate).
+    /// Computed host-side (all layer/gate rules live outside the core);
+    /// playback forwards them to the overlay function verbatim. The
+    /// core never sees host state.
     /// </summary>
-    API_FIELD() float AimPitchDeg = 0.0f;
-    API_FIELD() bool HideHead = false;
+    API_FIELD() float LayerAngleDeg = 0.0f;
+    API_FIELD() bool GateBone = false;
 
     /// <summary>
     /// True = the C# provider owns this query's scope decision (editable
@@ -180,10 +180,10 @@ public:
     API_FIELD() String ChooserStatusText;
     API_FIELD() bool TurnDriveActive = false;
     API_FIELD() float TurnDriveYaw = 0.0f;
-    API_FIELD() float LastAimRequested = 0.0f;
-    API_FIELD() float LastAimSpine = 0.0f;
-    API_FIELD() float LastAimHead = 0.0f;
-    API_FIELD() bool LastHeadHidden = false;
+    API_FIELD() float LastLayerRequested = 0.0f;
+    API_FIELD() float LastLayerPrimary = 0.0f;
+    API_FIELD() float LastLayerSecondary = 0.0f;
+    API_FIELD() bool LastLayerGateApplied = false;
     API_FIELD() bool LastFootLockL = false;
     API_FIELD() bool LastFootLockR = false;
     API_FIELD() float LastFootWeightL = 0.0f;

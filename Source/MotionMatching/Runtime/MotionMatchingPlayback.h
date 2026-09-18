@@ -31,21 +31,23 @@ enum class LockState
 /// Generic per-tick pose overlay seam (keeps non-MM processing OUT of the
 /// motion-matching folder): after inertial decay + search-pose save, before
 /// FK compose, playback hands the bone-LOCAL pose to the overlay function
-/// (e.g. the first-person aim/head-hide in Source/Game/Player, wired via
+/// (e.g. the host-side two-bone layer in Source/Game/Player, wired via
 /// its static AttachTo). The overlay owns all of its math; playback only
 /// mirrors the reported telemetry. Plain function pointer (no inheritance)
 /// so neither side constrains the other's scripting shape.
+/// The seam is a two-bone procedural layer (angle split primary/secondary)
+/// + single-bone scale gate, semantics decided host-side.
 /// </summary>
 typedef void (*MotionMatchingPoseOverlayFn)(
     Matrix* locals,
     int32 boneCount,
     const NodeIndices& nodes,
-    float overlayPitchDeg,
-    float spineShare,
-    bool hideHead,
-    float& outSpineDeg,
-    float& outHeadDeg,
-    bool& outHeadHidden,
+    float layerAngleDeg,
+    float splitShare,
+    bool gateBone,
+    float& outPrimaryDeg,
+    float& outSecondaryDeg,
+    bool& outGateApplied,
     void* userData);
 
 /// <summary>
@@ -98,21 +100,22 @@ public:
     API_PROPERTY() bool GetInertialActive() const;
 
     // Procedural overlay INPUTS (overlay seam — the bone math lives in the
-    // overlay impl, playback only feeds + mirrors telemetry). Pitch bends
-    // spine + head in bone-LOCAL space after root-strip and blend, before
-    // FK compose. Yaw is intentionally skipped: turn-drive owns facing.
-    // Values arrive decided (the provider owns camera/locomotion rules);
+    // overlay impl, playback only feeds + mirrors telemetry). The layer
+    // angle bends the primary + secondary bones in bone-LOCAL space after
+    // root-strip and blend, before FK compose. Yaw is intentionally
+    // skipped: turn-drive owns facing.
+    // Values arrive decided (host-side rules live outside the core);
     // playback clamps + forwards, never interprets.
-    API_FIELD() float OverlayPitchDeg = 0.0f;
-    API_FIELD() float OverlayClampDeg = 60.0f;
-    API_FIELD() float OverlaySpineShare = 0.5f;
+    API_FIELD() float LayerAngleDeg = 0.0f;
+    API_FIELD() float LayerClampDeg = 60.0f;
+    API_FIELD() float LayerSplitShare = 0.5f;
     // Last tick's applied angles (degrees, telemetry only).
-    API_FIELD() float LastAimRequested = 0.0f;
-    API_FIELD() float LastAimSpine = 0.0f;
-    API_FIELD() float LastAimHead = 0.0f;
-    // Head-hide input + mirror (overlay-owned math, see seam above).
-    API_FIELD() bool HideHead = false;
-    API_FIELD() bool LastHeadHidden = false;
+    API_FIELD() float LastLayerRequested = 0.0f;
+    API_FIELD() float LastLayerPrimary = 0.0f;
+    API_FIELD() float LastLayerSecondary = 0.0f;
+    // Bone-gate input + mirror (overlay-owned math, see seam above).
+    API_FIELD() bool GateBone = false;
+    API_FIELD() bool LastLayerGateApplied = false;
 
     // Wave C foot IK (legs only, playback-output-only, never search).
     // OWNERSHIP (P5): the solver + lock state machine below are CORE-OWNED
@@ -171,7 +174,7 @@ public:
     API_FIELD() int64 SampleFrameId = -1;
     API_FIELD() int64 SearchFrameId = -1;
     API_FIELD() int64 SaveSearchPoseFrameId = -1;
-    API_FIELD() int64 ApplyAimFrameId = -1;
+    API_FIELD() int64 ApplyLayerFrameId = -1;
     API_FIELD() int64 ApplyIKFrameId = -1;
 
 public:
@@ -206,9 +209,9 @@ private:
     float _playRate = 1.0f;
     float _playRateBefore = 1.0f;
 
-    int32 _aimSpineIndex = -1;
-    int32 _aimHeadIndex = -1;
-    bool _aimLogged = false;
+    int32 _layerPrimaryIndex = -1;
+    int32 _layerSecondaryIndex = -1;
+    bool _layerLogged = false;
 
     Float3 _rootUpAxis = Float3(0.0f, 0.0f, -1.0f);
     Float3 _controllerUpAxis = Float3(0.0f, 0.0f, -1.0f);

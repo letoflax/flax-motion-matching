@@ -136,9 +136,9 @@ void MotionMatchingPlayback::Setup(
     _fallbackModel = fallbackModel;
     _controllerUpAxis = controllerUpAxis;
     _rootNodeIndex = -1;
-    _aimSpineIndex = -1;
-    _aimHeadIndex = -1;
-    _aimLogged = false;
+    _layerPrimaryIndex = -1;
+    _layerSecondaryIndex = -1;
+    _layerLogged = false;
     _clips.Clear();
     _lengths.Clear();
     _loops.Clear();
@@ -165,8 +165,8 @@ void MotionMatchingPlayback::Setup(
         _rootNodeIndex = nodes.Root;
         // Optional upper-body nodes: missing (-1) bones are skipped per
         // bone (share dropped, not redistributed), never a setup failure.
-        _aimSpineIndex = nodes.Spine;
-        _aimHeadIndex = nodes.Head;
+        _layerPrimaryIndex = nodes.Spine;
+        _layerSecondaryIndex = nodes.Head;
         // Wave C legs: feet come from the same resolve; thigh/calf are
         // found by walking UP from each foot via the parent table
         // (no bone-name guesses, no C++ change needed).
@@ -175,7 +175,7 @@ void MotionMatchingPlayback::Setup(
         _legsResolved = false;
         _legsResolveFailed = false;
         LOG(Info, "Motion matching overlay: spine node={} head node={} (clamp=+-{:.0f}deg split={:.2f}/{:.2f}).",
-            _aimSpineIndex, _aimHeadIndex, (double)OverlayClampDeg, (double)OverlaySpineShare, (double)(1.0f - OverlaySpineShare));
+            _layerPrimaryIndex, _layerSecondaryIndex, (double)LayerClampDeg, (double)LayerSplitShare, (double)(1.0f - LayerSplitShare));
     }
     else if (resolveModel != nullptr)
     {
@@ -256,18 +256,18 @@ void MotionMatchingPlayback::Stop()
     SampleFrameId = -1;
     SearchFrameId = -1;
     SaveSearchPoseFrameId = -1;
-    ApplyAimFrameId = -1;
+    ApplyLayerFrameId = -1;
     ApplyIKFrameId = -1;
     _orderWarned = false;
     _poleWarned = false;
     _scaleWarned = false;
     ClearInertial();
-    OverlayPitchDeg = 0.0f;
-    LastAimRequested = 0.0f;
-    LastAimSpine = 0.0f;
-    LastAimHead = 0.0f;
-    HideHead = false;
-    LastHeadHidden = false;
+    LayerAngleDeg = 0.0f;
+    LastLayerRequested = 0.0f;
+    LastLayerPrimary = 0.0f;
+    LastLayerSecondary = 0.0f;
+    GateBone = false;
+    LastLayerGateApplied = false;
     // Wave C / PLAN §5.1: release pins and reset foot-lock state machines to Free.
     ResetFootLock();
 }
@@ -446,12 +446,12 @@ void MotionMatchingPlayback::SetPoseOverlay(MotionMatchingPoseOverlayFn fn, void
 
 void MotionMatchingPlayback::AssertTickOrder()
 {
-    // Intra-tick invariant: sample -> save -> aim -> IK, all stamped with
+    // Intra-tick invariant: sample -> save -> layer -> IK, all stamped with
     // the same _tickFrameId. Search ordering is checked only when the
     // policy wired NotifySearchExecuted for this tick.
     bool ok = SampleFrameId == _tickFrameId &&
         SaveSearchPoseFrameId == _tickFrameId &&
-        ApplyAimFrameId == _tickFrameId &&
+        ApplyLayerFrameId == _tickFrameId &&
         ApplyIKFrameId == _tickFrameId;
     if (SearchFrameId == _tickFrameId || SearchFrameId == -1)
     {
@@ -465,8 +465,8 @@ void MotionMatchingPlayback::AssertTickOrder()
     if (!ok && !_orderWarned)
     {
         _orderWarned = true;
-        LOG(Warning, "Motion matching tick order violated: tick={} sample={} search={} save={} aim={} ik={}. Expected sample<=search<=save<aim<IK.",
-            _tickFrameId, SampleFrameId, SearchFrameId, SaveSearchPoseFrameId, ApplyAimFrameId, ApplyIKFrameId);
+        LOG(Warning, "Motion matching tick order violated: tick={} sample={} search={} save={} layer={} ik={}. Expected sample<=search<=save<layer<IK.",
+            _tickFrameId, SampleFrameId, SearchFrameId, SaveSearchPoseFrameId, ApplyLayerFrameId, ApplyIKFrameId);
     }
 }
 
@@ -565,34 +565,34 @@ void MotionMatchingPlayback::Tick(float deltaTime, AnimatedModel* body, bool gro
     for (int32 i = 0; i < blendedLocals.Count(); i++)
         _searchLocals[i] = blendedLocals[i];
     SaveSearchPoseFrameId = _tickFrameId;
-    // Overlay (Player-owned procedural layer): LOCAL-space layer on top of
+    // Overlay (host-owned procedural layer): LOCAL-space layer on top of
     // the stripped+blended pose, before FK. Mutating in place is safe:
     // blendedLocals is a fresh array every tick (sampled or stripped this
     // frame), never the blend snapshot.
     {
-        const float clamp = MaxF(OverlayClampDeg, 0.0f);
-        const float requested = ClampF(OverlayPitchDeg, -clamp, clamp);
-        float spine = 0.0f;
-        float head = 0.0f;
-        bool headHidden = false;
+        const float clamp = MaxF(LayerClampDeg, 0.0f);
+        const float requested = ClampF(LayerAngleDeg, -clamp, clamp);
+        float primary = 0.0f;
+        float secondary = 0.0f;
+        bool gateApplied = false;
         if (_overlayFn != nullptr)
         {
             NodeIndices overlayNodes;
             overlayNodes.Root = _rootNodeIndex;
-            overlayNodes.Spine = _aimSpineIndex;
-            overlayNodes.Head = _aimHeadIndex;
+            overlayNodes.Spine = _layerPrimaryIndex;
+            overlayNodes.Head = _layerSecondaryIndex;
             overlayNodes.LeftFoot = _footLIndex;
             overlayNodes.RightFoot = _footRIndex;
             _overlayFn(blendedLocals.Get(), blendedLocals.Count(), overlayNodes,
-                requested, ClampF(OverlaySpineShare, 0.0f, 1.0f), HideHead,
-                spine, head, headHidden, _overlayUser);
+                requested, ClampF(LayerSplitShare, 0.0f, 1.0f), GateBone,
+                primary, secondary, gateApplied, _overlayUser);
         }
-        LastAimRequested = requested;
-        LastAimSpine = spine;
-        LastAimHead = head;
-        LastHeadHidden = headHidden;
+        LastLayerRequested = requested;
+        LastLayerPrimary = primary;
+        LastLayerSecondary = secondary;
+        LastLayerGateApplied = gateApplied;
     }
-    ApplyAimFrameId = _tickFrameId;
+    ApplyLayerFrameId = _tickFrameId;
 
     Array<Matrix> pose;
     String composeError;

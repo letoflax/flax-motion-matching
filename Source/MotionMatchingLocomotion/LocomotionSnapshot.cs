@@ -5,10 +5,9 @@ namespace MotionMatching;
 /// <summary>
 /// Neutral per-frame movement snapshot for <see cref="DefaultLocomotionProvider"/>.
 /// Plain data, no logic, no player types: any host (player rig, cutscene,
-/// test driver) fills this from its own state. Overlay authorship stays
-/// generic — <see cref="LookPitchDeg"/> and <see cref="RequestHeadHide"/>
-/// are decided host-side (e.g. by a first-person adapter), never derived
-/// from camera objects in here.
+/// test driver) fills this from its own state. Layer authorship stays
+/// generic — <see cref="LayerAngleDeg"/> and <see cref="RequestBoneGate"/>
+/// are decided host-side, never derived from host objects in here.
 /// </summary>
 [System.Serializable]
 public struct LocomotionSnapshot
@@ -23,6 +22,6 @@ public struct LocomotionSnapshot
     public bool IsSprinting;
     public float PositionHalflife;
     public float FacingHalflife;
-    public float LookPitchDeg;
-    public bool RequestHeadHide;
+    public float LayerAngleDeg;
+    public bool RequestBoneGate;
 }

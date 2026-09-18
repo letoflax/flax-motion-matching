@@ -741,12 +741,12 @@ void MotionMatchingRuntimePolicy::Tick(
     // Sample the live pose EVERY tick. Velocity = (pos - prev) / frameDt,
     // so the time basis always matches the sampling rate. Seeding happens
     // only after a successful sample (zero-velocity first frame).
-    // PLAN Ã‚Â§5.3 source: prefer the playback's pre-aim/pre-IK search
-    // snapshot over the displayed pose, so aim and foot IK never feed
+    // PLAN Ã‚Â§5.3 source: prefer the playback's pre-layer/pre-IK search
+    // snapshot over the displayed pose, so the layer and foot IK never feed
     // back into the next frame's candidate costs. Legacy displayed-pose
     // sampling stays as the fallback (no snapshot before the first
     // playback tick). A source switch reseeds velocities (one
-    // zero-velocity frame) because the two poses differ by aim/IK.
+    // zero-velocity frame) because the two poses differ by layer/IK.
     bool justSeeded = false;
     const Array<Matrix> searchLocals = _playback->GetSearchLocals();
     const bool haveSnapshot = searchLocals.Count() > 0;
@@ -932,17 +932,17 @@ void MotionMatchingRuntimePolicy::Tick(
         TryFastPath(frameDt);
     }
 
-    // Overlay feed (playback-only, never search): pitch + head visibility
-    // were decided game-side by the provider (camera, locomotion and FP
-    // rules live outside the core) and are forwarded verbatim AFTER this
+    // Overlay feed (playback-only, never search): the layer angle + bone
+    // gate were decided host-side by the provider (all layer/gate rules
+    // live outside the core) and are forwarded verbatim AFTER this
     // frame's live pose was already sampled above,
     // pose was already sampled above, so it cannot affect THIS frame's
-    // costs Ã¢â‚¬â€ only the next frame's search pose (the measured pollution
+    // costs — only the next frame's search pose (the measured pollution
     // path; suite decides the gate). Yaw stays untouched (turn-drive owns
     // facing).
     {
-        _playback->OverlayPitchDeg = state.AimPitchDeg;
-        _playback->HideHead = state.HideHead;
+        _playback->LayerAngleDeg = state.LayerAngleDeg;
+        _playback->GateBone = state.GateBone;
     }
 
     // Wave C motion gate: foot lock at rest adds pose cost for zero
@@ -958,7 +958,7 @@ void MotionMatchingRuntimePolicy::Tick(
         _playback->SetPlayRate(SelectPlayRate());
     }
     // Ã‚Â§18.9: stamp this tick's search decision on playback before it
-    // asserts intra-tick ordering (sample <= search <= save < aim < IK).
+    // asserts intra-tick ordering (sample <= search <= save < layer < IK).
     NotifySearch();
     _playback->Tick(frameDt, _body, state.IsGrounded);
     // Keep the search stamp mirror in lockstep with playback's tick
@@ -972,11 +972,11 @@ void MotionMatchingRuntimePolicy::Tick(
     }
     // Turn-drive follows the fresh clip yaw (committed turn steers facing).
     AdvanceTurnDrive();
-    // Wave B aim snapshot for telemetry (applied inside playback above).
-    LastAimRequested = _playback->LastAimRequested;
-    LastAimSpine = _playback->LastAimSpine;
-    LastAimHead = _playback->LastAimHead;
-    LastHeadHidden = _playback->LastHeadHidden;
+    // Layer snapshot for telemetry (applied inside playback above).
+    LastLayerRequested = _playback->LastLayerRequested;
+    LastLayerPrimary = _playback->LastLayerPrimary;
+    LastLayerSecondary = _playback->LastLayerSecondary;
+    LastLayerGateApplied = _playback->LastLayerGateApplied;
     // Wave C foot IK snapshot (playback-output-only, informational).
     LastFootLockL = _playback->LastFootLockL;
     LastFootLockR = _playback->LastFootLockR;
@@ -2738,12 +2738,12 @@ void MotionMatchingRuntimePolicy::LogTelemetryLine(float speed, float yawRate, c
         (_playback != nullptr && _playback->IsAtEnd) ? 1 : 0,
         (double)actorPos.X, (double)actorPos.Y, (double)actorPos.Z,
         (double)Float2(_snapshot.DesiredVelocity.X, _snapshot.DesiredVelocity.Z).Length(),
-        // Wave B aim (playback-only: informational, never a search input).
-        // Values are the previous frame's applied angles (this frame's aim
+        // Layer (playback-only: informational, never a search input).
+        // Values are the previous frame's applied angles (this frame's layer
         // bends bones after the query above already ran).
-        (double)(_playback != nullptr ? _playback->LastAimRequested : 0.0f),
-        (double)(_playback != nullptr ? _playback->LastAimSpine : 0.0f),
-        (double)(_playback != nullptr ? _playback->LastAimHead : 0.0f),
+        (double)(_playback != nullptr ? _playback->LastLayerRequested : 0.0f),
+        (double)(_playback != nullptr ? _playback->LastLayerPrimary : 0.0f),
+        (double)(_playback != nullptr ? _playback->LastLayerSecondary : 0.0f),
         // Wave C foot IK (playback-output-only: lock weights 0..1,
         // corrections in units/cm, raw lock gates 0/1).
         (double)(_playback != nullptr ? _playback->LastFootWeightL : 0.0f),

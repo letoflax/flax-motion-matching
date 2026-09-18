@@ -107,7 +107,7 @@ public:
     /// ComposeModelPose for the final actor-space pose expected by
     /// AnimatedModel.SetCurrentPose(worldSpace: false).
     /// C2 contract: the output array is a FRESH snapshot copy every call —
-    /// never an alias into baker/clip storage — so playback-side IK/aim may
+    /// never an alias into baker/clip storage — so playback-side IK/layer may
     /// mutate it in place while the saved search snapshot stays intact
     /// (PLAN §16). Row-vector convention: ComposeModelPose builds
     /// childLocal * parentWorld (parent on the RIGHT).

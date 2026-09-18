@@ -100,11 +100,11 @@ public struct MotionMatchingFrameInput
     public float LateralThreshold;
     public float LateralZRatio;
 
-    // 5. Overlay inputs, decided game-side (P4/P6): procedural pitch for the
-    // overlay layer + head visibility. The core forwards them verbatim and
-    // never sees camera state.
-    public float AimPitchDeg;
-    public bool HideHead;
+    // 5. Layer inputs, decided host-side (P4/P6): procedural angle for the
+    // two-bone layer + single-bone scale gate. The core forwards them
+    // verbatim and never interprets host state.
+    public float LayerAngleDeg;
+    public bool GateBone;
 
     // 6. Driver ownership (P2/P3): this provider enables the core's
     // airborne-transition machine and standing-turn machine. False = pure

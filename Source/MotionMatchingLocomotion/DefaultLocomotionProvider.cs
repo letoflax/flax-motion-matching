@@ -73,17 +73,17 @@ public class DefaultLocomotionProvider : Script, IMotionMatchingInputProvider
     [EditorOrder(5), EditorDisplay("MM Input")]
     public float LateralZRatio = 0.58f;
 
-    [EditorOrder(6), EditorDisplay("MM Input"), Tooltip("Feed look pitch into the procedural overlay layer (spine + head lean).")]
-    public bool EnableAim = true;
+    [EditorOrder(6), EditorDisplay("MM Input"), Tooltip("Feed the host angle into the procedural layer (split primary/secondary).")]
+    public bool EnablePoseLayer = true;
 
-    [EditorOrder(6), EditorDisplay("MM Input"), Tooltip("When true, feed zero pitch above rest speed x multiplier (baked clips have neutral arms).")]
-    public bool AimLowSpeedOnly = false;
+    [EditorOrder(6), EditorDisplay("MM Input"), Tooltip("When true, feed zero angle above rest speed x multiplier (baked clips have neutral arms).")]
+    public bool LayerLowSpeedOnly = false;
 
     [EditorOrder(6), EditorDisplay("MM Input")]
-    public float AimSpeedGateMult = 2.0f;
+    public float LayerSpeedGateMult = 2.0f;
 
-    [EditorOrder(6), EditorDisplay("MM Input"), Tooltip("Honor the snapshot's head-hide request (set host-side, e.g. first person).")]
-    public bool EnableHeadHide = true;
+    [EditorOrder(6), EditorDisplay("MM Input"), Tooltip("Honor the snapshot's bone-gate request (set host-side).")]
+    public bool EnableBoneGate = true;
 
     [EditorOrder(7), EditorDisplay("MM Input"), Tooltip("Run the core airborne-transition machine (takeoff/flight/landing direct-play). Off = pure search while airborne.")]
     public bool EnableJumpDriver = true;
@@ -151,20 +151,20 @@ public class DefaultLocomotionProvider : Script, IMotionMatchingInputProvider
         frame.CurrentYaw = _snap.CurrentYaw;
         frame.IsGrounded = _snap.IsGrounded;
         frame.IsSprinting = _snap.IsSprinting;
-        // Overlay inputs decided here: host-authored look pitch with the
-        // low-speed pollution gate, plus the host's head-hide request. The
-        // core forwards both verbatim and never sees camera state.
-        float aim = EnableAim ? _snap.LookPitchDeg : 0.0f;
-        if (AimLowSpeedOnly)
+        // Layer inputs decided here: host-authored angle with the
+        // low-speed gate, plus the host's bone-gate request. The
+        // core forwards both verbatim and never interprets host state.
+        float layerAngle = EnablePoseLayer ? _snap.LayerAngleDeg : 0.0f;
+        if (LayerLowSpeedOnly)
         {
             float planar = (float)Math.Sqrt(
                 _snap.CurrentVelocity.X * _snap.CurrentVelocity.X +
                 _snap.CurrentVelocity.Z * _snap.CurrentVelocity.Z);
-            if (planar >= IdleSpeedMax * AimSpeedGateMult)
-                aim = 0.0f;
+            if (planar >= IdleSpeedMax * LayerSpeedGateMult)
+                layerAngle = 0.0f;
         }
-        frame.AimPitchDeg = aim;
-        frame.HideHead = EnableHeadHide && _snap.RequestHeadHide;
+        frame.LayerAngleDeg = layerAngle;
+        frame.GateBone = EnableBoneGate && _snap.RequestBoneGate;
         frame.Points = _points;
         // This provider always owns the scope decision, even when it
         // resolves empty: empty = explicit no-match, never a silent
