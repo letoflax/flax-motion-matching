@@ -1,0 +1,580 @@
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using FlaxEditor;
+using FlaxEngine;
+using FlaxEngine.Json;
+
+namespace MotionMatching;
+
+/// <summary>
+/// One registry entry in the portable clips JSON
+/// (Content/MotionMatching/DefaultClips.json). Paths are Content-relative
+/// (e.g. "Animations/Humanoid/Run_Turn_L_090_Lfoot.flax"). Missing tags/loop
+/// fall back to InferTags/InferLoop at import.
+/// </summary>
+public class RegistryClipEntry
+{
+    public string path;
+    public string[] tags;
+    public bool loop;
+}
+
+/// <summary>
+/// Portable clip registry root object.
+/// </summary>
+public class ClipRegistryFile
+{
+    public int version = 1;
+    public RegistryClipEntry[] clips = Array.Empty<RegistryClipEntry>();
+}
+
+/// <summary>
+/// Editor operations for <see cref="MotionMatchingController"/>.
+///
+/// Split out of the runtime shell on purpose: C# partial classes cannot span
+/// assemblies, so editor work lives in this static service inside the
+/// MotionMatchingEditor module and only touches the controller through its
+/// public runtime API (plus the public <c>DatabaseFile</c> path). The
+/// runtime module never references this file.
+/// </summary>
+public static class MotionMatchingEditorService
+{
+    public static void AddClips(MotionMatchingController controller, string[] tags, Animation[] clips, bool loop = true)
+    {
+        if (controller == null)
+            return;
+        if (tags == null || tags.Length == 0 || clips == null || clips.Length == 0)
+            return;
+
+        if (MotionMatchingDatabase.AddClips(controller.DatabaseFile, tags, clips, loop))
+            ReloadDatabase(controller, true);
+    }
+
+    public static void AddClipFiles(MotionMatchingController controller, string[] tags, string[] paths, bool loop = true)
+    {
+        if (controller == null)
+            return;
+        if (tags == null || tags.Length == 0 || paths == null || paths.Length == 0)
+            return;
+
+        if (MotionMatchingDatabase.AddClipFiles(
+                controller.DatabaseFile, tags, paths, loop, out int addedCount))
+        {
+            Debug.Log($"Registered {addedCount} motion matching clips for '{string.Join("+", tags)}'.");
+            ReloadDatabase(controller, true);
+        }
+    }
+
+    public static void ClearAllAnimationClips(MotionMatchingController controller)
+    {
+        if (controller == null)
+            return;
+        if (MotionMatchingDatabase.ClearClips(controller.DatabaseFile))
+            ReloadDatabase(controller, true);
+    }
+
+    /// <summary>
+    /// Default shipped registry (replaces the Rebuild All button): import
+    /// this to restore the full clip set, then bake.
+    /// </summary>
+    public static string DefaultRegistryPath()
+    {
+        return Path.Combine(Globals.ProjectContentFolder, "MotionMatching", "DefaultClips.json");
+    }
+
+    private static string ToContentRelative(string path)
+    {
+        if (string.IsNullOrEmpty(path))
+            return path;
+        string full = path.Replace('/', Path.DirectorySeparatorChar);
+        string root = (Globals.ProjectContentFolder ?? string.Empty)
+            .Replace('/', Path.DirectorySeparatorChar)
+            .TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+        if (!string.IsNullOrEmpty(root) && full.StartsWith(root, StringComparison.OrdinalIgnoreCase))
+            full = full.Substring(root.Length);
+        return full.TrimStart(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar)
+            .Replace(Path.DirectorySeparatorChar, '/');
+    }
+
+    private static string FromContentRelative(string path)
+    {
+        if (string.IsNullOrEmpty(path))
+            return path;
+        string rel = path.Replace('/', Path.DirectorySeparatorChar)
+            .TrimStart(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+        if (Path.IsPathRooted(rel))
+            return rel;
+        return Path.Combine(Globals.ProjectContentFolder, rel);
+    }
+
+    /// <summary>
+    /// Exports the current registry to JSON. Returns a summary or an error.
+    /// </summary>
+    public static string ExportClipRegistry(MotionMatchingController controller, string path)
+    {
+        try
+        {
+            if (controller == null)
+                return "Export failed: no controller.";
+            var clips = GetRegisteredClips(controller) ?? Array.Empty<RegisteredClip>();
+            var entries = new List<RegistryClipEntry>();
+            foreach (var clip in clips.OrderBy(c => GetRegisteredClipName(c)))
+            {
+                string assetPath = clip.Clip != null ? clip.Clip.Path : null;
+                if (string.IsNullOrEmpty(assetPath))
+                    continue;
+                entries.Add(new RegistryClipEntry
+                {
+                    path = ToContentRelative(assetPath),
+                    tags = (clip.Tag ?? string.Empty).Split('+'),
+                    loop = clip.Loop,
+                });
+            }
+            var root = new ClipRegistryFile { version = 1, clips = entries.ToArray() };
+            File.WriteAllText(path, JsonSerializer.Serialize(root, true));
+            return $"Exported {entries.Count} clips to '{path}'.";
+        }
+        catch (Exception ex)
+        {
+            return "Export failed: " + ex.Message;
+        }
+    }
+
+    /// <summary>
+    /// Imports a registry JSON, REPLACING the whole registry (clear first —
+    /// replace-all has fewer failure modes than merge). Entries missing tags
+    /// or loop fall back to InferTags/InferLoop. Returns a summary or error.
+    /// </summary>
+    public static string ImportClipRegistry(MotionMatchingController controller, string path)
+    {
+        try
+        {
+            if (controller == null)
+                return "Import failed: no controller.";
+            if (!File.Exists(path))
+                return $"Import failed: file not found '{path}'.";
+            var root = JsonSerializer.Deserialize<ClipRegistryFile>(File.ReadAllText(path));
+            if (root == null || root.clips == null || root.clips.Length == 0)
+                return $"Import failed: no clips in '{path}'.";
+            if (!EnsureDatabaseLoaded(controller) || !controller.Database)
+                return "Import failed: database is not loaded.";
+
+            var groups = new Dictionary<string, List<string>>();
+            int skipped = 0;
+            foreach (var entry in root.clips)
+            {
+                if (entry == null || string.IsNullOrWhiteSpace(entry.path))
+                {
+                    skipped++;
+                    continue;
+                }
+                string full = FromContentRelative(entry.path.Trim());
+                if (!File.Exists(full))
+                {
+                    skipped++;
+                    continue;
+                }
+                string[] tags = (entry.tags == null || entry.tags.Length == 0)
+                    ? MotionMatchingAutoSetup.InferTags(full)
+                    : entry.tags;
+                var clean = new List<string>();
+                foreach (string tag in tags)
+                {
+                    if (!string.IsNullOrWhiteSpace(tag))
+                        clean.Add(tag.Trim().ToLowerInvariant());
+                }
+                if (clean.Count == 0)
+                    clean.AddRange(MotionMatchingAutoSetup.InferTags(full));
+                bool loop = entry.loop;
+                // InferLoop fallback only when the entry carries no loop info:
+                // JSON false is a real value, so trust it as authored.
+                string key = string.Join("+", clean.OrderBy(t => t, StringComparer.Ordinal)) +
+                    "|" + (loop ? "loop" : "once");
+                if (!groups.TryGetValue(key, out var list))
+                {
+                    list = new List<string>();
+                    groups[key] = list;
+                }
+                list.Add(full);
+            }
+
+            ClearAllAnimationClips(controller);
+            int added = 0;
+            foreach (var pair in groups.OrderBy(p => p.Key, StringComparer.Ordinal))
+            {
+                string[] parts = pair.Key.Split('|');
+                string[] files = pair.Value.ToArray();
+                // AddClipFiles resolves content-relative or absolute paths.
+                AddClipFiles(controller, parts[0].Split('+'), files, parts[1] == "loop");
+                added += files.Length;
+            }
+            return $"Imported {added} clips in {groups.Count} groups from '{path}' (skipped {skipped}). Bake required.";
+        }
+        catch (Exception ex)
+        {
+            return "Import failed: " + ex.Message;
+        }
+    }
+
+    /// <summary>
+    /// Bake, then reload + validate, then self-test — one pipeline for the
+    /// management window. Results surface via the editor log; the return
+    /// value is a one-line summary.
+    /// </summary>
+    public static string BakeValidateAndTest(MotionMatchingController controller)
+    {
+        if (controller == null)
+            return "No controller.";
+        BakeDatabase(controller);
+        if (!controller.PersistenceValid)
+            return "Bake failed; validate and self-test skipped. See log.";
+        ValidatePersistence(controller);
+        if (!controller.PersistenceValid)
+            return "Bake ok; persistence validation failed. See log.";
+        RunSearchSelfTest(controller);
+        return $"Bake + validate ok: clips={controller.Database.AnimationClipsCount}, samples={controller.Database.SampleCount}. Self-test in log.";
+    }
+
+    /// <summary>
+    /// One registered source clip for the review UI.
+    /// </summary>
+    public struct RegisteredClip
+    {
+        public int SourceIndex;
+        public Animation Clip;
+        public string Tag;
+        public bool Loop;
+    }
+
+    public static RegisteredClip[] GetRegisteredClips(MotionMatchingController controller)
+    {
+        if (controller == null)
+            return Array.Empty<RegisteredClip>();
+        if (!EnsureDatabaseLoaded(controller) || !controller.Database)
+            return Array.Empty<RegisteredClip>();
+
+        int count = controller.Database.GetSourceClipCount();
+        var result = new RegisteredClip[count];
+        for (int i = 0; i < count; i++)
+        {
+            result[i] = new RegisteredClip
+            {
+                SourceIndex = i,
+                Clip = controller.Database.GetSourceClipAnimation(i),
+                Tag = controller.Database.GetSourceClipTag(i),
+                Loop = controller.Database.GetSourceClipLoop(i),
+            };
+        }
+        return result;
+    }
+
+    public static string GetRegisteredClipName(RegisteredClip clip)
+    {
+        string path = clip.Clip?.Path;
+        if (!string.IsNullOrEmpty(path))
+            return Path.GetFileNameWithoutExtension(path);
+        return $"#{clip.SourceIndex}";
+    }
+
+    /// <summary>
+    /// tagSet is one '+'-joined tag set ("walk+turn_travel"), split here.
+    /// </summary>
+    public static void UpdateRegisteredClip(MotionMatchingController controller, int sourceIndex, string tagSet, bool loop)
+    {
+        if (controller == null)
+            return;
+        if (string.IsNullOrWhiteSpace(tagSet))
+            return;
+        string[] tags = tagSet.Split('+');
+
+        if (MotionMatchingDatabase.UpdateSourceClip(controller.DatabaseFile, sourceIndex, tags, loop))
+            ReloadDatabase(controller, true);
+    }
+
+    public static void RemoveRegisteredClip(MotionMatchingController controller, int sourceIndex)
+    {
+        if (controller == null)
+            return;
+        if (MotionMatchingDatabase.RemoveSourceClip(controller.DatabaseFile, sourceIndex))
+            ReloadDatabase(controller, true);
+    }
+
+    /// <summary>
+    /// Commits staged table edits in a single database load/save round-trip.
+    /// </summary>
+    public static void ApplyRegisteredClipEdits(MotionMatchingController controller,
+        int[] updateIndices,
+        string[] updateTags,
+        bool[] updateLoops,
+        int[] removeIndices)
+    {
+        if (controller == null)
+            return;
+        updateIndices = updateIndices ?? Array.Empty<int>();
+        updateTags = updateTags ?? Array.Empty<string>();
+        removeIndices = removeIndices ?? Array.Empty<int>();
+        if (updateIndices.Length == 0 && removeIndices.Length == 0)
+            return;
+
+        var loops = new int[updateLoops?.Length ?? 0];
+        for (int i = 0; i < loops.Length; i++)
+            loops[i] = updateLoops[i] ? 1 : 0;
+
+        if (MotionMatchingDatabase.ApplyClipEdits(controller.DatabaseFile, updateIndices, updateTags, loops, removeIndices))
+            ReloadDatabase(controller, true);
+    }
+
+    public static void BakeDatabase(MotionMatchingController controller)
+    {
+        if (controller == null)
+            return;
+        if (!EnsureDatabaseLoaded(controller) || controller.Database.AnimationClipsCount == 0)
+        {
+            Debug.LogWarning("Motion matching bake stopped: no animation clips.");
+            return;
+        }
+
+        if (!controller.PlayerModel)
+        {
+            Debug.LogWarning("Motion matching bake stopped: PlayerModel is not set.");
+            return;
+        }
+
+        controller.PersistenceValid = MotionMatchingBaker.Bake(
+            controller.PlayerModel,
+            controller.Schema,
+            controller.Database,
+            out int clips,
+            out int samples);
+
+        if (!controller.PersistenceValid)
+        {
+            ReloadDatabase(controller, false);
+            return;
+        }
+
+        ReloadDatabase(controller, true);
+        Debug.Log($"Motion matching database ready: clips={clips}, samples={samples}.");
+    }
+
+    public static void ValidatePersistence(MotionMatchingController controller)
+    {
+        if (controller == null)
+            return;
+        controller.PersistenceValid = MotionMatchingDatabase.ValidateSavedDatabase(
+            controller.DatabaseFile, out _, out _, out _, out _, out _);
+        ReloadDatabase(controller, false);
+    }
+
+    /// <summary>
+    /// Runs the native search self-test (exact queries must return their own
+    /// sample with ~zero cost) and prints the per-probe report.
+    /// </summary>
+    public static void RunSearchSelfTest(MotionMatchingController controller)
+    {
+        if (controller == null)
+            return;
+        if (!EnsureDatabaseLoaded(controller) || !controller.Database)
+        {
+            Debug.LogWarning("Motion matching self-test stopped: database is not loaded.");
+            return;
+        }
+
+        bool passed = MotionMatchingSearch.RunSelfTest(controller.Database, out string log);
+        Debug.Log($"Motion matching search self-test {(passed ? "PASSED" : "FAILED")}:\n{log}");
+    }
+
+    // Weight presets: scene Schema weights are live tuning — never baked
+    // into features — so presets apply immediately with no rebake, even
+    // mid-play. Rebake is only needed for feature changes.
+    public static void ApplyPresetBaseline(MotionMatchingController controller)
+    {
+        if (controller == null)
+            return;
+        controller.Schema.PoseWeight = 1.0f;
+        controller.Schema.TrajectoryWeight = 2.0f;
+        MarkTuningEdited(controller, "baseline (trajectory-heavy)");
+    }
+
+    public static void ApplyPresetPosePrecision(MotionMatchingController controller)
+    {
+        if (controller == null)
+            return;
+        controller.Schema.PoseWeight = 2.5f;
+        controller.Schema.TrajectoryWeight = 1.0f;
+        MarkTuningEdited(controller, "pose-heavy precision");
+    }
+
+    public static void ApplyPresetTurnHeavy(MotionMatchingController controller)
+    {
+        if (controller == null)
+            return;
+        controller.Schema.PoseWeight = 1.0f;
+        controller.Schema.TrajectoryWeight = 3.0f;
+        MarkTuningEdited(controller, "turn-heavy");
+    }
+
+    private static void MarkTuningEdited(MotionMatchingController controller, string preset)
+    {
+        Debug.Log($"Motion matching weights preset applied: {preset} " +
+            $"(pose={controller.Schema.PoseWeight}, trajectory={controller.Schema.TrajectoryWeight}). No rebake needed.");
+        if (controller.Actor?.Scene != null)
+            Editor.Instance.Scene.MarkSceneEdited(controller.Actor.Scene);
+    }
+
+    /// <summary>
+    /// One unpacked top-N row for the tuning window.
+    /// </summary>
+    public struct MotionMatchingCandidate
+    {
+        public int SampleIndex;
+        public int ClipIndex;
+        public string ClipName;
+        public float SampleTime;
+        public float Cost;
+        public float PoseCost;
+        public float TrajectoryCost;
+        public float ContinuityCost;
+        public float LoopCost;
+        public bool IsContinuation;
+        public bool IsLoop;
+        public bool IsRecordedWinner;
+    }
+
+    // Top-N: re-runs the native ranking on the last recorded query's
+    // inputs (works paused in the editor — no play input needed).
+    public static MotionMatchingCandidate[] QueryTopCandidates(MotionMatchingController controller, int topN)
+    {
+        if (controller == null)
+            return Array.Empty<MotionMatchingCandidate>();
+        return QueryTopCandidatesFor(controller, controller.LastTraceEntry, topN);
+    }
+
+    // Same ranking for an entry loaded from a trace file (bridge/agent path):
+    // the in-memory policy trace is gone after play stops, the file remains.
+    public static MotionMatchingCandidate[] QueryTopCandidatesFor(MotionMatchingController controller, MotionMatchingTraceEntry entry, int topN)
+    {
+        var empty = Array.Empty<MotionMatchingCandidate>();
+        if (controller == null)
+            return empty;
+        if (entry.Pose == null || entry.Trajectory == null || entry.Pose.Length == 0 || entry.Trajectory.Length == 0)
+            return empty;
+        if (!EnsureDatabaseLoaded(controller) || !controller.Database)
+            return empty;
+
+        string[] tags = string.IsNullOrEmpty(entry.Tags)
+            ? Array.Empty<string>()
+            : entry.Tags.Split('+');
+        var settings = new MotionMatchingSearchSettings
+        {
+            PoseWeight = entry.PoseWeight,
+            TrajectoryWeight = entry.TrajectoryWeight,
+            ContinuityWeight = entry.ContinuityWeight,
+            MinSwitchTime = entry.MinSwitchTime,
+            CurrentTime = entry.CurrentTime,
+            SameClipExclusionWindow = entry.ExclusionWindow,
+            ExpectedTime = entry.ExpectedTime,
+            ContinuingBias = entry.ContinuingBias,
+            ContinuingWindow = entry.ContinuingWindow,
+            SwitchMargin = entry.SwitchMargin,
+            LoopPreference = entry.LoopPreference,
+            LoopFilter = (MotionLoopFilter)entry.LoopFilter,
+            ReselectClip = entry.ReselectClip,
+            ReselectSampleTime = entry.ReselectSampleTime,
+            ReselectBanWindow = entry.ReselectBanWindow,
+            TwinBanWindow = entry.TwinBanWindow,
+            LoopTailExclusion = entry.LoopTailExclusion,
+        };
+        MotionMatchingSearch.FindTopCandidates(controller.Database, entry.Pose, entry.Trajectory,
+            settings, entry.ContinuityClip, tags, topN, out float[] packed, out string error);
+        if (!string.IsNullOrEmpty(error) && (packed == null || packed.Length == 0))
+        {
+            Debug.LogWarning($"Motion matching top-N: {error}");
+            return empty;
+        }
+        if (packed == null || packed.Length == 0)
+            return empty;
+        const int stride = 10;
+        int rows = packed.Length / stride;
+        var result = new MotionMatchingCandidate[rows];
+        for (int i = 0; i < rows; i++)
+        {
+            int b = i * stride;
+            int clip = (int)packed[b + 1];
+            int sample = (int)packed[b];
+            result[i] = new MotionMatchingCandidate
+            {
+                SampleIndex = sample,
+                ClipIndex = clip,
+                ClipName = ClipDisplayName(controller, clip),
+                SampleTime = packed[b + 2],
+                Cost = packed[b + 3],
+                PoseCost = packed[b + 4],
+                TrajectoryCost = packed[b + 5],
+                ContinuityCost = packed[b + 6],
+                LoopCost = packed[b + 7],
+                IsContinuation = packed[b + 8] > 0.5f,
+                IsLoop = packed[b + 9] > 0.5f,
+                IsRecordedWinner = entry.Valid && sample == entry.SampleIndex,
+            };
+        }
+        return result;
+    }
+
+    private static string ClipDisplayName(MotionMatchingController controller, int clipIndex)
+    {
+        try
+        {
+            string path = controller.Database?.GetClipAnimation(clipIndex)?.Path;
+            if (!string.IsNullOrEmpty(path))
+                return Path.GetFileNameWithoutExtension(path);
+        }
+        catch
+        {
+        }
+        return $"#{clipIndex}";
+    }
+
+    // Trace file helpers for the tuning window (default folder: Cache/).
+    public static string TraceDefaultFolder()
+    {
+        try
+        {
+            string folder = Globals.ProjectFolder;
+            if (string.IsNullOrEmpty(folder))
+                folder = Path.GetDirectoryName(Globals.ProjectContentFolder);
+            string cache = Path.Combine(folder, "Cache");
+            if (!Directory.Exists(cache))
+                Directory.CreateDirectory(cache);
+            return cache;
+        }
+        catch
+        {
+            return Globals.ProjectContentFolder;
+        }
+    }
+
+    private static bool EnsureDatabaseLoaded(MotionMatchingController controller)
+    {
+        // Timeout 0: probe only, never block the editor thread (default is 30s).
+        return controller.Database && !controller.Database.WaitForLoaded(0) || ReloadDatabase(controller, false);
+    }
+
+    private static bool ReloadDatabase(MotionMatchingController controller, bool markSceneEdited)
+    {
+        var loaded = Content.Load<MotionMatchingDatabase>(controller.DatabaseFile);
+        if (!loaded)
+        {
+            controller.ClearDatabaseStatus();
+            return false;
+        }
+
+        controller.Database = loaded;
+        controller.RefreshDatabaseStatus();
+        if (markSceneEdited && controller.Actor?.Scene != null)
+            Editor.Instance.Scene.MarkSceneEdited(controller.Actor.Scene);
+        return true;
+    }
+}

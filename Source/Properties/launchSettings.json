@@ -1,0 +1,25 @@
+﻿{
+  "profiles": {
+    "MotionMatching": {
+      "commandName": "Executable",
+      "workingDirectory": "D:/Code/flax/flax-test",
+      "executablePath": "D:/Apps/Flax/Flax_1.12/Binaries/Editor/Win64/$(FlaxConfiguration)/FlaxEditor.exe",
+      "commandLineArgs": "-project \"D:/Code/flax/flax-test\"",
+      "nativeDebugging": false
+    },
+    "MotionMatchingEditor": {
+      "commandName": "Executable",
+      "workingDirectory": "D:/Code/flax/flax-test",
+      "executablePath": "D:/Apps/Flax/Flax_1.12/Binaries/Editor/Win64/$(FlaxConfiguration)/FlaxEditor.exe",
+      "commandLineArgs": "-project \"D:/Code/flax/flax-test\"",
+      "nativeDebugging": false
+    },
+    "MotionMatchingLocomotion": {
+      "commandName": "Executable",
+      "workingDirectory": "D:/Code/flax/flax-test",
+      "executablePath": "D:/Apps/Flax/Flax_1.12/Binaries/Editor/Win64/$(FlaxConfiguration)/FlaxEditor.exe",
+      "commandLineArgs": "-project \"D:/Code/flax/flax-test\"",
+      "nativeDebugging": false
+    }
+  }
+}
