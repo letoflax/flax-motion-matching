@@ -130,7 +130,7 @@ void MotionMatchingRuntimePolicy::Initialize(
     _body = body;
     _liveSchema = schema;
     _cacheFolder = cacheFolder;
-    _defaultInertial = defaultInertial;
+    (void)defaultInertial;
     _playback = New<MotionMatchingPlayback>();
     _trace = New<MotionMatchingTraceLog>();
     SkinnedModel* fallbackModel = nullptr;
@@ -206,26 +206,12 @@ void MotionMatchingRuntimePolicy::Initialize(
     _usedSearchSnapshot = false;
     _searchSnapshotLength = 0;
     MeasureClipMotion();
-    BuildJumpPools();
-    _jumpPhase = 0;
-    _airTicks = 0;
-    _landHoldUntil = -99.0f;
-    _inertialOverridden = false;
-    JumpCount = 0;
     _samplingReady = true;
     PolicyState = String(TEXT("Locomotion"));
     _trace->Clear();
     _lastEntry = MotionMatchingTraceEntry();
-    HoldCount = 0;
-    TurnReplayCount = 0;
-    SettleCount = 0;
-    RecoveryCount = 0;
     LastSwitchReason = String(TEXT("init"));
     ChooserStatusText = String::Empty;
-    // foot-ik branch probe: log the effective scene gate once per session
-    // (distinguishes stale-scene true from a broken IK chain downstream).
-    LOG(Info, "Motion matching foot IK gate: EnableFootIK=1 authority={:.2f} exitSpeed={:.0f} blendTime={:.2f}.",
-        (double)_playback->FootLockAuthority, (double)_playback->FootLockExitSpeed, (double)_playback->FootBlendTime);
 }
 
 void MotionMatchingRuntimePolicy::Shutdown()
@@ -247,7 +233,6 @@ void MotionMatchingRuntimePolicy::Shutdown()
     _clipTurnAngle.Clear();
     _clipNet.Clear();
     _clipTags.Clear();
-    _landImpactTime.Clear();
     PolicyState = String(TEXT("Disabled"));
 }
 
@@ -257,7 +242,6 @@ void MotionMatchingRuntimePolicy::MeasureClipMotion()
     _clipTurnAngle.Clear();
     _clipNet.Clear();
     _clipTags.Clear();
-    _landImpactTime.Clear();
     MotionMatchingDatabase* db = _database;
     if (db == nullptr || !db->IsBaked())
         return;
@@ -272,26 +256,18 @@ void MotionMatchingRuntimePolicy::MeasureClipMotion()
     _clipTravel.Resize(clipCount);
     _clipTurnAngle.Resize(clipCount);
     _clipNet.Resize(clipCount);
-    _clipYawTable.Clear();
-    _clipYawStart.Resize(clipCount);
     // Snapshot tag SETS once: every per-clip/per-frame reader below goes
     // through ClipTags() and never touches native strings again.
     _clipTags.Resize(clipCount);
     for (int32 c = 0; c < clipCount; c++)
         _clipTags[c] = db->GetClipTags(c);
     int32 cursor = 0;
-    int32 turnInPlace = 0;
-    int32 turnTraveling = 0;
-    Array<String> mismatches;
-    Array<String> yAnomaly;
     for (int32 c = 0; c < clipCount && cursor < positions.Count(); c++)
     {
         float path = 0.0f;
         float yPath = 0.0f;
         float yaw = 0.0f;
         const int32 n = c < counts.Count() ? counts[c] : 0;
-        _clipYawStart[c] = _clipYawTable.Count();
-        _clipYawTable.Add(0.0f);
         Float3 first = cursor < positions.Count() ? positions[cursor] : Float3::Zero;
         Float3 last = first;
         for (int32 i = 1; i < n && cursor + i < positions.Count() && cursor + i < forwards.Count(); i++)
@@ -318,83 +294,16 @@ void MotionMatchingRuntimePolicy::MeasureClipMotion()
                     dy += 2.0f * PiF;
                 yaw += dy;
             }
-            // Push EVERY sample (even degenerate): the table is indexed by
-            // sample position, so skipping would misalign the whole clip.
-            _clipYawTable.Add(yaw);
+            // NOTE (P2): per-sample yaw table deleted with the turn driver;
+            // clip totals above are kept for the search straightness prior.
         }
         const float net = Float2(last.X - first.X, last.Z - first.Z).Length();
         _clipTravel[c] = path;
         _clipTurnAngle[c] = yaw;
         _clipNet[c] = net;
         cursor += n;
-        // Cross-check: measured domain must agree with the turn tag split.
-        // Any mismatch here means the auto-tag rule drifted Ã¢â‚¬â€ fix the rule.
-        const Array<String>& tagSet = ClipTags(c);
-        // Role-driven (never literals): empty role matches nothing.
-        const bool hasTurnIn = !_tuning.TurnInPlaceTag.IsEmpty() && tagSet.Contains(_tuning.TurnInPlaceTag);
-        const bool hasTurnTravel = !_tuning.TurnTravelTag.IsEmpty() && tagSet.Contains(_tuning.TurnTravelTag);
-        if (hasTurnIn || hasTurnTravel)
-        {
-            const bool measuredTraveling = path >= TravelingDistance;
-            if (measuredTraveling)
-                turnTraveling++;
-            else
-                turnInPlace++;
-            // Carrying BOTH turn tags is itself a tagging contradiction.
-            const bool taggedTraveling = hasTurnTravel && !hasTurnIn;
-            const bool contradictory = hasTurnTravel && hasTurnIn;
-            if ((measuredTraveling != taggedTraveling || contradictory) && mismatches.Count() < 10)
-            {
-                char message[256];
-                const StringAnsi nameAnsi(GetClipName(c));
-                snprintf(message, sizeof(message), "%s tagged %s path=%.0f net=%.0f yaw=%.2frad",
-                    nameAnsi.GetText(), taggedTraveling ? "turn_travel" : "turn_inplace",
-                    (double)path, (double)net, (double)yaw);
-                mismatches.Add(String(message));
-            }
-        }
-        const bool isJumpClip = !_tuning.JumpTag.IsEmpty() && tagSet.Contains(_tuning.JumpTag);
-        if (yPath >= TravelingDistance && !isJumpClip && yAnomaly.Count() < 10)
-        {
-            char message[256];
-            const StringAnsi nameAnsi(GetClipName(c));
-            const StringAnsi tagAnsi(MotionMatchingDatabase::JoinTags(tagSet));
-            snprintf(message, sizeof(message), "%s tags=%s Y-path=%.0f",
-                nameAnsi.GetText(), tagAnsi.GetText(), (double)yPath);
-            yAnomaly.Add(String(message));
-        }
     }
-    {
-        char message[2048];
-        int32 offset = snprintf(message, sizeof(message),
-            "Motion matching clip audit: %d clips measured, turn in-place=%d traveling=%d (path threshold %.0fu)",
-            clipCount, turnInPlace, turnTraveling, (double)TravelingDistance);
-        if (mismatches.Count() > 0)
-        {
-            offset += snprintf(message + offset, sizeof(message) - (size_t)offset, ", TAG MISMATCHES: ");
-            for (int32 i = 0; i < mismatches.Count() && offset < 1900; i++)
-            {
-                const StringAnsi part(mismatches[i]);
-                offset += snprintf(message + offset, sizeof(message) - (size_t)offset, "%s%s",
-                    i > 0 ? "; " : "", part.GetText());
-            }
-        }
-        else
-        {
-            offset += snprintf(message + offset, sizeof(message) - (size_t)offset, "%s", ", tags match measurement.");
-        }
-        if (yAnomaly.Count() > 0)
-        {
-            offset += snprintf(message + offset, sizeof(message) - (size_t)offset, " Y-ANOMALIES (non-jump): ");
-            for (int32 i = 0; i < yAnomaly.Count() && offset < 1900; i++)
-            {
-                const StringAnsi part(yAnomaly[i]);
-                offset += snprintf(message + offset, sizeof(message) - (size_t)offset, "%s%s",
-                    i > 0 ? "; " : "", part.GetText());
-            }
-        }
-        LOG(Info, "{}", String(message));
-    }
+    LOG(Info, "Motion matching clip audit: {} clips measured.", clipCount);
     LogAccelAudit();
     WriteClipAuditFile();
 }
@@ -537,26 +446,8 @@ void MotionMatchingRuntimePolicy::ResetOnTeleport()
     // _currentClip + playback survive (see above): continuity needs no
     // re-pick after a pure position jump.
     _hasLastActorPos = false;
-    // Provider owns rest: snap to its RestTag, or to empty (hold) when it
-    // names no rest role. Never assume "idle" here.
-    if (!_tuning.RestTag.IsEmpty())
-    {
-        _stableLinear = _tuning.RestTag;
-        _pendingKey = _tuning.RestTag + String(TEXT("|0"));
-    }
-    else
-    {
-        _stableLinear = String::Empty;
-        _pendingKey = String::Empty;
-    }
-    _stableYaw = false;
-    _pendingCount = 99;
     _chooserReseed = true;
     ActiveTag = String::Empty;
-    TurnDriveActive = false;
-    _turnDriving = false;
-    _driveClip = -1;
-    _slowTurnTimer = 0.0f;
     _prevDesVel = Float3::Zero;
     _prevDesSpeed = 0.0f;
     _oneshotUntil = -99.0f;
@@ -574,18 +465,7 @@ void MotionMatchingRuntimePolicy::ResetOnTeleport()
     _tickTrajectory.Clear();
     FastPathHits = 0;
     LastFastPathAge = 0.0f;
-    _latchedBackward = false;
-    _latchedLateral = false;
-    _hasPrevTargetYaw = false;
-    _jumpPhase = 0;
-    _airTicks = 0;
-    _landHoldUntil = -99.0f;
     _wasAirborne = false;
-    if (_inertialOverridden && _playback != nullptr)
-    {
-        _playback->InertializationDuration = _defaultInertial;
-        _inertialOverridden = false;
-    }
     if (_playback != nullptr)
         _playback->SetPlayRate(1.0f);
     LastSwitchReason = String(TEXT("teleport-reset"));
@@ -707,16 +587,6 @@ void MotionMatchingRuntimePolicy::Tick(
     _trajectoryPoints = trajectoryPoints;
     _sampleTimes = trajectorySampleTimes;
 
-    // P2/P3: a provider disabling a driver mid-engagement exits it cleanly
-    // instead of freezing mid-state. Default providers never toggle these.
-    if (!_tuning.EnableTurnDrive && _turnDriving)
-        ExitTurnDrive(String(TEXT("drive:disabled")));
-    if (!_tuning.EnableJumpDriver && _jumpPhase != 0)
-    {
-        _jumpPhase = 0;
-        _airTicks = 0;
-    }
-
     const float frameDt = MaxF(deltaTime, 0.000001f);
     _timeSinceSwitch += frameDt;
     _timeSinceInit += frameDt;
@@ -828,28 +698,6 @@ void MotionMatchingRuntimePolicy::Tick(
             _tickTrajectory = tickTraj;
     }
 
-    // Turn-drive owns standing turns: trigger runs before the query
-    // gate so a committed turn suppresses the search entirely. Camera
-    // rate is measured here (Tick owns frameDt, the trigger doesn't).
-    if (_hasPrevTargetYaw)
-    {
-        float dTarget = state.TargetYaw - _prevTargetYaw;
-        while (dTarget > 180.0f)
-            dTarget -= 360.0f;
-        while (dTarget < -180.0f)
-            dTarget += 360.0f;
-        _camRateDeg = AbsF(dTarget) / frameDt;
-    }
-    else
-    {
-        _camRateDeg = 0.0f;
-        _hasPrevTargetYaw = true;
-    }
-    _prevTargetYaw = state.TargetYaw;
-    MaybeStartTurnDrive(frameDt);
-    // Jump machine runs every tick (not query cadence): touchdown 0.1s
-    // late would show the fall pose already grounded (visible pop).
-    TickJump();
 
     _queryTimer += frameDt;
     const bool warmed = !justSeeded && _timeSinceInit >= WarmupTime;
@@ -858,64 +706,16 @@ void MotionMatchingRuntimePolicy::Tick(
     // cadence path below stays for SearchEveryFrame=false.
     const bool queryDue = warmed && (_tuning.SearchEveryFrame ||
         _queryTimer >= MaxF(_tuning.QueryInterval, 0.01f));
-    // Per-tick search suppression (Phase 3): jump/landing/turn holds are
-    // evaluated every frame so off-cadence scans cannot trade midair or
-    // turn poses either. Entries are still recorded on cadence ticks
-    // only (trace economy); suppression itself is per-frame.
-    // Jump hold: takeoff/flight clips play through deterministically
-    // (direct-played above); the search must not trade midair poses.
-    // Grounded queries are untouched, so ground phases never change.
-    // Landing hold: touchdown owns the pose while the severity blend
-    // settles (see DoLanding). B2 turn hold: a turn one-shot still
-    // playing while the yaw persists keeps playing to its end.
-    const char* holdReason = nullptr;
-    bool holdIsJump = false;
-    bool holdIsDrive = false;
-    if (_jumpPhase != 0)
-    {
-        holdIsJump = true;
-        holdReason = _jumpPhase == 1 ? "jump:takeoff-hold" : "jump:flight-hold";
-    }
-    else if (Time::GetGameTime() < _landHoldUntil)
-    {
-        holdReason = "held:landing-playthrough";
-    }
-    else if (_turnDriving)
-    {
-        holdIsDrive = true;
-        holdReason = "drive:turn-playthrough";
-    }
-    else if (ShouldHoldTurn())
-    {
-        holdReason = "held:turn-playthrough";
-    }
+    // P2: pure search dispatch (machine holds deleted).
     if (queryDue && warmed)
     {
         _queryTimer = 0.0f;
-        if (holdReason != nullptr)
-        {
-            LastSwitchReason = String(holdReason);
-            if (holdIsJump)
-            {
-                HoldCount++;
-                RecordPolicyEvent("jump", _currentClip, LastSwitchReason);
-            }
-            else if (!holdIsDrive)
-            {
-                HoldCount++;
-                RecordPolicyEvent("hold", _currentClip, LastSwitchReason);
-            }
-        }
-        else
-        {
-            // Ã‚Â§7.1/Ã‚Â§18.8: the cadence tick is the only place a full scan
-            // may run, and only on a real continuation miss. _fastPathFrames
-            // counts these opportunities so the frame cap stays
-            // FPS-independent (5 x QueryInterval ~ MaxFastPathAge).
-            _fastPathFrames++;
-            if (!TryFastPath(frameDt))
-                RunQuery(trajectoryPoints, actorWorld, frameDt);
-        }
+        // P2: pure search dispatch (machine holds deleted). Cadence ticks
+        // may run a full scan on continuation miss; off-cadence ticks below
+        // only try the cheap continuation.
+        _fastPathFrames++;
+        if (!TryFastPath(frameDt))
+            RunQuery(trajectoryPoints, actorWorld, frameDt);
     }
     else if (queryDue && (_timeSinceInit < WarmupTime || justSeeded))
     {
@@ -923,7 +723,7 @@ void MotionMatchingRuntimePolicy::Tick(
         // first real query sees settled pose velocity and trajectory past.
         _queryTimer = 0.0f;
     }
-    else if (warmed && holdReason == nullptr && _poseValid)
+    else if (warmed && _poseValid)
     {
         // Ã‚Â§7.1/Ã‚Â§18.8 off-cadence tick: cheap continuation only. A miss is
         // recorded (and forces the full scan at the next cadence tick), but
@@ -932,31 +732,8 @@ void MotionMatchingRuntimePolicy::Tick(
         TryFastPath(frameDt);
     }
 
-    // Overlay feed (playback-only, never search): the layer angle + bone
-    // gate were decided host-side by the provider (all layer/gate rules
-    // live outside the core) and are forwarded verbatim AFTER this
-    // frame's live pose was already sampled above,
-    // pose was already sampled above, so it cannot affect THIS frame's
-    // costs — only the next frame's search pose (the measured pollution
-    // path; suite decides the gate). Yaw stays untouched (turn-drive owns
-    // facing).
-    {
-        _playback->LayerAngleDeg = state.LayerAngleDeg;
-        _playback->GateBone = state.GateBone;
-    }
 
-    // Wave C motion gate: foot lock at rest adds pose cost for zero
-    // visual gain (nothing travels, nothing skates) while polluting the
-    // next query's live pose. Engage only when moving or turning.
-    {
-        const float planarForIK = Float2(state.CurrentVelocity.X, state.CurrentVelocity.Z).Length();
-        const float yawForIK = AbsF(state.AngularVelocity.Y);
-        const float yawGate = _tuning.YawRateThreshold;
-        const float speedGate = _tuning.IdleSpeedMax;
-        _playback->FootIKEnabled = (planarForIK > speedGate || yawForIK >= yawGate)
-            && _tuning.EnableFootIK;
-        _playback->SetPlayRate(SelectPlayRate());
-    }
+    _playback->SetPlayRate(SelectPlayRate());
     // Ã‚Â§18.9: stamp this tick's search decision on playback before it
     // asserts intra-tick ordering (sample <= search <= save < layer < IK).
     NotifySearch();
@@ -970,490 +747,23 @@ void MotionMatchingRuntimePolicy::Tick(
         if (_playback->SampleFrameId >= 0)
             _nextSearchFrameId = _playback->SampleFrameId + 1;
     }
-    // Turn-drive follows the fresh clip yaw (committed turn steers facing).
-    AdvanceTurnDrive();
-    // Layer snapshot for telemetry (applied inside playback above).
-    LastLayerRequested = _playback->LastLayerRequested;
-    LastLayerPrimary = _playback->LastLayerPrimary;
-    LastLayerSecondary = _playback->LastLayerSecondary;
-    LastLayerGateApplied = _playback->LastLayerGateApplied;
-    // Wave C foot IK snapshot (playback-output-only, informational).
-    LastFootLockL = _playback->LastFootLockL;
-    LastFootLockR = _playback->LastFootLockR;
-    LastFootWeightL = _playback->LastFootWeightL;
-    LastFootWeightR = _playback->LastFootWeightR;
-    LastFootCorrL = _playback->LastFootCorrL;
-    LastFootCorrR = _playback->LastFootCorrR;
 
     // A finished one-shot releases the continuity lock so the next
     // query may leave immediately instead of holding the last frame.
     if (_playback->IsAtEnd)
         _timeSinceSwitch = 999.0f;
-
-    // B2b turn replay: a turn one-shot that ends while the yaw persists
-    // restarts the SAME clip instead of searching (the search only
-    // trades near-twin one-shots at the joint). Wrong-direction holds
-    // end as soon as the yaw drops Ã¢â‚¬â€ the next query then re-searches.
-    if (_tuning.EnableTurnDrive && _playback->IsAtEnd && _currentClip >= 0 &&
-        AbsF(state.AngularVelocity.Y) >= _tuning.YawRateThreshold &&
-        IsTurnLikeClip(_currentClip) && !_turnDriving)
-    {
-        const float replaySpeed = Float2(state.CurrentVelocity.X, state.CurrentVelocity.Z).Length();
-        if (replaySpeed > _tuning.IdleSpeedMax)
-        {
-            // Ã‚Â§18.11: never replay a turn clip under locomotion speed Ã¢â‚¬â€ the
-            // moving body's own search owns the next candidate. The skipped
-            // replay is recorded so the interruption is auditable.
-            LastSwitchReason = String(TEXT("replay:turn-skipped-speed"));
-            RecordPolicyEvent("replay", _currentClip, LastSwitchReason);
-        }
-        else
-        {
-            _playback->Play(_currentClip, 0.0f, true);
-            LastSwitchReason = String(TEXT("replay:turn-loop"));
-            TurnReplayCount++;
-            RecordPolicyEvent("replay", _currentClip, LastSwitchReason);
-        }
-    }
 }
 
-void MotionMatchingRuntimePolicy::TickJump()
-{
-    if (_playback == nullptr || !_tuning.EnableJumpDriver)
-        return;
-    const MotionMatchingPlayerSnapshot& state = _snapshot;
-    if (_jumpPhase == 0)
-    {
-        // Landing-blend restore: the snapshot was taken at Play, so the
-        // override can revert as soon as the land clip started blending.
-        if (_inertialOverridden && state.IsGrounded)
-        {
-            _playback->InertializationDuration = _defaultInertial;
-            _inertialOverridden = false;
-        }
-        // Takeoff gate (see JumpRiseVelY/JumpMinAirTicks): teleport
-        // re-ground blips (vy <= 0, a few ticks) must not start the
-        // machine; real jumps rise at 1620 and fire at once.
-        if (!state.IsGrounded)
-        {
-            _airTicks++;
-            if (state.CurrentVelocity.Y > JumpRiseVelY || _airTicks >= JumpMinAirTicks)
-                StartTakeoff();
-        }
-        else
-        {
-            _airTicks = 0;
-        }
-        return;
-    }
-    if (state.IsGrounded)
-    {
-        DoLanding();
-        return;
-    }
-    if (_jumpPhase == 1)
-    {
-        const float airTime = Time::GetGameTime() - _jumpTakeoffTime;
-        if (state.CurrentVelocity.Y < JumpFallVelY || airTime >= JumpTakeoffMaxTime)
-        {
-            _jumpPhase = 2;
-            if (_fallLoop >= 0 && _currentClip != _fallLoop)
-            {
-                _playback->Play(_fallLoop, 0.0f, true);
-                _currentClip = _fallLoop;
-                _timeSinceSwitch = 0.0f;
-                SwitchCount++;
-                WinnerClip = _fallLoop;
-                WinnerClipName = GetClipName(_fallLoop);
-                ActiveTag = _tuning.JumpTag;
-                char reason[256];
-                snprintf(reason, sizeof(reason), "jump:flight-fall air=%.2fs clip=", (double)airTime);
-                const StringAnsi nameAnsi(WinnerClipName);
-                strncat(reason, nameAnsi.GetText(), sizeof(reason) - strlen(reason) - 1);
-                LastSwitchReason = String(reason);
-                RecordPolicyEvent("jump", _fallLoop, LastSwitchReason);
-            }
-        }
-    }
-}
-
-void MotionMatchingRuntimePolicy::StartTakeoff()
-{
-    const MotionMatchingPlayerSnapshot& state = _snapshot;
-    _jumpPhase = 1;
-    _jumpTakeoffTime = Time::GetGameTime();
-    _airTicks = 0;
-    _takeoffPlanarSpeed = Float2(state.CurrentVelocity.X, state.CurrentVelocity.Z).Length();
-    _takeoffWasSprint = state.IsSprinting;
-    _wasAirborne = true;
-    if (_turnDriving)
-        ExitTurnDrive(String(TEXT("jump:takeoff-abort")));
-    const int32 bucket = SpeedBucket(_takeoffPlanarSpeed, _takeoffWasSprint);
-    const int32 clip = PickTakeoffClip(bucket);
-    if (clip >= 0 && _playback != nullptr)
-    {
-        _playback->Play(clip, 0.0f, true);
-        _currentClip = clip;
-        _timeSinceSwitch = 0.0f;
-        SwitchCount++;
-        WinnerClip = clip;
-        WinnerClipName = GetClipName(clip);
-        ActiveTag = _tuning.JumpTag;
-    }
-    JumpCount++;
-    {
-        char reason[256];
-        const StringAnsi nameAnsi(GetClipName(clip));
-        snprintf(reason, sizeof(reason), "jump:takeoff-%s clip=%s speed=%.0f",
-            BucketLabel(bucket), nameAnsi.GetText(), (double)_takeoffPlanarSpeed);
-        LastSwitchReason = String(reason);
-    }
-    RecordPolicyEvent("jump", clip, LastSwitchReason);
-}
-
-void MotionMatchingRuntimePolicy::DoLanding()
-{
-    const MotionMatchingPlayerSnapshot& state = _snapshot;
-    const float airTime = Time::GetGameTime() - _jumpTakeoffTime;
-    const float landSpeed = Float2(state.CurrentVelocity.X, state.CurrentVelocity.Z).Length();
-    const int32 bucket = SpeedBucket(landSpeed, state.IsSprinting);
-    const bool severe = airTime >= JumpSevereMinAir;
-    const bool heavy = severe || airTime >= JumpLightMaxAir;
-    const int32 clip = severe ? PickSevereLandClip() : PickLandClip(bucket, heavy);
-    const float blend = severe ? JumpBlendSevere : heavy ? JumpBlendHeavy : JumpBlendLight;
-    // Land-clip impact seek (see below): hoisted for the reason string.
-    float impact = 0.0f;
-    if (clip >= 0 && _landImpactTime.Count() > clip && _landImpactTime[clip] >= 0.0f)
-        impact = _landImpactTime[clip];
-    if (_playback != nullptr)
-    {
-        _playback->InertializationDuration = blend;
-        _inertialOverridden = true;
-        if (clip >= 0)
-        {
-            // Land clips contain their own fall: start at the measured
-            // touchdown, never at 0 (which replays falling while standing).
-            _playback->Play(clip, impact, true);
-            _currentClip = clip;
-            _timeSinceSwitch = 0.0f;
-            SwitchCount++;
-            WinnerClip = clip;
-            WinnerClipName = GetClipName(clip);
-        }
-    }
-    ActiveTag = String::Empty; // next grounded query re-derives tags
-    _jumpPhase = 0;
-    _wasAirborne = false;
-    _airTicks = 0;
-    // Landing hold (see JumpLandHold*): the land clip owns the touchdown
-    // briefly; the first search after the hold settle-to-loops instead of
-    // churning transitions. Scaled by severity like the blend.
-    _landHoldUntil = Time::GetGameTime() + (severe ? JumpLandHoldSevere : heavy ? JumpLandHoldHeavy : JumpLandHoldLight);
-    {
-        char reason[256];
-        const StringAnsi nameAnsi(GetClipName(clip));
-        snprintf(reason, sizeof(reason), "jump:land-%s-%s air=%.2fs blend=%.2f clip=%s impact=%.2fs",
-            BucketLabel(bucket), severe ? "severe" : heavy ? "heavy" : "light",
-            (double)airTime, (double)blend, nameAnsi.GetText(), (double)impact);
-        LastSwitchReason = String(reason);
-    }
-    RecordPolicyEvent("jump", clip, LastSwitchReason);
-}
-
-// Measured-speed bucket for the airborne-transition pools: 0 = rest,
-// 1..3 = ascending tuning ceilings, urgent intent forces the top bucket.
-// Bucket membership is measured root motion; no gait vocabulary.
-int32 MotionMatchingRuntimePolicy::SpeedBucket(float speed, bool sprinting) const
-{
-    if (speed <= _tuning.IdleSpeedMax)
-        return 0;
-    if (sprinting)
-        return 3;
-    if (speed <= _tuning.WalkSpeedMax)
-        return 1;
-    if (speed <= _tuning.RunSpeedMax)
-        return 2;
-    return 3;
-}
-
-const char* MotionMatchingRuntimePolicy::BucketLabel(int32 bucket)
-{
-    switch (bucket)
-    {
-    case 0: return "rest";
-    case 1: return "low";
-    case 2: return "mid";
-    default: return "high";
-    }
-}
-
-int32 MotionMatchingRuntimePolicy::PickTakeoffClip(int32 bucket)
-{
-    const Array<int32>* pool = &_takeoffPool[0];
-    if (bucket >= 0 && bucket < JumpBucketCount)
-        pool = &_takeoffPool[bucket];
-    if (pool->Count() == 0)
-        pool = &_takeoffAny;
-    if (pool->Count() == 0)
-        return _fallLoop;
-    return (*pool)[JumpCount % pool->Count()];
-}
-
-int32 MotionMatchingRuntimePolicy::PickLandClip(int32 bucket, bool heavy)
-{
-    const Array<int32>* pool = &_landPoolLight[0];
-    if (bucket >= 0 && bucket < JumpBucketCount)
-        pool = heavy ? &_landPoolHeavy[bucket] : &_landPoolLight[bucket];
-    // Measured-bucket miss falls back to any measured landing clip before
-    // the looping fall clip: a takeoff/landing must never play the fall loop.
-    if (pool->Count() == 0)
-        pool = &_landAny;
-    if (pool->Count() == 0)
-        return _fallLoop;
-    return (*pool)[JumpCount % pool->Count()];
-}
-
-int32 MotionMatchingRuntimePolicy::PickSevereLandClip()
-{
-    if (_landRoll.Count() > 0)
-        return _landRoll[JumpCount % _landRoll.Count()];
-    if (_landStumble.Count() > 0)
-        return _landStumble[JumpCount % _landStumble.Count()];
-    return PickLandClip(2, true);
-}
-
-float MotionMatchingRuntimePolicy::FindTouchdown(MotionMatchingDatabase* db, int32 start, int32 count)
-{
-    if (db == nullptr || count <= 0)
-        return -1.0f;
-    const Array<float>& features = db->GetPoseFeatures();
-    const int32 poseSize = db->GetPoseFeatureSize();
-    const Array<float>& times = db->GetSampleTimes();
-    if (features.Count() == 0 || times.Count() == 0 || poseSize <= 2)
-        return -1.0f;
-    const int32 offL = poseSize - 2;
-    const int32 offR = poseSize - 1;
-    int32 bestStart = -1;
-    int32 bestLen = 0;
-    int32 curStart = -1;
-    for (int32 i = 0; i < count; i++)
-    {
-        const int32 gi = start + i;
-        const int64 base0 = (int64)gi * poseSize;
-        bool planted = false;
-        if (base0 + offR < features.Count())
-            planted = features[(int32)base0 + offL] >= 0.5f || features[(int32)base0 + offR] >= 0.5f;
-        if (!planted)
-        {
-            if (curStart < 0)
-                curStart = i;
-        }
-        else if (curStart >= 0)
-        {
-            const int32 runLen = i - curStart;
-            if (runLen > bestLen)
-            {
-                bestLen = runLen;
-                bestStart = curStart;
-            }
-            curStart = -1;
-        }
-    }
-    if (curStart >= 0)
-    {
-        const int32 runLen = count - curStart;
-        if (runLen > bestLen)
-        {
-            bestLen = runLen;
-            bestStart = curStart;
-        }
-    }
-    if (bestLen < 3 || bestStart < 0)
-        return -1.0f;
-    const int32 td = bestStart + bestLen;
-    if (td >= count)
-        return -1.0f;
-    const int32 gtd = start + td;
-    if (gtd < 0 || gtd >= times.Count())
-        return -1.0f;
-    return times[gtd];
-}
-
-void MotionMatchingRuntimePolicy::BuildJumpPools()
-{
-    Array<int32> takeoffPool[JumpBucketCount];
-    Array<int32> landPoolLight[JumpBucketCount];
-    Array<int32> landPoolHeavy[JumpBucketCount];
-    Array<int32> landRoll, landStumble, takeoffAny, landAny;
-    Array<int32> landClips;
-    Array<int32> landBucket;
-    Array<float> landSpan;
-    _fallLoop = -1;
-    {
-        const int32 n0 = _database != nullptr ? _database->GetClipCount() : 0;
-        _landImpactTime.Resize(n0);
-        for (int32 i = 0; i < n0; i++)
-            _landImpactTime[i] = -1.0f;
-    }
-    {
-        MotionMatchingDatabase* db = _database;
-        const int32 n = db != nullptr ? db->GetClipCount() : 0;
-        // Null-database sessions keep every pool empty (same as the C#).
-        const Array<Float3>* positions = (db != nullptr) ? &db->GetRootPositions() : nullptr;
-        const Array<Float3>* forwards = (db != nullptr) ? &db->GetRootForwards() : nullptr;
-        const Array<float>* lengths = (db != nullptr) ? &db->GetClipLengths() : nullptr;
-        int32 cursor = 0;
-        for (int32 c = 0; c < n; c++)
-        {
-            const int32 cnt = (db != nullptr && c < db->GetClipSampleCounts().Count()) ? db->GetClipSampleCounts()[c] : 0;
-            if (_tuning.JumpTag.IsEmpty() || !ClipTags(c).Contains(_tuning.JumpTag) || cnt <= 0)
-            {
-                cursor += cnt;
-                continue;
-            }
-            // The looping jump clip is the deterministic fall loop.
-            if (db->GetClipLoop(c))
-            {
-                _fallLoop = c;
-                cursor += cnt;
-                continue;
-            }
-            const int32 end = cursor + cnt - 1;
-            if (positions == nullptr || cursor < 0 || end >= positions->Count())
-            {
-                cursor += cnt;
-                continue;
-            }
-            const Float3 first = (*positions)[cursor];
-            const Float3 last = (*positions)[end];
-            // Backpedal jumps are the wrong router direction (mirrors the
-            // old "B_ excluded" rule without names): a clip whose net
-            // horizontal travel opposes its own start facing is skipped.
-            if (forwards != nullptr && cursor < forwards->Count())
-            {
-                const Float2 netDisp(last.X - first.X, last.Z - first.Z);
-                const Float2 facing((*forwards)[cursor].X, (*forwards)[cursor].Z);
-                if (netDisp.LengthSquared() > 1.0f && facing.LengthSquared() > 0.000001f &&
-                    netDisp.X * facing.X + netDisp.Y * facing.Y < 0.0f)
-                {
-                    cursor += cnt;
-                    continue;
-                }
-            }
-            float minY = first.Y;
-            float maxY = first.Y;
-            float path = 0.0f;
-            for (int32 i = 1; i < cnt && cursor + i < positions->Count(); i++)
-            {
-                const Float3 p0 = (*positions)[cursor + i - 1];
-                const Float3 p1 = (*positions)[cursor + i];
-                path += Float2(p1.X - p0.X, p1.Z - p0.Z).Length();
-                if (p1.Y < minY)
-                    minY = p1.Y;
-                if (p1.Y > maxY)
-                    maxY = p1.Y;
-            }
-            const float len = (lengths != nullptr && c < lengths->Count()) ? (*lengths)[c] : 0.0f;
-            const float speed = len > 0.01f ? path / len : 0.0f;
-            const int32 bucket = SpeedBucket(speed, false);
-            float firstHalfMaxY = first.Y;
-            const int32 half = cnt / 2;
-            for (int32 i = 0; i < half && cursor + i < positions->Count(); i++)
-            {
-                if ((*positions)[cursor + i].Y > firstHalfMaxY)
-                    firstHalfMaxY = (*positions)[cursor + i].Y;
-            }
-            const bool isTakeoff = firstHalfMaxY - first.Y > 25.0f;
-            float impactTime = -1.0f;
-            if (!isTakeoff)
-                impactTime = FindTouchdown(db, cursor, cnt);
-            if (isTakeoff)
-            {
-                takeoffPool[bucket].Add(c);
-                takeoffAny.Add(c);
-            }
-            else if (impactTime >= 0.0f)
-            {
-                landClips.Add(c);
-                landBucket.Add(bucket);
-                landSpan.Add(maxY - minY);
-                landAny.Add(c);
-                _landImpactTime[c] = impactTime;
-            }
-            else
-            {
-                // Pure flight (falls off, never lands in-clip): neither
-                // pool. Falls back to the looping fall clip at pick time.
-                cursor += cnt;
-                continue;
-            }
-            cursor += cnt;
-        }
-        // Data-driven severity (no baked heavy/light flag): clips whose
-        // measured vertical fall is at or above the median land span are
-        // heavy, the rest light. Deterministic and rebake-free.
-        float median = 0.0f;
-        if (landSpan.Count() > 0)
-        {
-            Array<float> sorted = landSpan;
-            // Insertion sort (pool is small, init-only).
-            for (int32 i = 1; i < sorted.Count(); i++)
-            {
-                const float key = sorted[i];
-                int32 j = i - 1;
-                while (j >= 0 && sorted[j] > key)
-                {
-                    sorted[j + 1] = sorted[j];
-                    j--;
-                }
-                sorted[j + 1] = key;
-            }
-            median = sorted[sorted.Count() / 2];
-        }
-        for (int32 i = 0; i < landClips.Count(); i++)
-        {
-            const int32 c = landClips[i];
-            const bool heavy = landSpan[i] >= median;
-            const int32 b = landBucket[i] >= 0 && landBucket[i] < JumpBucketCount ? landBucket[i] : 0;
-            if (heavy)
-                landPoolHeavy[b].Add(c);
-            else
-                landPoolLight[b].Add(c);
-        }
-    }
-    for (int32 b = 0; b < JumpBucketCount; b++)
-    {
-        _takeoffPool[b] = takeoffPool[b];
-        _landPoolLight[b] = landPoolLight[b];
-        _landPoolHeavy[b] = landPoolHeavy[b];
-    }
-    _landRoll = landRoll;
-    _landStumble = landStumble;
-    _takeoffAny = takeoffAny;
-    _landAny = landAny;
-    {
-        const StringAnsi fallName(_fallLoop >= 0 ? GetClipName(_fallLoop) : String(TEXT("MISSING")));
-        char message[1024];
-        snprintf(message, sizeof(message),
-            "Jump pools (baked metadata): takeoff rest/low/mid/high=%d/%d/%d/%d fall=%s land rest=%d/%d low=%d/%d mid=%d/%d high=%d/%d roll=%d stumble=%d",
-            _takeoffPool[0].Count(), _takeoffPool[1].Count(), _takeoffPool[2].Count(), _takeoffPool[3].Count(),
-            fallName.GetText(),
-            _landPoolLight[0].Count(), _landPoolHeavy[0].Count(),
-            _landPoolLight[1].Count(), _landPoolHeavy[1].Count(),
-            _landPoolLight[2].Count(), _landPoolHeavy[2].Count(),
-            _landPoolLight[3].Count(), _landPoolHeavy[3].Count(),
-            _landRoll.Count(), _landStumble.Count());
-        LOG(Info, "{}", String(message));
-    }
-}
-
+// P2: onset band ceilings are the ex-default provider values (5/200/490).
+// The provider owns the live ceilings for its scope; the core keeps fixed
+// bands so the onset one-shot filter has no gameplay tuning.
 int32 MotionMatchingRuntimePolicy::BandFromSpeed(float speed) const
 {
-    if (speed <= _tuning.IdleSpeedMax)
+    if (speed <= 5.0f)
         return 0;
-    if (speed <= _tuning.WalkSpeedMax)
+    if (speed <= 200.0f)
         return 1;
-    if (speed <= _tuning.RunSpeedMax)
+    if (speed <= 490.0f)
         return 2;
     return 3;
 }
@@ -1488,7 +798,7 @@ void MotionMatchingRuntimePolicy::UpdateIntentSignals()
     const float planarSpeed = Float2(state.CurrentVelocity.X, state.CurrentVelocity.Z).Length();
     const float yawRate = AbsF(state.AngularVelocity.Y);
     const float desSpeed = Float2(state.DesiredVelocity.X, state.DesiredVelocity.Z).Length();
-    if (!airborne && yawRate < _tuning.YawRateThreshold &&
+    if (!airborne && yawRate < 0.5f &&
         desSpeed - _prevDesSpeed >= 150.0f)
         _oneshotUntil = Time::GetGameTime() + 0.35f;
     _prevDesSpeed = desSpeed;
@@ -1556,70 +866,20 @@ void MotionMatchingRuntimePolicy::RunQuery(const Array<TrajectoryPoint>& traject
     // runs on a zero-velocity reseed pose that cannot honestly match a
     // transition (all bone velocities read zero). Loops only Ã¢â‚¬â€ otherwise
     // a planted one-shot (pivot) wins the poisoned query and the playing
-    // pose then looks like itself forever. Consumed by SelectTags below.
+    // pose then looks like itself forever.
     const bool reseeded = _chooserReseed;
-    // Provider-decided scope: ScopeConstrained means the C# provider
-    // computed this query's tags (editable gait bands/roles on its Tags
-    // UI) and the native SelectTags is bypassed. Unconstrained = legacy
-    // native decision (self-test and bare callers keep working).
-    const bool externalScope = _snapshot.ScopeConstrained;
-    Array<String> tags;
-    if (externalScope)
-    {
-        // C# owns scope hysteresis now: never let a stale reseed pin LoopOnly
-        // below (reseeded was already captured above for this query).
-        _chooserReseed = false;
-        tags = MotionMatchingDatabase::SplitTagSet(_snapshot.AllowedTagSet);
-        ActiveTag = MotionMatchingDatabase::JoinTags(tags);
-        // Keep the idle watchdog meaningful: primary tag first by convention
-        // (SplitTagSet sorts, and gait names sort before turn_*).
-        if (tags.Count() > 0)
-            _stableLinear = tags[0];
-    }
-    else
-    {
-        tags = SelectTags(airborne, edge, planarSpeed, yawRate, state.IsSprinting,
-            ComputeDecelLatchedDirection(trajectoryPoints, airborne, planarSpeed, desSpeed, true),
-            ComputeDecelLatchedDirection(trajectoryPoints, airborne, planarSpeed, desSpeed, false));
-    }
-    // M6: surface the chooser's confirm state every query (not just on
-    // change) so a pending gait is visible while it waits out repeats.
-    {
-        char chooser[256];
-        const StringAnsi stableAnsi(_stableLinear);
-        const StringAnsi pendingAnsi(_pendingKey);
-        snprintf(chooser, sizeof(chooser), "%s|%d<=%s (%d/%d)%s",
-            stableAnsi.GetText(), _stableYaw ? 1 : 0, pendingAnsi.GetText(),
-            _pendingCount, MaxI(_tuning.TagConfirmRepeats, 1), fairFight ? "|fair" : "");
-        ChooserStatusText = String(chooser);
-    }
-    // External scope owns its hysteresis in C#: report it verbatim so the
-    // tuning window shows the controller's decision, not stale native state.
-    if (externalScope)
-        ChooserStatusText = String(TEXT("ext:")) + ActiveTag;
-
-    // Constrained empty scope = explicit no-match (contract §8/R7): no
-    // candidate may win, so the current clip simply holds. This short
-    // circuit runs before every selection path below (scan, recovery
-    // retries, onset fallback). The fast-path continuation may still hold
-    // the incumbent on off-cadence ticks, which is the same observable
-    // outcome (hold current), so no fast-path invalidation is needed.
-    if (externalScope && tags.Count() == 0)
+    // P2: provider-decided scope only (native legacy chooser deleted). The
+    // provider owns hysteresis/bands/roles game-side; empty allowed is an
+    // explicit no-match: hold current, never fall back to any pool.
+    _chooserReseed = false;
+    Array<String> tags = MotionMatchingDatabase::SplitTagSet(_snapshot.AllowedTagSet);
+    ActiveTag = MotionMatchingDatabase::JoinTags(tags);
+    ChooserStatusText = String(TEXT("ext:")) + ActiveTag;
+    if (tags.Count() == 0)
     {
         ActiveTag = String::Empty;
         ChooserStatusText = String(TEXT("ext:empty (no-match)"));
         LastSwitchReason = String(TEXT("no-result:empty-scope"));
-        return;
-    }
-
-    // Unconstrained HOLD: the legacy chooser has no tuning role for this
-    // motion (moving locomotion without a provider role, or an empty
-    // rest/jump/turn role). Hold the current clip instead of guessing.
-    // SelectTags already cleared ActiveTag; keep the stabilized display
-    // above so the hold stays auditable.
-    if (!externalScope && tags.Count() == 0)
-    {
-        LastSwitchReason = String(TEXT("no-result:hold"));
         return;
     }
 
@@ -1665,8 +925,11 @@ void MotionMatchingRuntimePolicy::RunQuery(const Array<TrajectoryPoint>& traject
     // loops structurally here (break/stop/turn tails cannot re-win).
     // Measured rest gaps run 0.2-2.1, so the 0.5 preference below is only
     // a tie-break; the structural exit is end-triggered LoopOnly (next).
-    const bool restCalm = !airborne && planarSpeed <= _tuning.IdleSpeedMax &&
-        yawRate < _tuning.YawRateThreshold;
+    // P2: rest/yaw gates use the ex-default provider ceilings (5 u/s, 0.5
+    // rad/s). The provider owns the live values for its scope decision;
+    // the core keeps fixed gates so search has no gameplay tuning.
+    const bool restCalm = !airborne && planarSpeed <= 5.0f &&
+        yawRate < 0.5f;
     // End-triggered loop recovery: playback frozen on a finished one-shot
     // end frame searches loop clips ONLY (same chooser tags). The ended
     // one-shot cannot re-win no matter how exactly the pose matches, so
@@ -1682,7 +945,7 @@ void MotionMatchingRuntimePolicy::RunQuery(const Array<TrajectoryPoint>& traject
     // never gets a foothold. Turn ends with live yaw are excluded (B2b
     // replay owns them) and airborne ends keep normal search.
     const bool endedMoving = _playback != nullptr && _playback->IsAtEnd && !airborne && !restCalm &&
-        planarSpeed > _tuning.IdleSpeedMax && yawRate < _tuning.YawRateThreshold;
+        planarSpeed > 5.0f && yawRate < 0.5f;
     const bool endedRecovery = endedRest || endedMoving;
     // Settle-to-loop: a one-shot still playing while steadily moving (no
     // yaw) yields to loops early instead of riding a seconds-long
@@ -1705,25 +968,10 @@ void MotionMatchingRuntimePolicy::RunQuery(const Array<TrajectoryPoint>& traject
     // while running straight otherwise deadlocks (observed M3: pivot wins
     // a poisoned reseed query, then re-wins forever on self-pose).
     const bool settleToLoop = currentOneShot && !airborne && !restCalm &&
-        planarSpeed > _tuning.IdleSpeedMax && desSpeed > _tuning.IdleSpeedMax &&
-        yawRate < _tuning.YawRateThreshold &&
+        planarSpeed > 5.0f && desSpeed > 5.0f &&
+        yawRate < 0.5f &&
         _timeSinceSwitch > _tuning.SettleToLoopDelay;
-    // Turn joints trade near-twin one-shots every query, so the lock runs
-    // longer while any turn tag is active (first response unaffected).
-    bool turnActive = false;
-    if (tags.Count() > 0)
-    {
-        for (int32 i = 0; i < tags.Count(); i++)
-        {
-            if ((!_tuning.TurnInPlaceTag.IsEmpty() && tags[i] == _tuning.TurnInPlaceTag) ||
-                (!_tuning.TurnTravelTag.IsEmpty() && tags[i] == _tuning.TurnTravelTag))
-            {
-                turnActive = true;
-                break;
-            }
-        }
-    }
-    const float minSwitch = turnActive ? _tuning.TurnMinSwitchTime : _tuning.MinSwitchTime;
+    const float minSwitch = _tuning.MinSwitchTime;
     MotionMatchingSearchSettings settings;
     settings.PoseWeight = _tuning.PoseWeight;
     settings.TrajectoryWeight = _tuning.TrajectoryWeight;
@@ -1775,16 +1023,13 @@ void MotionMatchingRuntimePolicy::RunQuery(const Array<TrajectoryPoint>& traject
     settings.QueryYawRate = yawRate;
     // Foot-lock prior weights: playback pin weights (0..1, clamped).
     // Recorded in the trace below, so replay stays bit-exact.
-    settings.FootLockL = _playback != nullptr
-        ? ClampF(_playback->LastFootWeightL, 0.0f, 1.0f) : 0.0f;
-    settings.FootLockR = _playback != nullptr
-        ? ClampF(_playback->LastFootWeightR, 0.0f, 1.0f) : 0.0f;
-    // D1/PLAN Ã‚Â§5.2: the foot-lock search prior applies ONLY while the
-    // playback lock is FIRM (H1b LockState == Locked). The pin weights
-    // above still ramp for the visual lock; Planting/Releasing must not
-    // steer candidate ranking.
-    settings.FirmLockL = _playback != nullptr && _playback->FirmLockL;
-    settings.FirmLockR = _playback != nullptr && _playback->FirmLockR;
+    // P2: no plugin lock pins exist (solver deleted); the search prior
+    // stays structurally (settings + FootLockCost + selftest Phase K) but
+    // never fires at runtime. Game-side IK owns its own contact state.
+    settings.FootLockL = 0.0f;
+    settings.FootLockR = 0.0f;
+    settings.FirmLockL = false;
+    settings.FirmLockR = false;
     // Fresh input beats stale end-state: an onset window (des jumped)
     // wants transitions, even if playback sits on an ended one-shot
     // that would otherwise force loop-only recovery. Recovery still
@@ -1804,11 +1049,6 @@ void MotionMatchingRuntimePolicy::RunQuery(const Array<TrajectoryPoint>& traject
     if (!_snapshot.ExcludedTagSet.IsEmpty())
         settings.ExcludeTags = MotionMatchingDatabase::SplitTagSet(_snapshot.ExcludedTagSet);
     settings.CollectClassDiagnostics = _tuning.EffectiveTelemetry;
-    // Frequency telemetry for the heuristics (see counters above).
-    if (endedRecovery)
-        RecoveryCount++;
-    if (settleToLoop)
-        SettleCount++;
 
     // Ã‚Â§18.8: capture the query signature this full scan anchors the fast
     // path against (clip/time cannot change until Play below).
@@ -2015,23 +1255,6 @@ void MotionMatchingRuntimePolicy::RunQuery(const Array<TrajectoryPoint>& traject
     // pop Ã¢â‚¬â€ spikes the continuity lock absorbs are the system working.
     {
         const float now = Time::GetGameTime();
-        // Multi-tag: the joined ActiveTag ("idle+turn_inplace") no longer
-        // equals "idle" — compare the stabilized linear domain instead.
-        // Role-driven rest tag (defaults to "idle"); empty role disables.
-        if (didSwitch && !fused && !_tuning.RestTag.IsEmpty() && _stableLinear == _tuning.RestTag &&
-            planarSpeed > _tuning.IdleSpeedMax * 10.0f &&
-            now - _lastIdleSpeedWarn > 5.0f)
-        {
-            _lastIdleSpeedWarn = now;
-            const StringAnsi clipAnsi(WinnerClipName);
-            const StringAnsi chooserAnsi(ChooserStatusText);
-            const StringAnsi restAnsi(_tuning.RestTag);
-            char message[512];
-            snprintf(message, sizeof(message),
-                "Motion matching anomaly: tags=%s at speed=%.0f (clip=%s cost=%.1f chooser=%s).",
-                restAnsi.GetText(), (double)planarSpeed, clipAnsi.GetText(), (double)result.Cost, chooserAnsi.GetText());
-            LOG(Warning, "{}", String(message));
-        }
         if (didSwitch && !fused && result.Cost > 0.5f && result.Cost < 1e29f && now - _lastSpikeWarn > 5.0f)
         {
             _lastSpikeWarn = now;
@@ -2198,9 +1421,8 @@ MotionMatchingRuntimePolicy::FastPathSignature MotionMatchingRuntimePolicy::Capt
 {
     const float planarSpeed = Float2(_snapshot.CurrentVelocity.X, _snapshot.CurrentVelocity.Z).Length();
     const float yawRate = AbsF(_snapshot.AngularVelocity.Y);
-    int32 contacts = (_snapshot.IsGrounded ? 1 : 0) | (_snapshot.IsSprinting ? 2 : 0) |
-        (_playback != nullptr && _playback->LastFootLockL ? 4 : 0) |
-        (_playback != nullptr && _playback->LastFootLockR ? 8 : 0);
+    // P2: lock-machine bits removed with the plugin solver (no pins exist).
+    int32 contacts = (_snapshot.IsGrounded ? 1 : 0) | (_snapshot.IsSprinting ? 2 : 0);
     int32 dbId = 0;
     if (_database != nullptr)
         dbId = (int32)(((uintptr_t)_database) & 0xFFFFFFFF) ^ (_database->GetClipCount() * 397);
@@ -2312,78 +1534,13 @@ void MotionMatchingRuntimePolicy::RecordTrace(float speed, float yawRate, const 
     _lastEntry = entry;
 }
 
-bool MotionMatchingRuntimePolicy::ShouldHoldTurn()
-{
-    if (!_tuning.EnableTurnDrive)
-        return false;
-    if (_currentClip < 0 || _playback == nullptr || _playback->IsAtEnd)
-        return false;
-    if (AbsF(_snapshot.AngularVelocity.Y) < _tuning.YawRateThreshold)
-        return false;
-    // Ã‚Â§18.11: the turn hold owns FACING at rest only. A body with real
-    // planar speed must never have its locomotion search suppressed by a
-    // turn-in-place clip; at/below IdleSpeedMax the hold is the intended
-    // stationary turn.
-    const float planarSpeed = Float2(_snapshot.CurrentVelocity.X, _snapshot.CurrentVelocity.Z).Length();
-    if (planarSpeed > _tuning.IdleSpeedMax)
-        return false;
-    return IsTurnLikeClip(_currentClip);
-}
 
-bool MotionMatchingRuntimePolicy::IsTurnLikeClip(int32 clipIndex)
-{
-    return _database != nullptr && _database->GetClipTurnLike(clipIndex);
-}
 
-bool MotionMatchingRuntimePolicy::IsMovingBackward(const Array<TrajectoryPoint>& trajectoryPoints)
-{
-    if (trajectoryPoints.Count() == 0)
-        return false;
-    const Array<float>& offsets = _sampleTimes;
-    if (offsets.Count() == 0)
-        return false;
-    float sum = 0.0f;
-    int32 n = 0;
-    const int32 count = trajectoryPoints.Count() < offsets.Count() ? trajectoryPoints.Count() : offsets.Count();
-    for (int32 i = 0; i < count; i++)
-    {
-        if (offsets[i] > 0.01f)
-        {
-            sum += trajectoryPoints[i].Position.Z;
-            n++;
-        }
-    }
-    return n > 0 && sum / (float)n < -_tuning.BackwardThreshold;
-}
 
-bool MotionMatchingRuntimePolicy::IsMovingLateral(const Array<TrajectoryPoint>& trajectoryPoints)
-{
-    if (trajectoryPoints.Count() == 0)
-        return false;
-    const Array<float>& offsets = _sampleTimes;
-    if (offsets.Count() == 0)
-        return false;
-    float sumX = 0.0f;
-    float sumZ = 0.0f;
-    int32 n = 0;
-    const int32 count = trajectoryPoints.Count() < offsets.Count() ? trajectoryPoints.Count() : offsets.Count();
-    for (int32 i = 0; i < count; i++)
-    {
-        if (offsets[i] > 0.01f)
-        {
-            sumX += trajectoryPoints[i].Position.X;
-            sumZ += trajectoryPoints[i].Position.Z;
-            n++;
-        }
-    }
-    if (n == 0)
-        return false;
-    const float meanX = AbsF(sumX / (float)n);
-    const float meanZ = sumZ / (float)n;
-    if (meanX <= _tuning.LateralThreshold)
-        return false;
-    return meanZ <= meanX * MaxF(_tuning.LateralZRatio, 0.05f);
-}
+
+
+
+
 
 float MotionMatchingRuntimePolicy::Wrap180(float a)
 {
@@ -2394,301 +1551,20 @@ float MotionMatchingRuntimePolicy::Wrap180(float a)
     return a;
 }
 
-float MotionMatchingRuntimePolicy::TurnClipYawAt(int32 clip, float frac)
-{
-    if (_clipYawTable.Count() == 0 || _clipYawStart.Count() == 0)
-        return 0.0f;
-    if (clip < 0 || clip >= _clipYawStart.Count())
-        return 0.0f;
-    if (_database == nullptr)
-        return 0.0f;
-    const Array<int32>& counts = _database->GetClipSampleCounts();
-    if (counts.Count() == 0 || clip >= counts.Count())
-        return 0.0f;
-    const int32 b = _clipYawStart[clip];
-    int32 n = counts[clip];
-    if (b + n > _clipYawTable.Count())
-        n = _clipYawTable.Count() - b;
-    if (n <= 1)
-        return 0.0f;
-    const float f = ClampF(frac, 0.0f, 1.0f) * (float)(n - 1);
-    const int32 i0 = (int32)f;
-    if (i0 >= n - 1)
-        return _clipYawTable[b + n - 1];
-    const float t = f - (float)i0;
-    return _clipYawTable[b + i0] * (1.0f - t) + _clipYawTable[b + i0 + 1] * t;
-}
 
-int32 MotionMatchingRuntimePolicy::PickTurnClip(float needDeg, float errSign)
-{
-    if (_database == nullptr)
-        return -1;
-    int32 best = -1;
-    float bestGap = MAX_float;
-    const int32 clipCount = _database->GetClipCount();
-    for (int32 c = 0; c < clipCount; c++)
-    {
-        if (_tuning.TurnInPlaceTag.IsEmpty() || !ClipTags(c).Contains(_tuning.TurnInPlaceTag))
-            continue;
-        const float angle = c < _clipTurnAngle.Count() ? _clipTurnAngle[c] : 0.0f;
-        if (AbsF(angle) < 0.17f)
-            continue;
-        if ((angle >= 0.0f) != (errSign >= 0.0f))
-            continue;
-        const float gap = AbsF(AbsF(angle) * 57.29578f - needDeg);
-        if (gap < bestGap)
-        {
-            bestGap = gap;
-            best = c;
-        }
-    }
-    return best;
-}
 
-void MotionMatchingRuntimePolicy::MaybeStartTurnDrive(float frameDt)
-{
-    if (!_tuning.EnableTurnDrive || _turnDriving || _database == nullptr || _playback == nullptr)
-        return;
-    if (!_snapshot.IsGrounded || _timeSinceInit < WarmupTime)
-        return;
-    const float planarSpeed = Float2(_snapshot.CurrentVelocity.X, _snapshot.CurrentVelocity.Z).Length();
-    if (planarSpeed > _tuning.IdleSpeedMax)
-        return;
-    const float err = Wrap180(_snapshot.TargetYaw - _snapshot.CurrentYaw);
-    const float absErr = AbsF(err);
-    if (absErr >= _tuning.TurnDriveAngle)
-    {
-        _slowTurnTimer = 0.0f;
-    }
-    else
-    {
-        // Patient trigger: a small error held long (slow sustained turn)
-        // fires too Ã¢â‚¬â€ its steady state never reaches the big threshold.
-        if (absErr >= _tuning.TurnPatientAngle)
-            _slowTurnTimer += frameDt;
-        else
-            _slowTurnTimer = 0.0f;
-        if (_slowTurnTimer < _tuning.TurnPatientTime)
-            return;
-        _slowTurnTimer = 0.0f;
-    }
-    // A turn clip already playing owns the turn Ã¢â‚¬â€ never hijack it.
-    if (_currentClip >= 0 && !_playback->IsAtEnd &&
-        !_tuning.TurnInPlaceTag.IsEmpty() && ClipTags(_currentClip).Contains(_tuning.TurnInPlaceTag))
-        return;
-    // Bucket from the CAMERA rate (intent), not the body rate: the clip
-    // must cover where the camera is GOING. Body rate lags so badly that
-    // big flicks always under-bucket into 45s (verified symptom).
-    const float need = AbsF(err) + _camRateDeg * _tuning.TurnLookahead;
-    const int32 best = PickTurnClip(need, err);
-    if (best < 0)
-        return;
-    _playback->Play(best, 0.0f, true);
-    _currentClip = best;
-    _timeSinceSwitch = 0.0f;
-    SwitchCount++;
-    WinnerClip = best;
-    WinnerClipName = GetClipName(best);
-    ActiveTag = _tuning.TurnInPlaceTag;
-    _turnDriving = true;
-    _driveClip = best;
-    _turnStartYaw = _snapshot.CurrentYaw;
-    _turnTargetYaw = _snapshot.CurrentYaw + _clipTurnAngle[best] * 57.29578f;
-    _turnInitialErr = err;
-    _turnUnwrappedErr = err;
-    _turnPrevWrappedErr = err;
-    TurnDriveActive = true;
-    TurnDriveYaw = _snapshot.CurrentYaw;
-    _turnDriveStartTime = Time::GetGameTime();
-    {
-        char reason[256];
-        snprintf(reason, sizeof(reason), "drive:turn-start err=%.0f need=%.0f clipAngle=%.0f cam=%.0f",
-            (double)err, (double)need, (double)(_clipTurnAngle[best] * 57.29578f), (double)_camRateDeg);
-        LastSwitchReason = String(reason);
-    }
-    RecordPolicyEvent("drive", best, LastSwitchReason);
-}
 
-void MotionMatchingRuntimePolicy::AdvanceTurnDrive()
-{
-    if (!_turnDriving)
-        return;
-    const float planarSpeed = Float2(_snapshot.CurrentVelocity.X, _snapshot.CurrentVelocity.Z).Length();
-    const float length = _playback != nullptr ? _playback->GetCurrentClipLength() : 0.0f;
-    const float progress = length > 0.0f && _playback != nullptr
-        ? MinF(_playback->CurrentTime / length, 1.0f) : 1.0f;
-    const float total = _turnTargetYaw - _turnStartYaw;
-    // Authored curve (not linear time): the facing tracks what the clip
-    // actually does each moment, so feet and body agree by construction.
-    const float authored = TurnClipYawAt(_driveClip, progress) * 57.29578f;
-    float yaw = total >= 0.0f
-        ? _turnStartYaw + MinF(MaxF(authored, 0.0f), total)
-        : _turnStartYaw + MaxF(MinF(authored, 0.0f), total);
-    TurnDriveYaw = yaw;
-    // Camera error in unwrapped space: wrap-around from sustained spins
-    // accumulates through zero-crossings instead of faking a reversal.
-    const float wErr = Wrap180(_snapshot.TargetYaw - yaw);
-    // NOTE: snapshot is a per-tick copy; the coordinator steers Actor yaw
-    // from TurnDriveYaw (same value the C# wrote into state before).
-    _turnUnwrappedErr += Wrap180(wErr - _turnPrevWrappedErr);
-    _turnPrevWrappedErr = wErr;
-    const bool flying = _camRateDeg > _tuning.TurnSettleRate * 57.29578f;
-    const bool done = progress >= 1.0f || AbsF(_turnUnwrappedErr) <= 5.0f;
-    const bool abort = !_snapshot.IsGrounded || planarSpeed > _tuning.IdleSpeedMax;
-    const bool flipped = (_turnUnwrappedErr >= 0.0f) != (total >= 0.0f) &&
-        AbsF(_turnUnwrappedErr) > _tuning.TurnDriveAngle * 0.5f;
-    // Wrong-way fuse (settled only): facing outgrew the start error by a
-    // margin, so the clip turns away from the camera (sign bug) Ã¢â‚¬â€ release
-    // within ~0.5s. While flying, growth is expected (camera runs away).
-    const bool wrongWay = !flying && AbsF(_turnUnwrappedErr) > AbsF(_turnInitialErr) + 45.0f;
-    // No chain branch by design: a finished drive exits, and a still-big
-    // error retriggers fresh next tick (re-bucketed from live error).
-    // Fewer paths, same coverage, nothing to get stuck in.
-    if (done || abort || flipped || wrongWay)
-        ExitTurnDrive(abort || flipped || wrongWay ? String(TEXT("drive:turn-abort")) : String(TEXT("drive:turn-done")));
-    else
-        LastSwitchReason = String(TEXT("drive:turn-playthrough"));
-}
 
-void MotionMatchingRuntimePolicy::ExitTurnDrive(const String& reason)
-{
-    _turnDriving = false;
-    TurnDriveActive = false;
-    _driveClip = -1;
-    _slowTurnTimer = 0.0f;
-    const float dur = Time::GetGameTime() - _turnDriveStartTime;
-    const StringAnsi reasonAnsi(reason);
-    char message[256];
-    snprintf(message, sizeof(message), "%s dur=%.2fs endErr=%.0f",
-        reasonAnsi.GetText(), (double)dur, (double)_turnUnwrappedErr);
-    LastSwitchReason = String(message);
-    RecordPolicyEvent("drive", _currentClip, LastSwitchReason);
-}
 
-bool MotionMatchingRuntimePolicy::ComputeDecelLatchedDirection(const Array<TrajectoryPoint>& trajectoryPoints, bool airborne,
-    float planarSpeed, float desSpeed, bool backwardAxis)
-{
-    const bool coasting = !airborne && desSpeed <= _tuning.IdleSpeedMax && planarSpeed > _tuning.IdleSpeedMax;
-    if (coasting)
-        return backwardAxis ? _latchedBackward : _latchedLateral;
-    const bool value = backwardAxis ? IsMovingBackward(trajectoryPoints) : IsMovingLateral(trajectoryPoints);
-    if (!airborne)
-    {
-        if (backwardAxis)
-            _latchedBackward = value;
-        else
-            _latchedLateral = value;
-    }
-    return value;
-}
 
-// LEGACY fallback, frozen: used only when the snapshot is unconstrained
-// (ScopeConstrained == false, i.e. self-test and bare callers — all
-// production providers constrain). The provider owns every gait decision;
-// this path only maps rest/airborne through the tuning roles and HOLDs
-// (returns empty = no-match holds the current clip) for any moving
-// locomotion the tuning does not name (back/strafe/sprint/walk/run have no
-// tuning role). Do not extend with new gaits.
-Array<String> MotionMatchingRuntimePolicy::SelectTags(bool airborne, bool edge, float speed, float yawRate, bool sprinting, bool backward, bool lateral)
-{
-    (void)sprinting;
-    (void)backward;
-    (void)lateral;
-    const String& jumpTag = _tuning.JumpTag;
-    const String& restTag = _tuning.RestTag;
-    const String& turnInTag = _tuning.TurnInPlaceTag;
-    const String& turnTravelTag = _tuning.TurnTravelTag;
 
-    if (airborne)
-    {
-        if (jumpTag.IsEmpty())
-        {
-            _chooserReseed = false;
-            ActiveTag = String::Empty;
-            return Array<String>();
-        }
-        _stableLinear = jumpTag;
-        _stableYaw = false;
-        _pendingKey = jumpTag + String(TEXT("|0"));
-        _pendingCount = 99;
-        _chooserReseed = false;
-        ActiveTag = jumpTag;
-        Array<String> jumpTags;
-        jumpTags.Add(jumpTag);
-        return jumpTags;
-    }
 
-    // Moving locomotion has no tuning role: HOLD the current clip instead
-    // of guessing a gait. Rest is the only role-driven ground domain;
-    // Walk/RunSpeedMax still live in tuning for the jump-bucket classifier
-    // (SpeedBucket), not for scope here.
-    if (!restTag.IsEmpty() && speed > _tuning.IdleSpeedMax)
-    {
-        _chooserReseed = false;
-        ActiveTag = String::Empty;
-        return Array<String>();
-    }
-    if (restTag.IsEmpty())
-    {
-        _chooserReseed = false;
-        ActiveTag = String::Empty;
-        return Array<String>();
-    }
 
-    String linear = restTag;
-    const bool yaw = yawRate >= _tuning.YawRateThreshold;
-    char keyBuf[64], stableBuf[64];
-    const StringAnsi linearAnsi(linear);
-    snprintf(keyBuf, sizeof(keyBuf), "%s|%d", linearAnsi.GetText(), yaw ? 1 : 0);
-    const StringAnsi stableAnsi(_stableLinear);
-    snprintf(stableBuf, sizeof(stableBuf), "%s|%d", stableAnsi.GetText(), _stableYaw ? 1 : 0);
-    const String key(keyBuf);
-    const String stableKey(stableBuf);
-    // Rest hysteresis only: adopt immediately on edges, reseed, stable match
-    // or first assumption (empty stable); entering rest otherwise waits out
-    // TagConfirmRepeats as a natural settle tail. There is no leaving-rest
-    // instant adoption here — leaving rest means moving, which HOLDs above
-    // and never updates the stable domain.
-    if (edge || key == stableKey || _chooserReseed || _stableLinear.IsEmpty())
-    {
-        _stableLinear = linear;
-        _stableYaw = yaw;
-        _pendingKey = key;
-        _pendingCount = 99;
-        _chooserReseed = false;
-    }
-    else if (key == _pendingKey)
-    {
-        _pendingCount++;
-        if (_pendingCount >= MaxI(_tuning.TagConfirmRepeats, 1))
-        {
-            _stableLinear = linear;
-            _stableYaw = yaw;
-        }
-    }
-    else
-    {
-        _pendingKey = key;
-        _pendingCount = 1;
-    }
 
-    Array<String> set;
-    set.Add(_stableLinear);
-    if (_stableYaw)
-    {
-        const String& turnTag = (_stableLinear == restTag) ? turnInTag : turnTravelTag;
-        if (!turnTag.IsEmpty())
-            set.Add(turnTag);
-    }
-    ActiveTag = String::Empty;
-    for (int32 i = 0; i < set.Count(); i++)
-    {
-        if (i > 0)
-            ActiveTag += String(TEXT("+"));
-        ActiveTag += set[i];
-    }
-    return set;
-}
+
+
+// P2: legacy unconstrained chooser deleted (was here).
+
 
 void MotionMatchingRuntimePolicy::LogTelemetryLine(float speed, float yawRate, const Array<String>& tags,
     const MotionMatchingResult& result, const Float3& actorPos, float timeError)
@@ -2722,9 +1598,6 @@ void MotionMatchingRuntimePolicy::LogTelemetryLine(float speed, float yawRate, c
         "\"loopT\":%d,\"oneT\":%d,"
         "\"pref\":%.2f,\"switches\":%d,\"seeks\":%d,\"cur\":%d,\"ptime\":%.2f,\"atEnd\":%d,"
         "\"px\":%.0f,\"py\":%.0f,\"pz\":%.0f,\"des\":%.0f,"
-        "\"aim\":%.2f,\"aimSp\":%.2f,\"aimHd\":%.2f,"
-        "\"ikLW\":%.2f,\"ikLC\":%.2f,\"ikRW\":%.2f,\"ikRC\":%.2f,"
-        "\"ikLl\":%d,\"ikRl\":%d,\"fYL\":%.1f,\"fYR\":%.1f,"
         "\"rateB\":%.3f,\"rateA\":%.3f,\"effDt\":%.4f,\"cycle\":%d,\"tErr\":%.4f}",
         (double)Time::GetGameTime(), stateAnsi.GetText(), tagBuf, (double)speed, (double)yawRate,
         _snapshot.IsGrounded ? 1 : 0,
@@ -2738,25 +1611,8 @@ void MotionMatchingRuntimePolicy::LogTelemetryLine(float speed, float yawRate, c
         (_playback != nullptr && _playback->IsAtEnd) ? 1 : 0,
         (double)actorPos.X, (double)actorPos.Y, (double)actorPos.Z,
         (double)Float2(_snapshot.DesiredVelocity.X, _snapshot.DesiredVelocity.Z).Length(),
-        // Layer (playback-only: informational, never a search input).
-        // Values are the previous frame's applied angles (this frame's layer
-        // bends bones after the query above already ran).
-        (double)(_playback != nullptr ? _playback->LastLayerRequested : 0.0f),
-        (double)(_playback != nullptr ? _playback->LastLayerPrimary : 0.0f),
-        (double)(_playback != nullptr ? _playback->LastLayerSecondary : 0.0f),
-        // Wave C foot IK (playback-output-only: lock weights 0..1,
-        // corrections in units/cm, raw lock gates 0/1).
-        (double)(_playback != nullptr ? _playback->LastFootWeightL : 0.0f),
-        (double)(_playback != nullptr ? _playback->LastFootCorrL : 0.0f),
-        (double)(_playback != nullptr ? _playback->LastFootWeightR : 0.0f),
-        (double)(_playback != nullptr ? _playback->LastFootCorrR : 0.0f),
-        (_playback != nullptr && _playback->LastFootLockL) ? 1 : 0,
-        (_playback != nullptr && _playback->LastFootLockR) ? 1 : 0,
-        // Foot world-height telemetry (model-space Y from the shown pose;
-        // world Y = py + this, actor rotation is yaw-only).
-        (double)(_playback != nullptr ? _playback->LastFootYL : 0.0f),
-        (double)(_playback != nullptr ? _playback->LastFootYR : 0.0f),
-        // PLAN §6.1 / §18.10 play-rate and timing telemetry
+        // P2: play-rate and timing telemetry only (overlay/IK keys deleted
+        // with the plugin solver; game-side post passes own their telemetry).
         (double)rateB, (double)rateA, (double)effDt, cycle, (double)timeError);
     const StringAnsi folderAnsi(_cacheFolder);
     char path[1024];

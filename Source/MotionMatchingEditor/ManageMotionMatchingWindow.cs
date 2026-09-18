@@ -16,11 +16,13 @@ namespace MotionMatching;
 public class ManageMotionMatchingWindow : CustomEditorWindow
 {
     private readonly MotionMatchingController _controller;
+    private readonly System.Action _onEdited;
     private LabelElement _status;
 
-    public ManageMotionMatchingWindow(MotionMatchingController controller)
+    public ManageMotionMatchingWindow(MotionMatchingController controller, System.Action onEdited = null)
     {
         _controller = controller;
+        _onEdited = onEdited;
     }
 
     public override void Initialize(LayoutElementsContainer layout)
@@ -38,7 +40,7 @@ public class ManageMotionMatchingWindow : CustomEditorWindow
         {
             if (_controller == null)
                 return;
-            MotionMatchingEditorService.ClearAllAnimationClips(_controller);
+            MotionMatchingEditorService.ClearAllAnimationClips(_controller, _onEdited);
             SetStatus("Registry cleared.");
         };
         layout.Space(8);
@@ -46,12 +48,12 @@ public class ManageMotionMatchingWindow : CustomEditorWindow
         {
             if (_controller == null)
                 return;
-            SetStatus(MotionMatchingEditorService.BakeValidateAndTest(_controller));
+            SetStatus(MotionMatchingEditorService.BakeValidateAndTest(_controller, _onEdited));
         };
         layout.Button("Open Tuning (M6)").Button.Clicked += () =>
         {
             if (_controller != null)
-                new MotionMatchingTuningWindow(_controller).Show();
+                new MotionMatchingTuningWindow(_controller, _onEdited).Show();
         };
         layout.Space(8);
         _status = layout.Label("Ready.");

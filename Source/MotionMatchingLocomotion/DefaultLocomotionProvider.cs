@@ -10,8 +10,8 @@ namespace MotionMatching;
 /// movement snapshot, the gait scope decision (editable bands/roles) and the
 /// spring trajectory predictor. Has no player types, camera objects or
 /// automation: any host fills <see cref="LocomotionSnapshot"/> from its own
-/// state. An empty resolved scope is an explicit no-match (HasScope stays
-/// true), never a silent legacy-native fallback.
+/// state. An empty resolved scope is an explicit no-match (empty scope),
+/// never a silent legacy-native fallback.
 /// </summary>
 public class DefaultLocomotionProvider : Script, IMotionMatchingInputProvider
 {
@@ -52,10 +52,10 @@ public class DefaultLocomotionProvider : Script, IMotionMatchingInputProvider
     [EditorOrder(3), EditorDisplay("MM Input"), Tooltip("Rest ceiling: speeds at/below this latch the rest band and gate coast/hold logic.")]
     public float IdleSpeedMax = 5.0f;
 
-    [EditorOrder(3), EditorDisplay("MM Input"), Tooltip("Jump-router Walk ceiling (native JumpGait bucket). Warns when it drifts from the bands.")]
+    [EditorOrder(3), EditorDisplay("MM Input"), Tooltip("Game-driver Walk ceiling (game JumpDriver bucket). Warns when it drifts from the bands.")]
     public float JumpWalkSpeedMax = 200.0f;
 
-    [EditorOrder(3), EditorDisplay("MM Input"), Tooltip("Jump-router Run ceiling (native JumpGait bucket). Warns when it drifts from the bands.")]
+    [EditorOrder(3), EditorDisplay("MM Input"), Tooltip("Game-driver Run ceiling (game JumpDriver bucket). Warns when it drifts from the bands.")]
     public float JumpRunSpeedMax = 490.0f;
 
     [EditorOrder(4), EditorDisplay("MM Input")]
@@ -73,23 +73,11 @@ public class DefaultLocomotionProvider : Script, IMotionMatchingInputProvider
     [EditorOrder(5), EditorDisplay("MM Input")]
     public float LateralZRatio = 0.58f;
 
-    [EditorOrder(6), EditorDisplay("MM Input"), Tooltip("Feed the host angle into the procedural layer (split primary/secondary).")]
-    public bool EnablePoseLayer = true;
-
-    [EditorOrder(6), EditorDisplay("MM Input"), Tooltip("When true, feed zero angle above rest speed x multiplier (baked clips have neutral arms).")]
-    public bool LayerLowSpeedOnly = false;
-
-    [EditorOrder(6), EditorDisplay("MM Input")]
-    public float LayerSpeedGateMult = 2.0f;
-
-    [EditorOrder(6), EditorDisplay("MM Input"), Tooltip("Honor the snapshot's bone-gate request (set host-side).")]
-    public bool EnableBoneGate = true;
-
-    [EditorOrder(7), EditorDisplay("MM Input"), Tooltip("Run the core airborne-transition machine (takeoff/flight/landing direct-play). Off = pure search while airborne.")]
-    public bool EnableJumpDriver = true;
-
-    [EditorOrder(7), EditorDisplay("MM Input"), Tooltip("Run the core standing-turn machine (committed turn direct-play + holds). Off = pure search while turning.")]
-    public bool EnableTurnDrive = true;
+    // P2: overlay inputs are consumed game-side by the facade post-pass
+    // (the game player reads them from its own per-frame input copy),
+    // never forwarded into the core. The fields below died with the core
+    // overlay seam: EnablePoseLayer, LayerLowSpeedOnly, LayerSpeedGateMult,
+    // EnableBoneGate, EnableJumpDriver, EnableTurnDrive.
 
     [EditorOrder(7), EditorDisplay("MM Input")]
     public bool DrawDebugTrajectory = true;
@@ -151,43 +139,15 @@ public class DefaultLocomotionProvider : Script, IMotionMatchingInputProvider
         frame.CurrentYaw = _snap.CurrentYaw;
         frame.IsGrounded = _snap.IsGrounded;
         frame.IsSprinting = _snap.IsSprinting;
-        // Layer inputs decided here: host-authored angle with the
-        // low-speed gate, plus the host's bone-gate request. The
-        // core forwards both verbatim and never interprets host state.
-        float layerAngle = EnablePoseLayer ? _snap.LayerAngleDeg : 0.0f;
-        if (LayerLowSpeedOnly)
-        {
-            float planar = (float)Math.Sqrt(
-                _snap.CurrentVelocity.X * _snap.CurrentVelocity.X +
-                _snap.CurrentVelocity.Z * _snap.CurrentVelocity.Z);
-            if (planar >= IdleSpeedMax * LayerSpeedGateMult)
-                layerAngle = 0.0f;
-        }
-        frame.LayerAngleDeg = layerAngle;
-        frame.GateBone = EnableBoneGate && _snap.RequestBoneGate;
         frame.Points = _points;
-        // This provider always owns the scope decision, even when it
-        // resolves empty: empty = explicit no-match, never a silent
-        // legacy fallback.
-        frame.HasScope = true;
+        // P2: scope only. Roles/speeds/thresholds/drivers/overlay inputs
+        // died with the core machines: the provider keeps them as game-side
+        // config for its own scope decision above, but nothing crosses into
+        // the core anymore besides movement + trajectory + scope.
         frame.AllowedTagSet = scope ?? string.Empty;
         frame.ExcludedTagSet = string.IsNullOrWhiteSpace(GameplayExclude)
             ? string.Empty
             : GameplayExclude.Trim().ToLowerInvariant();
-        frame.JumpTag = NormRole(JumpTag);
-        frame.TurnInPlaceTag = NormRole(TurnInPlaceTag);
-        frame.TurnTravelTag = NormRole(TurnTravelTag);
-        frame.RestTag = RestBandTag();
-        frame.RestSpeedMax = IdleSpeedMax;
-        frame.JumpWalkSpeedMax = JumpWalkSpeedMax;
-        frame.JumpRunSpeedMax = JumpRunSpeedMax;
-        frame.YawRateThreshold = YawRateThreshold;
-        frame.TagConfirmRepeats = TagConfirmRepeats;
-        frame.BackwardThreshold = BackwardThreshold;
-        frame.LateralThreshold = LateralThreshold;
-        frame.LateralZRatio = LateralZRatio;
-        frame.EnableJumpDriver = EnableJumpDriver;
-        frame.EnableTurnDrive = EnableTurnDrive;
         return frame;
     }
 
@@ -212,13 +172,12 @@ public class DefaultLocomotionProvider : Script, IMotionMatchingInputProvider
         var frame = new MotionMatchingFrameInput();
         frame.IsGrounded = true;
         frame.Points = Array.Empty<TrajectoryPoint>();
-        frame.HasScope = true;
         string rest = RestBandTag();
         if (string.IsNullOrEmpty(rest))
         {
             frame.AllowedTagSet = string.Empty;
             ScopeWarnOnce("idle-no-bands",
-                "Motion matching provider: no gait bands configured; returning explicit no-match (HasScope=true, empty scope).");
+                "Motion matching provider: no gait bands configured; returning explicit no-match (empty scope).");
         }
         else
         {
@@ -227,20 +186,6 @@ public class DefaultLocomotionProvider : Script, IMotionMatchingInputProvider
         frame.ExcludedTagSet = string.IsNullOrWhiteSpace(GameplayExclude)
             ? string.Empty
             : GameplayExclude.Trim().ToLowerInvariant();
-        frame.JumpTag = NormRole(JumpTag);
-        frame.TurnInPlaceTag = NormRole(TurnInPlaceTag);
-        frame.TurnTravelTag = NormRole(TurnTravelTag);
-        frame.RestTag = rest;
-        frame.RestSpeedMax = IdleSpeedMax;
-        frame.JumpWalkSpeedMax = JumpWalkSpeedMax;
-        frame.JumpRunSpeedMax = JumpRunSpeedMax;
-        frame.YawRateThreshold = YawRateThreshold;
-        frame.TagConfirmRepeats = TagConfirmRepeats;
-        frame.BackwardThreshold = BackwardThreshold;
-        frame.LateralThreshold = LateralThreshold;
-        frame.LateralZRatio = LateralZRatio;
-        frame.EnableJumpDriver = EnableJumpDriver;
-        frame.EnableTurnDrive = EnableTurnDrive;
         return frame;
     }
 
@@ -334,11 +279,6 @@ public class DefaultLocomotionProvider : Script, IMotionMatchingInputProvider
             }
         }
         return rest;
-    }
-
-    private static string NormRole(string role)
-    {
-        return string.IsNullOrWhiteSpace(role) ? string.Empty : role.Trim().ToLowerInvariant();
     }
 
     /// <summary>

@@ -60,6 +60,10 @@ public struct MotionMatchingInputContext
 /// Movement is copied straight into the native snapshot; scope strings are
 /// '+'-joined and split natively (the scripting marshaller cannot move
 /// Array-String struct fields across the boundary).
+/// P2: movement + trajectory + scope only. All gameplay decisions (gait
+/// roles, speed ceilings, yaw/direction thresholds, driver flags, overlay
+/// angles/gates) live game-side in the provider/snapshot and never cross
+/// into the core. Empty AllowedTagSet = explicit no-match.
 /// </summary>
 public struct MotionMatchingFrameInput
 {
@@ -78,38 +82,36 @@ public struct MotionMatchingFrameInput
     // the core skips the query exactly like today's trajError path.
     public TrajectoryPoint[] Points;
 
-    // 3. Scope. HasScope=false = provider does not decide (legacy native
-    // decision, bare callers). HasScope=true with an empty AllowedTagSet
-    // = explicit no-match: no candidate may win, the current clip holds.
-    public bool HasScope;
+    // 3. Scope: '+'-joined include/exclude tag sets decided provider-side.
+    // Empty AllowedTagSet = explicit no-match (hold current, never fall
+    // back to any pool). The native legacy chooser is deleted, so every
+    // query is provider-scoped.
     public string AllowedTagSet;
     public string ExcludedTagSet;
+}
 
-    // 4. Locomotion-owned tuning the core still consumes (roles replace
-    // the old literals; speeds replace the old shell scene fields).
-    public string JumpTag;
-    public string TurnInPlaceTag;
-    public string TurnTravelTag;
-    public string RestTag;
-    public float RestSpeedMax;
-    public float JumpWalkSpeedMax;
-    public float JumpRunSpeedMax;
-    public float YawRateThreshold;
-    public int TagConfirmRepeats;
-    public float BackwardThreshold;
-    public float LateralThreshold;
-    public float LateralZRatio;
+// P0 additive-only DTOs for future game drivers (never read by Tick yet).
+// Neutral Layer-style naming: no gait/jump/turn/camera vocabulary.
 
-    // 5. Layer inputs, decided host-side (P4/P6): procedural angle for the
-    // two-bone layer + single-bone scale gate. The core forwards them
-    // verbatim and never interprets host state.
-    public float LayerAngleDeg;
-    public bool GateBone;
+/// <summary>
+/// P0: neutral query filter for a future game driver. Plain data only;
+/// not consumed by the runtime yet (no Tick change).
+/// </summary>
+public struct MotionMatchingQueryFilter
+{
+    public TrajectoryPoint[] Points;
+    public string AllowedTags;
+    public string ExcludedTags;
+}
 
-    // 6. Driver ownership (P2/P3): this provider enables the core's
-    // airborne-transition machine and standing-turn machine. False = pure
-    // search from that machine (no direct-plays, holds or facing overrides).
-    // Defaults are false in a bare struct: providers must opt in explicitly.
-    public bool EnableJumpDriver;
-    public bool EnableTurnDrive;
+/// <summary>
+/// P0: neutral search tuning for a future game driver. Plain data only;
+/// not consumed by the runtime yet (no Tick change).
+/// </summary>
+public struct MotionMatchingSearchTuning
+{
+    public float PoseWeight;
+    public float TrajectoryWeight;
+    public float InertializationDuration;
+    public int FrameSearchBudget;
 }

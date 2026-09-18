@@ -1,74 +1,52 @@
 using System;
-using System.Collections.Generic;
 using System.IO;
 using FlaxEngine;
 
 namespace MotionMatching;
 
 /// <summary>
-/// Scene-facing settings and status for the native motion-matching system.
+/// Scene-detached runtime for the native motion-matching system.
 ///
-/// Plugin boundary (MM_PLUGIN_PLAN.md): this shell owns the database,
-/// policy/playback lifecycle and core-only tuning. Everything locomotion
-/// (gait scope, trajectory prediction, gait speeds) arrives through the
-/// single IMotionMatchingInputProvider slot below. This file must never
-/// reference game types (PlayerState, coordinators, automation, overlays).
+/// P3: plain C# class, zero scene presence. The game-side facade
+/// (MotionMatchingPlayer) owns this object, feeds it a prebuilt
+/// <see cref="MotionMatchingFrameInput"/> every tick (it calls the provider's
+/// BuildInput itself) and drives the overlay post-pass + pose write. This
+/// class owns the database, policy/playback lifecycle and core-only tuning.
+/// Everything locomotion (gait scope, trajectory prediction, gait speeds)
+/// arrives through the frame argument. This file must never reference game
+/// types (PlayerState, coordinators, automation, overlays).
 /// </summary>
-public class MotionMatchingController : Script
+public class MotionMatchingController
 {
-
     /// <summary>
-    /// Bake contract authored in the scene. A snapshot is stored inside the database on bake;
+    /// Bake contract authored by the host. A snapshot is stored inside the database on bake;
     /// </summary>
-    [EditorOrder(0), EditorDisplay("Schema"),
-     Tooltip("Search/bake contract. Skeleton bone names ship EMPTY by design: configure them for your rig (Schema → Skeleton). An empty profile fails fast with the exact scene path instead of silently using mannequin names.")]
     public PoseSearchSchema Schema = CreateDefaultSchema();
 
-    [ExpandGroups]
-    [EditorOrder(10), EditorDisplay("Model")]
     public SkinnedModel PlayerModel;
 
-    [ExpandGroups]
-    [EditorOrder(20), EditorDisplay("Database")]
     public string DatabasePath = "MotionMatching/MotionMatchingDatabase.flax";
 
-    [EditorOrder(21), EditorDisplay("Database"), ReadOnly]
     public MotionMatchingDatabase Database;
 
-    [EditorOrder(22), EditorDisplay("Database"), ReadOnly]
     public int AnimationClipsCount;
 
-    [EditorOrder(23), EditorDisplay("Database"), ReadOnly]
     public int SampleCount;
 
-    [EditorOrder(24), EditorDisplay("Database"), ReadOnly]
     public bool PersistenceValid;
 
-    [HideInEditor]
     public string[] AnimationTags = Array.Empty<string>();
 
-    [HideInEditor]
     public int[] AnimationClipCountsByTag = Array.Empty<int>();
 
-    [ExpandGroups]
-    [EditorOrder(30), EditorDisplay("Input"),
-     Tooltip("Game-side input provider (Flax inspector cannot show interface fields, so this is a Script slot cast to IMotionMatchingInputProvider). Null = tick skipped with a warning; the game driver assigns its provider here.")]
-    public Script InputProvider;
-
-    // Host-assigned session config (set by the game driver, e.g. from
-    // automation flags — the shell never reads automation itself).
-    [HideInEditor]
+    // Host-assigned session config (set by the game facade, e.g. from
+    // automation flags — this class never reads automation itself).
     public string CacheFolder = string.Empty;
-    [HideInEditor]
     public bool TelemetryOverride = false;
-    [HideInEditor]
     public bool IndexedVerifyAuto = false;
 
-    [ExpandGroups]
-    [EditorOrder(40), EditorDisplay("Playback")]
     public AnimatedModel CharacterBody;
 
-    [EditorOrder(41), EditorDisplay("Playback")]
     public float QueryInterval = 0.1f;
 
     // Per-frame search: the query gate runs every warmed tick instead of on
@@ -76,47 +54,39 @@ public class MotionMatchingController : Script
     // boundary. Full scans stay budgeted (FrameSearchBudget) with a rotating
     // stride + continuation exemption, and intent-change queries always scan
     // unstrided — same total CPU as cadence, minimal worst-case latency.
-    [EditorOrder(41), EditorDisplay("Playback")]
     public bool SearchEveryFrame = true;
 
     // Samples scored per full scan (rotating stride covers the rest over
     // following frames). 12000 ≈ 1ms on the reference machine. 0 = unstrided.
-    [EditorOrder(41), EditorDisplay("Playback")]
     public int FrameSearchBudget = 12000;
 
     // Phase 3 (KDTREE_PLAN.md): indexed path is live by default (phase-2
     // audit: 0.33% same-clip-twin divergence, suite parity gate below).
     // Brute force stays as fallback + permanent verify harness.
-    [EditorOrder(41), EditorDisplay("Playback")]
     public bool UseIndexedSearch = true;
 
     // Candidates retrieved per tag before exact rerank. 16 (measured
     // 2026-09-14: sub-1ms scans, 0/1500 verify divergence, 12/12 suite).
-    [EditorOrder(41), EditorDisplay("Playback")]
     public int TopKCandidates = 16;
 
     // Phase 2 (KDTREE_PLAN.md): run brute force alongside the indexed path,
     // count divergences, keep the brute-force winner. Permanent debug harness.
-    [EditorOrder(41), EditorDisplay("Playback")]
     public bool VerifyIndexedSearch = false;
 
-    // Single foot-IK switch (positive logic): ticked = IK may engage when
-    // moving (Wave C motion gate still applies). Replaces the old
-    // DisableFootIK kill-switch + the foot-ik branch force-enable override.
-    [EditorOrder(45), EditorDisplay("Playback"), Tooltip("Enable foot IK (locks engage only while moving/turning).")]
-    public bool EnableFootIK = true;
+    // P2: foot-IK solver deleted with the plugin lock machine (field died
+    // with it). Game-side FootIKController owns all foot solving; search
+    // contact features (bake + query) are untouched.
 
     // NOTE: layer decisions (procedural angle, bone gate) live
-    // in the input provider now (P4/P6). The shell forwards its decided
-    // LayerAngleDeg/GateBone verbatim; see MotionMatchingFrameInput.
+    // game-side now (P2 post-pass in the game facade): the provider
+    // snapshot still carries the host-authored angle/gate for the game
+    // pass, but nothing is forwarded into the core anymore.
 
     // Switch penalty added to any different-clip winner (continuity block).
     // Rev-3 cost units (N1b shrank dissimilarity ~100x): 0.0025 restores the
     // old ratio against typical winner costs (~0.01-0.2 measured).
-    [EditorOrder(47), EditorDisplay("Playback")]
     public float ContinuityWeight = 0.0025f;
 
-    [EditorOrder(48), EditorDisplay("Playback")]
     public float MinSwitchTime = 0.12f;
 
     // Continuation stickiness (live tuning, no rebake): bias rewards the
@@ -125,27 +95,21 @@ public class MotionMatchingController : Script
     // (measured mean winner cost 0.095), so both scale down equally to keep
     // the old hold/switch ratios. UE philosophy is the same direction (tiny
     // -0.01 bias + interrupt logic instead of giant margins).
-    [EditorOrder(49), EditorDisplay("Playback")]
     public float ContinuingBias = 0.012f;
 
-    [EditorOrder(50), EditorDisplay("Playback")]
     public float ContinuingWindow = 0.15f;
 
-    [EditorOrder(51), EditorDisplay("Playback")]
     public float SwitchMargin = 0.008f;
 
     // foot-ik branch flip work: fair-fight intent accumulator trip level
     // (u/s accumulated with 0.7/tick decay) and unbiased-scan latch window
     // (seconds). A 45deg walk flip slews ~20u/s per tick and trips in 2-3
     // ticks; steady-motion noise stays an order of magnitude below.
-    [EditorOrder(51), EditorDisplay("Playback")]
     public float FairFightAccum = 40.0f;
-    [EditorOrder(51), EditorDisplay("Playback")]
     public float FairFightWindow = 0.25f;
 
     // Heuristic thresholds below were hardcoded constants (codex review):
     // exposed live so tuning moves numbers instead of code. No rebake needed.
-    [EditorOrder(52), EditorDisplay("Playback")]
     public float SettleToLoopDelay = 0.3f;
 
     // Rest-loop preference (loops win ties at rest so one-shot breaks/stops
@@ -153,213 +117,134 @@ public class MotionMatchingController : Script
     // ~0.005-0.02 measured, so 0.02 settles rest without touching transitions
     // (preference is zero unless restCalm). Raised from 0.005 after measured
     // Idle_Break churn in suite phase 10.
-    [EditorOrder(53), EditorDisplay("Playback")]
     public float RestLoopPreference = 0.02f;
 
-    [EditorOrder(57), EditorDisplay("Playback")]
     public float SameClipExclusion = 0.25f;
 
-    [EditorOrder(58), EditorDisplay("Playback")]
     public float SameClipSeekThreshold = 0.25f;
 
-    // Longer switch lock while turn tags are active: turn entry trades
-    // near-twin one-shots every query, so the first turn win holds longer.
-    // First response stays immediate (lock only bites AFTER a switch).
-    [EditorOrder(59), EditorDisplay("Playback")]
-    public float TurnMinSwitchTime = 0.3f;
-
-    // Turn-drive trigger: facing error (degrees) past this starts a committed
-    // in-place turn. Low enough that the spring-skate window (idle loop
-    // yawing under a planted stance) stays small; early exit caps overplay.
-    [EditorOrder(60), EditorDisplay("Playback")]
-    public float TurnDriveAngle = 25.0f;
-
-    // Reactive bucket: need = |error| + cameraRate * lookahead, matched to
-    // the clip whose measured turn angle is closest (fast flicks pick bigger
-    // turns). Camera rate, not body: body lags, camera is the intent.
-    [EditorOrder(61), EditorDisplay("Playback")]
-    public float TurnLookahead = 0.2f;
-
-    // Flying-vs-settled split (rad/s on the CAMERA yaw): while flying, error
-    // growth is expected, so the wrong-way fuse stays off; once settled the
-    // fuse arms and drives finish exactly.
-    [EditorOrder(62), EditorDisplay("Playback")]
-    public float TurnSettleRate = 2.0f;
-
-    // Patient trigger for slow sustained turns (steady error never reaches
-    // TurnDriveAngle): fire once the error holds past the small angle this long.
-    [EditorOrder(63), EditorDisplay("Playback")]
-    public float TurnPatientAngle = 15.0f;
-
-    [EditorOrder(64), EditorDisplay("Playback")]
-    public float TurnPatientTime = 1.0f;
+    // P3: Turn* game-driver config moved to the game facade
+    // (MotionMatchingPlayer.TurnDriveAngle/Lookahead/SettleRate/PatientAngle/
+    // PatientTime). The native turn machine is deleted and never read these;
+    // the game-side TurnDriver is the only reader. TurnMinSwitchTime died
+    // with them: it was never pushed into the native tuning (no reader in
+    // the P2 headers) and no driver reads it.
 
     // Cost fuse: a switched winner above this is treated as a corrupted query
     // (observed: single-query pose spike mid steady walk, self-heals next
     // query) — hold current instead of cascading. Rev-3 units: legit switches
     // peak ~0.9 measured, so 2.0 keeps headroom without ever firing legally.
-    [EditorOrder(65), EditorDisplay("Playback")]
     public float CostFuseThreshold = 2.0f;
 
     // Inertialization decay time (replaces linear-crossfade BlendDuration;
     // single path, no parallel blend modes).
-    [EditorOrder(49), EditorDisplay("Playback")]
     public float InertializationDuration = 0.25f;
 
-    [EditorOrder(50), EditorDisplay("Playback")]
     public bool TelemetryLog = false;
 
-    // Effective switch: the scene field above never changes at runtime —
+    // Effective switch: the host field above never changes at runtime —
     // the host flips TelemetryOverride (e.g. from file-driven automation),
     // so the scene is never dirtied by a play session.
     public bool EffectiveTelemetry => TelemetryLog || TelemetryOverride;
 
-    [EditorOrder(60), EditorDisplay("Telemetry"), ReadOnly]
-    public string PolicyState = "Disabled";
+    // Telemetry mirrors (getters: written only by Update below, read by the
+    // game facade / editor service / bridge).
+    public string PolicyState { get; private set; } = "Disabled";
+    public int WinnerSample { get; private set; } = -1;
+    public int WinnerClip { get; private set; } = -1;
+    public string WinnerClipName { get; private set; } = string.Empty;
+    public float WinnerCost { get; private set; } = float.MaxValue;
+    public float SecondBestCost { get; private set; } = float.MaxValue;
+    public float WinnerPoseCost { get; private set; } = float.MaxValue;
+    public float WinnerTrajectoryCost { get; private set; } = float.MaxValue;
+    public float WinnerContinuityCost { get; private set; }
+    public float WinnerLoopCost { get; private set; }
+    public int SwitchCount { get; private set; }
+    public int SeekCount { get; private set; }
+    public float LastQueryMs { get; private set; }
+    public string ActiveTag { get; private set; } = string.Empty;
 
-    [EditorOrder(61), EditorDisplay("Telemetry"), ReadOnly]
-    public int WinnerSample = -1;
+    // P2: TurnDriveActive/Yaw mirrors deleted with the native turn machine.
+    // Committed-turn facing is owned game-side (facade driver facing); the
+    // core never steers facing anymore.
 
-    [EditorOrder(62), EditorDisplay("Telemetry"), ReadOnly]
-    public int WinnerClip = -1;
+    public bool WinnerIsLoop { get; private set; }
+    public float LoopPreferenceApplied { get; private set; }
+    public float BestLoopCost { get; private set; } = float.MaxValue;
+    public string BestLoopClipName { get; private set; } = string.Empty;
+    public float BestOneShotCost { get; private set; } = float.MaxValue;
+    public string BestOneShotClipName { get; private set; } = string.Empty;
+    public int LoopScoredCount { get; private set; }
+    public int OneShotScoredCount { get; private set; }
+    public int LoopTotalCount { get; private set; }
+    public int OneShotTotalCount { get; private set; }
+    public string LastSwitchReason { get; private set; } = string.Empty;
+    public string ChooserStatus { get; private set; } = string.Empty;
+    public int TraceEntries { get; private set; }
 
-    [EditorOrder(63), EditorDisplay("Telemetry"), ReadOnly]
-    public string WinnerClipName = string.Empty;
-
-    [EditorOrder(63), EditorDisplay("Telemetry"), ReadOnly]
-    public float WinnerCost = float.MaxValue;
-
-    [EditorOrder(64), EditorDisplay("Telemetry"), ReadOnly]
-    public float SecondBestCost = float.MaxValue;
-
-    [EditorOrder(65), EditorDisplay("Telemetry"), ReadOnly]
-    public float WinnerPoseCost = float.MaxValue;
-
-    [EditorOrder(66), EditorDisplay("Telemetry"), ReadOnly]
-    public float WinnerTrajectoryCost = float.MaxValue;
-
-    [EditorOrder(67), EditorDisplay("Telemetry"), ReadOnly]
-    public float WinnerContinuityCost;
-
-    [EditorOrder(68), EditorDisplay("Telemetry"), ReadOnly]
-    public float WinnerLoopCost;
-
-    [EditorOrder(69), EditorDisplay("Telemetry"), ReadOnly]
-    public int SwitchCount;
-
-    [EditorOrder(70), EditorDisplay("Telemetry"), ReadOnly]
-    public int SeekCount;
-
-    [EditorOrder(71), EditorDisplay("Telemetry"), ReadOnly]
-    public float LastQueryMs;
-
-    [EditorOrder(72), EditorDisplay("Telemetry"), ReadOnly]
-    public string ActiveTag = string.Empty;
-
-    [EditorOrder(72), EditorDisplay("Telemetry"), ReadOnly]
-    public bool TurnDriveActive;
-
-    [EditorOrder(72), EditorDisplay("Telemetry"), ReadOnly]
-    public float TurnDriveYaw;
-
-    [EditorOrder(73), EditorDisplay("Telemetry"), ReadOnly]
-    public bool WinnerIsLoop;
-
-    [EditorOrder(74), EditorDisplay("Telemetry"), ReadOnly]
-    public float LoopPreferenceApplied;
-
-    [EditorOrder(75), EditorDisplay("Telemetry"), ReadOnly]
-    public float BestLoopCost = float.MaxValue;
-
-    [EditorOrder(76), EditorDisplay("Telemetry"), ReadOnly]
-    public string BestLoopClipName = string.Empty;
-
-    [EditorOrder(77), EditorDisplay("Telemetry"), ReadOnly]
-    public float BestOneShotCost = float.MaxValue;
-
-    [EditorOrder(78), EditorDisplay("Telemetry"), ReadOnly]
-    public string BestOneShotClipName = string.Empty;
-
-    [EditorOrder(79), EditorDisplay("Telemetry"), ReadOnly]
-    public int LoopScoredCount;
-
-    [EditorOrder(80), EditorDisplay("Telemetry"), ReadOnly]
-    public int OneShotScoredCount;
-
-    [EditorOrder(81), EditorDisplay("Telemetry"), ReadOnly]
-    public int LoopTotalCount;
-
-    [EditorOrder(82), EditorDisplay("Telemetry"), ReadOnly]
-    public int OneShotTotalCount;
-
-    [EditorOrder(83), EditorDisplay("Telemetry"), ReadOnly]
-    public string LastSwitchReason = string.Empty;
-
-    [EditorOrder(84), EditorDisplay("Telemetry"), ReadOnly]
-    public string ChooserStatus = string.Empty;
-
-    [EditorOrder(85), EditorDisplay("Telemetry"), ReadOnly]
-    public int TraceEntries;
-
-    [EditorOrder(86), EditorDisplay("Telemetry"), ReadOnly]
-    public int HoldCount;
-
-    [EditorOrder(87), EditorDisplay("Telemetry"), ReadOnly]
-    public int TurnReplayCount;
-
-    [EditorOrder(88), EditorDisplay("Telemetry"), ReadOnly]
-    public int SettleCount;
-
-    [EditorOrder(89), EditorDisplay("Telemetry"), ReadOnly]
-    public int RecoveryCount;
-
-    [EditorOrder(90), EditorDisplay("Telemetry"), ReadOnly]
-    public int JumpCount;
-
-    [EditorOrder(91), EditorDisplay("Telemetry"), ReadOnly]
-    public float LayerAngle;
-
-    [EditorOrder(92), EditorDisplay("Telemetry"), ReadOnly]
-    public float LayerPrimary;
-
-    [EditorOrder(93), EditorDisplay("Telemetry"), ReadOnly]
-    public float LayerSecondary;
-
-    [EditorOrder(93), EditorDisplay("Telemetry"), ReadOnly]
-    public bool LayerGateApplied;
-
-    [EditorOrder(94), EditorDisplay("Telemetry"), ReadOnly]
-    public bool FootLockL;
-
-    [EditorOrder(95), EditorDisplay("Telemetry"), ReadOnly]
-    public bool FootLockR;
-
-    [EditorOrder(96), EditorDisplay("Telemetry"), ReadOnly]
-    public float FootCorrL;
-
-    [EditorOrder(97), EditorDisplay("Telemetry"), ReadOnly]
-    public float FootCorrR;
-
-    [EditorOrder(98), EditorDisplay("Telemetry"), ReadOnly]
-    public int FastPathHits;
+    // P2: machine/overlay/IK telemetry deleted with their producers
+    // (HoldCount, TurnReplayCount, SettleCount, RecoveryCount, JumpCount,
+    // LayerAngle/Primary/Secondary/GateApplied, FootLockL/R, FootCorrL/R).
+    // Search telemetry above (switches, seeks, query ms, fast path) stays.
+    public int FastPathHits { get; private set; }
 
     private MotionMatchingRuntimePolicy _policy;
     private bool _telemetryWarned;
-    private bool _providerWarned;
-    private int _frameId;
 
     public float[] TrajectorySampleTimes => Database?.TrajectorySampleTimes ?? Schema.TrajectorySampleTimes;
 
+    public bool IsReady => _policy != null && _policy.IsReady;
+
     /// <summary>
     /// Live playback handle for game-side integrations (e.g. pose overlays
-    /// attach here). Null until the first tick initializes the policy.
+    /// attach here). Null until the first update initializes the policy.
     /// </summary>
     public MotionMatchingPlayback Playback => _policy != null ? _policy.GetPlayback() : null;
 
-    public override void OnEnable()
+    /// <summary>
+    /// P0 additive-only: publish the existing search-pose path without
+    /// touching Update. Returns the playback's current search locals plus the
+    /// current winner (false + defaults when the policy is not ready).
+    /// </summary>
+    public bool TryGetBasePose(out Matrix[] locals, out int winnerClip, out float winnerCost)
     {
-        base.OnEnable();
+        locals = System.Array.Empty<Matrix>();
+        winnerClip = -1;
+        winnerCost = float.MaxValue;
+        if (_policy == null || !_policy.IsReady)
+            return false;
+        var playback = _policy.GetPlayback();
+        if (playback == null)
+            return false;
+        locals = playback.GetSearchLocals() ?? System.Array.Empty<Matrix>();
+        winnerClip = _policy.WinnerClip;
+        winnerCost = _policy.WinnerCost;
+        return true;
+    }
 
+    /// <summary>
+    /// P0 additive-only force-clip hatch for future game drivers. Forwards
+    /// to playback Play with forceSeek:true and logs the reason on EVERY
+    /// call (anti-abuse). No production callers yet.
+    /// </summary>
+    public void ForcePlayClip(int clipIndex, float startTime, string reason)
+    {
+        Debug.Log("MotionMatchingController.ForcePlayClip: clip=" + clipIndex
+            + " startTime=" + startTime + " reason=" + (reason ?? string.Empty));
+        var playback = Playback;
+        if (playback == null)
+            return;
+        playback.Play(clipIndex, startTime, true);
+    }
+
+    /// <summary>
+    /// P3 explicit init (replaces the Script OnEnable): the game facade
+    /// assigns Schema/PlayerModel/DatabasePath/CharacterBody + session
+    /// config first, then calls this. Content.Load works outside Scripts —
+    /// Globals remain usable here.
+    /// </summary>
+    public void Initialize()
+    {
         _telemetryWarned = false;
 
         // Unified load path (no editor partial): Content.Load works in both
@@ -368,45 +253,29 @@ public class MotionMatchingController : Script
         EnsureDatabaseLoadedForGame();
     }
 
+    // P3: the P2 rebuild-compat reflection shim for the legacy native scope
+    // gate is deleted with the facade (the P2 headers no longer carry it).
+
     /// <summary>
-    /// Clears native playback state and snaps the provider (scope + predictor
-    /// reseed). Call after teleport/respawn.
+    /// Clears native playback state. The game facade resets its provider
+    /// (scope + predictor) and drivers separately — this class no longer
+    /// owns any provider reference. Call after teleport/respawn.
     /// </summary>
     public void ResetPlayback()
     {
         _policy?.ResetOnTeleport();
-        (InputProvider as IMotionMatchingInputProvider)?.Reset();
     }
 
     /// <summary>
-    /// Policy + playback tick. The game driver pushes fresh player state into
-    /// the provider first, then calls this. The provider's frame is the only
-    /// input: movement, trajectory, scope and locomotion tuning. Loads the
-    /// database on first tick if OnEnable found none.
+    /// P3 policy + playback tick. The game facade builds the provider frame
+    /// itself (provider.BuildInput) and passes it in with the actor world
+    /// transform — this class never calls a provider. Loads the database on
+    /// first tick if Initialize found none.
     /// </summary>
-    public void TickPolicy(float deltaTime)
+    public void Update(float deltaTime, Transform actorWorld, MotionMatchingFrameInput input)
     {
         if (CharacterBody == null)
             return;
-
-        var provider = InputProvider as IMotionMatchingInputProvider;
-        // A destroyed script reads as null; a disabled one must not be
-        // ticked even though the slot still references it (lifecycle D1:
-        // never drive animation from a provider the host switched off).
-        bool providerOff = InputProvider != null &&
-            InputProvider is Script providerScript && !providerScript.Enabled;
-        if (provider == null || providerOff)
-        {
-            if (!_providerWarned)
-            {
-                _providerWarned = true;
-                Debug.LogWarning(providerOff
-                    ? "MotionMatchingController: InputProvider is disabled; animation tick skipped until it is re-enabled or replaced."
-                    : "MotionMatchingController: InputProvider slot is empty or does not implement IMotionMatchingInputProvider. Assign a provider (e.g. the locomotion sample); animation tick skipped.");
-            }
-            return;
-        }
-        _providerWarned = false;
 
         if (_policy == null)
             _policy = new MotionMatchingRuntimePolicy();
@@ -439,7 +308,7 @@ public class MotionMatchingController : Script
             return;
 
         // Debug-only trace gate with a visible warning (codex review): the
-        // scene TelemetryLog field is never written at runtime; the host
+        // host TelemetryLog field is never written at runtime; the host
         // flips only TelemetryOverride above.
         if (_policy.GetTrace() != null)
             _policy.GetTrace().Enabled = EffectiveTelemetry;
@@ -448,18 +317,6 @@ public class MotionMatchingController : Script
             _telemetryWarned = true;
             Debug.LogWarning("Motion matching telemetry/trace is ACTIVE (debug-only: per-query clones + file logging). Turn off TelemetryLog for shipping builds.");
         }
-
-        // The single input call: provider owns scope, trajectory and
-        // locomotion tuning; the shell only forwards plain data.
-        var ctx = new MotionMatchingInputContext
-        {
-            ActorWorld = Actor.Transform,
-            DeltaTime = deltaTime,
-            FrameId = ++_frameId,
-            DatabaseTags = AnimationTags,
-            SampleTimes = TrajectorySampleTimes,
-        };
-        MotionMatchingFrameInput input = provider.BuildInput(ctx);
 
         var snapshot = new MotionMatchingPlayerSnapshot
         {
@@ -470,9 +327,6 @@ public class MotionMatchingController : Script
             CurrentYaw = input.CurrentYaw,
             IsGrounded = input.IsGrounded,
             IsSprinting = input.IsSprinting,
-            LayerAngleDeg = input.LayerAngleDeg,
-            GateBone = input.GateBone,
-            ScopeConstrained = input.HasScope,
             AllowedTagSet = input.AllowedTagSet ?? string.Empty,
             ExcludedTagSet = input.ExcludedTagSet ?? string.Empty,
         };
@@ -481,15 +335,9 @@ public class MotionMatchingController : Script
             PoseWeight = Schema.PoseWeight,
             TrajectoryWeight = Schema.TrajectoryWeight,
             SampleRate = Schema.SampleRate,
-            IdleSpeedMax = input.RestSpeedMax,
-            WalkSpeedMax = input.JumpWalkSpeedMax,
-            RunSpeedMax = input.JumpRunSpeedMax,
-            YawRateThreshold = input.YawRateThreshold,
             FairFightAccum = FairFightAccum,
             FairFightWindow = FairFightWindow,
-            TagConfirmRepeats = input.TagConfirmRepeats,
             SettleToLoopDelay = SettleToLoopDelay,
-            TurnMinSwitchTime = TurnMinSwitchTime,
             MinSwitchTime = MinSwitchTime,
             SameClipExclusion = SameClipExclusion,
             SameClipSeekThreshold = SameClipSeekThreshold,
@@ -505,27 +353,12 @@ public class MotionMatchingController : Script
             VerifyIndexedSearch = VerifyIndexedSearch,
             IndexedVerifyAuto = IndexedVerifyAuto,
             EffectiveTelemetry = EffectiveTelemetry,
-            EnableFootIK = EnableFootIK,
-            EnableJumpDriver = input.EnableJumpDriver,
-            EnableTurnDrive = input.EnableTurnDrive,
             ContinuityWeight = ContinuityWeight,
             CostFuseThreshold = CostFuseThreshold,
-            TurnDriveAngle = TurnDriveAngle,
-            TurnLookahead = TurnLookahead,
-            TurnPatientAngle = TurnPatientAngle,
-            TurnPatientTime = TurnPatientTime,
-            TurnSettleRate = TurnSettleRate,
-            BackwardThreshold = input.BackwardThreshold,
-            LateralThreshold = input.LateralThreshold,
-            LateralZRatio = input.LateralZRatio,
-            JumpTag = input.JumpTag ?? string.Empty,
-            TurnInPlaceTag = input.TurnInPlaceTag ?? string.Empty,
-            TurnTravelTag = input.TurnTravelTag ?? string.Empty,
-            RestTag = input.RestTag ?? string.Empty,
         };
         _policy.Tick(deltaTime, snapshot,
             input.Points ?? Array.Empty<TrajectoryPoint>(),
-            Actor.Transform.GetWorld(), TrajectorySampleTimes, tuning);
+            actorWorld.GetWorld(), TrajectorySampleTimes, tuning);
 
         PolicyState = _policy.PolicyState;
         WinnerSample = _policy.WinnerSample;
@@ -540,8 +373,6 @@ public class MotionMatchingController : Script
         SeekCount = _policy.SeekCount;
         LastQueryMs = _policy.LastQueryMs;
         ActiveTag = _policy.ActiveTag;
-        TurnDriveActive = _policy.TurnDriveActive;
-        TurnDriveYaw = _policy.TurnDriveYaw;
         WinnerLoopCost = _policy.WinnerLoopCost;
         WinnerIsLoop = _policy.WinnerIsLoop;
         LoopPreferenceApplied = _policy.LoopPreferenceApplied;
@@ -556,19 +387,6 @@ public class MotionMatchingController : Script
         LastSwitchReason = _policy.LastSwitchReason;
         ChooserStatus = _policy.ChooserStatusText;
         TraceEntries = _policy.GetTrace() != null ? _policy.GetTrace().Count : 0;
-        HoldCount = _policy.HoldCount;
-        TurnReplayCount = _policy.TurnReplayCount;
-        SettleCount = _policy.SettleCount;
-        RecoveryCount = _policy.RecoveryCount;
-        JumpCount = _policy.JumpCount;
-        LayerAngle = _policy.LastLayerRequested;
-        LayerPrimary = _policy.LastLayerPrimary;
-        LayerSecondary = _policy.LastLayerSecondary;
-        LayerGateApplied = _policy.LastLayerGateApplied;
-        FootLockL = _policy.LastFootLockL;
-        FootLockR = _policy.LastFootLockR;
-        FootCorrL = _policy.LastFootCorrL;
-        FootCorrR = _policy.LastFootCorrR;
         FastPathHits = _policy.FastPathHits;
     }
 
@@ -617,7 +435,7 @@ public class MotionMatchingController : Script
     public static bool SchemaEquals(in PoseSearchSchema a, in PoseSearchSchema b)
     {
         float AxisTolerance = 0.001f;
-        
+
         // The baker stores normalized axes, so compare directions rather than raw vectors.
         if (a.SampleRate != b.SampleRate ||
             !Float3.NearEqual(Float3.Normalize(a.RootForwardAxis), Float3.Normalize(b.RootForwardAxis), AxisTolerance) ||

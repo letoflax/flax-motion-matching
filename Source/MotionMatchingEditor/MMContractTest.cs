@@ -5,9 +5,10 @@ namespace MotionMatching;
 
 /// <summary>
 /// Scripted input provider for the contract test below. Plain counter +
-/// canned frame; no game logic.
+/// canned frame; no game logic. P3: plain class (the runtime no longer owns
+/// a provider slot — the game facade builds frames itself).
 /// </summary>
-public class MMContractTestProvider : Script, IMotionMatchingInputProvider
+public class MMContractTestProvider : IMotionMatchingInputProvider
 {
     public int BuildCalls;
     public bool ResetCalled;
@@ -26,17 +27,42 @@ public class MMContractTestProvider : Script, IMotionMatchingInputProvider
 }
 
 /// <summary>
-/// Provider-contract tests (MM plugin §14, review R11): explicit-empty,
-/// unconstrained, reset propagation, mid-play swap, driver opt-outs.
-/// Runs in PLAY mode on the loaded PlayerTestScene through a private policy
-/// instance (never touches the scene's live policy) plus the shell slot
-/// with save/restore. Surfaced via the mm.tuning bridge op "contract".
-/// Play mode is required: pose sampling and playback only tick live there
-/// (edit-mode ticks run no queries, so A/B cannot assert).
+/// Runtime-contract tests (P2 boundary locks, P3 re-anchored): explicit-empty
+/// no-match, provider scope respected, reset-then-soak stays usable, per-frame
+/// source swap takes effect, input free of gameplay fields (compile-level),
+/// pose-out equals the internal search locals, force-hatch effect, and pure
+/// search with no machine direct-plays. E1/E2 driver locks are deleted with
+/// the native machines.
+///
+/// P3: all checks run through the plain runtime object (Update with canned
+/// frames + an identity world transform), never through provider slots or
+/// hand-built native structs: the generated snapshot/tuning layouts are owned
+/// by the native build. Runs in PLAY mode (pose sampling and playback only
+/// tick live there).
 /// </summary>
 public static class MMContractTest
 {
     private const float Dt = 1.0f / 60.0f;
+
+    // Field names that must NOT exist on the P2 frame (gameplay lives
+    // game-side; the core takes movement + trajectory + scope only).
+    private static readonly string[] DeadFrameFields = new string[]
+    {
+        "HasScope",
+        "JumpTag", "TurnInPlaceTag", "TurnTravelTag", "RestTag",
+        "RestSpeedMax", "JumpWalkSpeedMax", "JumpRunSpeedMax",
+        "YawRateThreshold", "TagConfirmRepeats",
+        "BackwardThreshold", "LateralThreshold", "LateralZRatio",
+        "LayerAngleDeg", "GateBone",
+        "EnableJumpDriver", "EnableTurnDrive",
+    };
+
+    private static readonly string[] MachineReasonPrefixes = new string[]
+    {
+        "jump:", "drive:", "held:landing", "held:turn", "replay:turn",
+    };
+
+    private static readonly Transform TestWorld = new Transform(Float3.Zero, Quaternion.Identity, Float3.One);
 
     public static string RunAll(MotionMatchingController controller)
     {
@@ -64,221 +90,178 @@ public static class MMContractTest
             return "CONTRACT FAIL: need 6 sample times, got " +
                 (sampleTimes == null ? "null" : sampleTimes.Length.ToString()) + ".";
 
-        // A: explicit-empty scope = no-match, never a silent pool fallback.
+        // 1: explicit-empty scope = no-match, never a silent pool fallback.
         {
-            var policy = NewPolicy(controller);
-            var tuning = BaseTuning();
-            var snapshot = BaseSnapshot();
-            snapshot.ScopeConstrained = true;
-            snapshot.AllowedTagSet = string.Empty;
-            snapshot.ExcludedTagSet = string.Empty;
-            TickN(policy, snapshot, tuning, controller, 100);
-            bool statusOk = policy.ChooserStatusText.StartsWith("ext:empty");
-            bool reasonOk = policy.LastSwitchReason == "no-result:empty-scope";
+            var prov = NewCanned(string.Empty, string.Empty);
+            controller.ResetPlayback();
+            TickProvider(controller, prov, 100);
+            bool statusOk = controller.ChooserStatus.StartsWith("ext:empty");
+            bool reasonOk = controller.LastSwitchReason == "no-result:empty-scope";
             Check("explicit-empty", statusOk && reasonOk,
-                "chooser='" + policy.ChooserStatusText + "' reason='" + policy.LastSwitchReason + "'");
-            policy.Shutdown();
+                "chooser='" + controller.ChooserStatus + "' reason='" + controller.LastSwitchReason + "'");
         }
 
-        // B: unconstrained = legacy native path (no "ext:" status).
+        // 2: provider scope is respected (single-tag idle at rest).
         {
-            var policy = NewPolicy(controller);
-            var tuning = BaseTuning();
-            var snapshot = BaseSnapshot();
-            snapshot.ScopeConstrained = false;
-            snapshot.AllowedTagSet = string.Empty;
-            TickN(policy, snapshot, tuning, controller, 100);
-            bool ok = !policy.ChooserStatusText.StartsWith("ext:") &&
-                policy.ChooserStatusText.Length > 0;
-            Check("unconstrained-legacy", ok,
-                "chooser='" + policy.ChooserStatusText + "'");
-            policy.Shutdown();
+            var prov = NewCanned("idle", string.Empty);
+            controller.ResetPlayback();
+            TickProvider(controller, prov, 120);
+            bool ok = controller.ActiveTag == "idle";
+            Check("scope-respected", ok,
+                "activeTag='" + controller.ActiveTag + "' winner='" + controller.WinnerClipName + "'");
         }
 
-        // C: shell ResetPlayback propagates to the provider.
+        // 3: reset leaves the runtime usable (P3: the runtime owns no
+        // provider slot, so there is no reset propagation to test here —
+        // the facade resets its provider separately. Reset then soak must
+        // still settle on the scoped tag).
         {
-            var prov = controller.Actor.AddScript<MMContractTestProvider>();
-            Script saved = controller.InputProvider;
-            controller.InputProvider = prov;
-            try
+            var prov = NewCanned("idle", string.Empty);
+            controller.ResetPlayback();
+            TickProvider(controller, prov, 120);
+            bool ok = controller.ActiveTag == "idle";
+            Check("reset-then-soak", ok,
+                "activeTag='" + controller.ActiveTag + "' after ResetPlayback");
+        }
+
+        // 4: per-frame source swap takes effect on the next update (P3: the
+        // facade feeds frames directly, so swap = different frame contents:
+        // idle soak, then empty scope must flip the chooser to ext:empty,
+        // then idle must recover).
+        {
+            var idle = NewCanned("idle", string.Empty);
+            var empty = NewCanned(string.Empty, string.Empty);
+            controller.ResetPlayback();
+            TickProvider(controller, idle, 60);
+            TickProvider(controller, empty, 60);
+            bool emptyOk = controller.ChooserStatus.StartsWith("ext:empty");
+            TickProvider(controller, idle, 120);
+            bool recoverOk = controller.ActiveTag == "idle";
+            Check("frame-swap", emptyOk && recoverOk,
+                "emptyChooser='" + controller.ChooserStatus + "' recoveredTag='" + controller.ActiveTag + "'");
+            controller.ResetPlayback();
+        }
+
+        // 5: input carries no gameplay fields (compile-level boundary).
+        {
+            var names = new HashSet<string>();
+            foreach (var f in typeof(MotionMatchingFrameInput).GetFields())
+                names.Add(f.Name);
+            var leaked = new List<string>();
+            foreach (string dead in DeadFrameFields)
             {
-                controller.ResetPlayback();
-                Check("reset-propagates", prov.ResetCalled,
-                    "provider.ResetCalled=" + prov.ResetCalled);
+                if (names.Contains(dead))
+                    leaked.Add(dead);
             }
-            finally
-            {
-                controller.InputProvider = saved;
-                Destroy(prov);
-            }
+            Check("input-no-gameplay-fields", leaked.Count == 0,
+                leaked.Count == 0
+                    ? "frame fields=[" + string.Join(",", names) + "]"
+                    : "leaked=[" + string.Join(",", leaked) + "]");
         }
 
-        // D: mid-play provider swap takes effect on the next tick.
+        // 6: pose-out equals the internal search locals.
         {
-            var provA = controller.Actor.AddScript<MMContractTestProvider>();
-            var provB = controller.Actor.AddScript<MMContractTestProvider>();
-            provA.FrameToReturn = CannedFrame(sampleTimes);
-            provB.FrameToReturn = CannedFrame(sampleTimes);
-            Script saved = controller.InputProvider;
-            try
+            var prov = NewCanned("idle", string.Empty);
+            controller.ResetPlayback();
+            TickProvider(controller, prov, 30);
+            bool ok = false;
+            string detail = "TryGetBasePose=false";
+            if (controller.TryGetBasePose(out Matrix[] locals, out int clip, out float cost))
             {
-                controller.InputProvider = provA;
-                controller.TickPolicy(Dt);
-                controller.TickPolicy(Dt);
-                int aCalls = provA.BuildCalls;
-                controller.InputProvider = provB;
-                controller.TickPolicy(Dt);
-                controller.TickPolicy(Dt);
-                bool ok = aCalls >= 2 && provA.BuildCalls == aCalls && provB.BuildCalls >= 2;
-                Check("provider-swap", ok,
-                    "A=" + provA.BuildCalls + " (was " + aCalls + ") B=" + provB.BuildCalls);
-                controller.ResetPlayback();
+                var playback = controller.Playback;
+                Matrix[] internals = playback != null ? playback.GetSearchLocals() : null;
+                if (internals != null && locals.Length == internals.Length && locals.Length > 0)
+                {
+                    ok = true;
+                    for (int i = 0; i < locals.Length; i++)
+                    {
+                        if (!locals[i].Equals(internals[i]))
+                        {
+                            ok = false;
+                            break;
+                        }
+                    }
+                    detail = "bones=" + locals.Length + " clip=" + clip;
+                }
+                else
+                {
+                    detail = "lens out=" + locals.Length + " internal=" + (internals == null ? "null" : internals.Length.ToString());
+                }
             }
-            finally
+            Check("pose-out-is-search-locals", ok, detail);
+        }
+
+        // 7: force-hatch lands the requested clip (P0 hatch, logs every call).
+        {
+            var prov = NewCanned("idle", string.Empty);
+            controller.ResetPlayback();
+            TickProvider(controller, prov, 10);
+            var playback = controller.Playback;
+            int clips = controller.Database != null ? controller.Database.ClipCount : 0;
+            bool ok = false;
+            string detail = "no playback/clips";
+            if (playback != null && clips > 1)
             {
-                controller.InputProvider = saved;
-                Destroy(provA);
-                Destroy(provB);
+                int target = (playback.CurrentClip + 1) % clips;
+                controller.ForcePlayClip(target, 0.0f, "contract:force-hatch");
+                ok = playback.CurrentClip == target;
+                detail = "forced=" + target + " current=" + playback.CurrentClip;
             }
+            Check("force-hatch", ok, detail);
         }
 
-        // E1: jump driver off = airborne never takes off.
+        // 8: pure search — a grounded fixed-scope soak never takes a
+        // machine direct-play (no jump/drive/hold/replay reasons; only
+        // the search-winner path and the ForcePlayClip hatch may Play).
         {
-            var policy = NewPolicy(controller);
-            var tuning = BaseTuning();
-            tuning.EnableJumpDriver = false;
-            var snapshot = BaseSnapshot();
-            snapshot.IsGrounded = false;
-            snapshot.CurrentVelocity = new Float3(0.0f, -100.0f, 300.0f);
-            TickN(policy, snapshot, tuning, controller, 30);
-            bool ok = policy.JumpCount == 0;
-            Check("jump-driver-off", ok, "JumpCount=" + policy.JumpCount);
-
-            var policyOn = NewPolicy(controller);
-            var tuningOn = BaseTuning();
-            tuningOn.EnableJumpDriver = true;
-            TickN(policyOn, snapshot, tuningOn, controller, 30);
-            bool okOn = policyOn.JumpCount >= 1;
-            Check("jump-driver-on-positive", okOn, "JumpCount=" + policyOn.JumpCount);
-            policy.Shutdown();
-            policyOn.Shutdown();
+            var prov = NewCanned("idle", string.Empty);
+            controller.ResetPlayback();
+            TickProvider(controller, prov, 90);
+            string reason = controller.LastSwitchReason ?? string.Empty;
+            bool machine = false;
+            foreach (string prefix in MachineReasonPrefixes)
+            {
+                if (reason.StartsWith(prefix))
+                {
+                    machine = true;
+                    break;
+                }
+            }
+            Check("pure-search-no-machine-play", !machine,
+                "reason='" + reason + "' chooser='" + controller.ChooserStatus + "'");
         }
 
-        // E2: turn drive off = huge facing error never commits a turn.
-        // 45 ticks: the drive would start right after the 0.5s warmup
-        // (~tick 31) and still be mid-clip at the assert; 90 ticks could
-        // outlast the turn clip and exit normally.
-        {
-            var policy = NewPolicy(controller);
-            var tuning = BaseTuning();
-            tuning.EnableTurnDrive = false;
-            var snapshot = BaseSnapshot();
-            snapshot.TargetYaw = 120.0f;
-            snapshot.CurrentYaw = 0.0f;
-            TickN(policy, snapshot, tuning, controller, 45);
-            bool ok = !policy.TurnDriveActive;
-            Check("turn-drive-off", ok, "TurnDriveActive=" + policy.TurnDriveActive);
-
-            var policyOn = NewPolicy(controller);
-            var tuningOn = BaseTuning();
-            tuningOn.EnableTurnDrive = true;
-            TickN(policyOn, snapshot, tuningOn, controller, 45);
-            bool okOn = policyOn.TurnDriveActive;
-            Check("turn-drive-on-positive", okOn, "TurnDriveActive=" + policyOn.TurnDriveActive);
-            policy.Shutdown();
-            policyOn.Shutdown();
-        }
+        controller.ResetPlayback();
 
         string verdict = passed == total ? "CONTRACT PASS" : "CONTRACT FAIL";
         return verdict + ": " + passed + "/" + total + " checks\n" + string.Join("\n", lines);
     }
 
-    private static MotionMatchingRuntimePolicy NewPolicy(MotionMatchingController controller)
+    private static MMContractTestProvider NewCanned(string allowed, string excluded)
     {
-        var policy = new MotionMatchingRuntimePolicy();
-        policy.Initialize(controller.Database, controller.CharacterBody,
-            controller.Schema, string.Empty, 0.25f);
-        return policy;
+        return new MMContractTestProvider { FrameToReturn = CannedFrame(allowed, excluded) };
     }
 
-    private static MotionMatchingPolicyTuning BaseTuning()
+    private static void TickProvider(MotionMatchingController controller, MMContractTestProvider prov, int n)
     {
-        // Explicit every field: C# `new` on a bound struct does NOT run the
-        // C++ member initializers, so unset fields read zero (a zeroed
-        // YawRateThreshold once let every hold gate pass and swallowed all
-        // queries). Values mirror the shell/provider defaults; search is
-        // deterministic: every warmed tick scans unstrided, brute force,
-        // no telemetry, no IK sweeps.
-        return new MotionMatchingPolicyTuning
+        for (int i = 0; i < n; i++)
         {
-            PoseWeight = 1.0f,
-            TrajectoryWeight = 2.0f,
-            SampleRate = 30.0f,
-            IdleSpeedMax = 5.0f,
-            WalkSpeedMax = 200.0f,
-            RunSpeedMax = 490.0f,
-            YawRateThreshold = 0.5f,
-            FairFightAccum = 40.0f,
-            FairFightWindow = 0.25f,
-            TagConfirmRepeats = 2,
-            SettleToLoopDelay = 0.3f,
-            TurnMinSwitchTime = 0.3f,
-            MinSwitchTime = 0.12f,
-            SameClipExclusion = 0.25f,
-            SameClipSeekThreshold = 0.25f,
-            ContinuingBias = 0.012f,
-            ContinuingWindow = 0.15f,
-            SwitchMargin = 0.008f,
-            RestLoopPreference = 0.02f,
-            FrameSearchBudget = 0,
-            SearchEveryFrame = true,
-            QueryInterval = 0.1f,
-            UseIndexedSearch = false,
-            TopKCandidates = 16,
-            VerifyIndexedSearch = false,
-            IndexedVerifyAuto = false,
-            EffectiveTelemetry = false,
-            EnableFootIK = false,
-            EnableJumpDriver = true,
-            EnableTurnDrive = true,
-            ContinuityWeight = 0.0025f,
-            CostFuseThreshold = 2.0f,
-            TurnDriveAngle = 25.0f,
-            TurnLookahead = 0.2f,
-            TurnPatientAngle = 15.0f,
-            TurnPatientTime = 1.0f,
-            TurnSettleRate = 2.0f,
-            BackwardThreshold = 30.0f,
-            LateralThreshold = 30.0f,
-            LateralZRatio = 0.58f,
-            JumpTag = "jump",
-            TurnInPlaceTag = "turn_inplace",
-            TurnTravelTag = "turn_travel",
-            RestTag = "idle",
-        };
+            var ctx = new MotionMatchingInputContext
+            {
+                ActorWorld = TestWorld,
+                DeltaTime = Dt,
+                FrameId = i,
+                DatabaseTags = controller.AnimationTags,
+                SampleTimes = controller.TrajectorySampleTimes,
+            };
+            MotionMatchingFrameInput frame = prov.BuildInput(ctx);
+            controller.Update(Dt, TestWorld, frame);
+        }
     }
 
-    private static MotionMatchingPlayerSnapshot BaseSnapshot()
+    private static MotionMatchingFrameInput CannedFrame(string allowed, string excluded)
     {
-        return new MotionMatchingPlayerSnapshot
-        {
-            CurrentVelocity = Float3.Zero,
-            DesiredVelocity = Float3.Zero,
-            AngularVelocity = Float3.Zero,
-            TargetYaw = 0.0f,
-            CurrentYaw = 0.0f,
-            LayerAngleDeg = 0.0f,
-            GateBone = false,
-            IsGrounded = true,
-            IsSprinting = false,
-            ScopeConstrained = false,
-            AllowedTagSet = string.Empty,
-            ExcludedTagSet = string.Empty,
-        };
-    }
-
-    private static MotionMatchingFrameInput CannedFrame(float[] sampleTimes)
-    {
+        // P2 slim frame: movement + trajectory + scope only.
         return new MotionMatchingFrameInput
         {
             Velocity = Float3.Zero,
@@ -290,44 +273,8 @@ public static class MMContractTest
             IsGrounded = true,
             IsSprinting = false,
             Points = new TrajectoryPoint[6],
-            HasScope = false,
-            AllowedTagSet = string.Empty,
-            ExcludedTagSet = string.Empty,
-            JumpTag = "jump",
-            TurnInPlaceTag = "turn_inplace",
-            TurnTravelTag = "turn_travel",
-            RestTag = "idle",
-            RestSpeedMax = 5.0f,
-            JumpWalkSpeedMax = 200.0f,
-            JumpRunSpeedMax = 490.0f,
-            YawRateThreshold = 0.5f,
-            TagConfirmRepeats = 2,
-            BackwardThreshold = 30.0f,
-            LateralThreshold = 30.0f,
-            LateralZRatio = 0.58f,
-            LayerAngleDeg = 0.0f,
-            GateBone = false,
-            EnableJumpDriver = true,
-            EnableTurnDrive = true,
+            AllowedTagSet = allowed ?? string.Empty,
+            ExcludedTagSet = excluded ?? string.Empty,
         };
-    }
-
-    private static void TickN(MotionMatchingRuntimePolicy policy,
-        MotionMatchingPlayerSnapshot snapshot, MotionMatchingPolicyTuning tuning,
-        MotionMatchingController controller, int n)
-    {
-        var points = new TrajectoryPoint[6];
-        for (int i = 0; i < n; i++)
-        {
-            policy.Tick(Dt, snapshot, points,
-                controller.Actor.Transform.GetWorld(),
-                controller.TrajectorySampleTimes, tuning);
-        }
-    }
-
-    private static void Destroy(Script script)
-    {
-        if (script)
-            Object.Destroy(script);
     }
 }

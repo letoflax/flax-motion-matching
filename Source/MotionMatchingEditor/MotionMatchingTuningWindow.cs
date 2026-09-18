@@ -19,14 +19,16 @@ public class MotionMatchingTuningWindow : CustomEditorWindow
     private const int TopRows = 8;
 
     private readonly MotionMatchingController _controller;
+    private readonly System.Action _onEdited;
     private LabelElement _validity;
     private LabelElement _live;
     private readonly LabelElement[] _topLabels = new LabelElement[TopRows];
     private LabelElement _status;
 
-    public MotionMatchingTuningWindow(MotionMatchingController controller)
+    public MotionMatchingTuningWindow(MotionMatchingController controller, System.Action onEdited = null)
     {
         _controller = controller;
+        _onEdited = onEdited;
     }
 
     public override void Initialize(LayoutElementsContainer layout)
@@ -56,11 +58,11 @@ public class MotionMatchingTuningWindow : CustomEditorWindow
         layout.Label("Weight Presets (live, no rebake)", TextAlignment.Near);
         var presets = layout.HorizontalPanel();
         var baseline = presets.Button("Baseline").Button;
-        baseline.Clicked += () => { if (_controller != null) { MotionMatchingEditorService.ApplyPresetBaseline(_controller); ApplyPresetDone("baseline"); } };
+        baseline.Clicked += () => { if (_controller != null) { MotionMatchingEditorService.ApplyPresetBaseline(_controller, _onEdited); ApplyPresetDone("baseline"); } };
         var precision = presets.Button("Pose Precision").Button;
-        precision.Clicked += () => { if (_controller != null) { MotionMatchingEditorService.ApplyPresetPosePrecision(_controller); ApplyPresetDone("pose precision"); } };
+        precision.Clicked += () => { if (_controller != null) { MotionMatchingEditorService.ApplyPresetPosePrecision(_controller, _onEdited); ApplyPresetDone("pose precision"); } };
         var turn = presets.Button("Turn Heavy").Button;
-        turn.Clicked += () => { if (_controller != null) { MotionMatchingEditorService.ApplyPresetTurnHeavy(_controller); ApplyPresetDone("turn heavy"); } };
+        turn.Clicked += () => { if (_controller != null) { MotionMatchingEditorService.ApplyPresetTurnHeavy(_controller, _onEdited); ApplyPresetDone("turn heavy"); } };
         layout.Space(4);
 
         layout.Label("Trace (Cache/MMTrace.jsonl, Cache/MMTrace.csv)", TextAlignment.Near);

@@ -33,15 +33,15 @@ public class ClipRegistryFile
 /// <summary>
 /// Editor operations for <see cref="MotionMatchingController"/>.
 ///
-/// Split out of the runtime shell on purpose: C# partial classes cannot span
-/// assemblies, so editor work lives in this static service inside the
-/// MotionMatchingEditor module and only touches the controller through its
-/// public runtime API (plus the public <c>DatabaseFile</c> path). The
-/// runtime module never references this file.
+/// P3: the controller is a plain C# class owned by the game-side facade
+/// (MotionMatchingPlayer). This service keeps operating on the controller
+/// object the facade hands over (game -> plugin direction stays legal; the
+/// plugin never names game types). Scene-dirty marking arrives as an
+/// optional callback because the controller no longer has an Actor.
 /// </summary>
 public static class MotionMatchingEditorService
 {
-    public static void AddClips(MotionMatchingController controller, string[] tags, Animation[] clips, bool loop = true)
+    public static void AddClips(MotionMatchingController controller, string[] tags, Animation[] clips, bool loop = true, Action onEdited = null)
     {
         if (controller == null)
             return;
@@ -49,10 +49,10 @@ public static class MotionMatchingEditorService
             return;
 
         if (MotionMatchingDatabase.AddClips(controller.DatabaseFile, tags, clips, loop))
-            ReloadDatabase(controller, true);
+            ReloadDatabase(controller, true, onEdited);
     }
 
-    public static void AddClipFiles(MotionMatchingController controller, string[] tags, string[] paths, bool loop = true)
+    public static void AddClipFiles(MotionMatchingController controller, string[] tags, string[] paths, bool loop = true, Action onEdited = null)
     {
         if (controller == null)
             return;
@@ -63,16 +63,16 @@ public static class MotionMatchingEditorService
                 controller.DatabaseFile, tags, paths, loop, out int addedCount))
         {
             Debug.Log($"Registered {addedCount} motion matching clips for '{string.Join("+", tags)}'.");
-            ReloadDatabase(controller, true);
+            ReloadDatabase(controller, true, onEdited);
         }
     }
 
-    public static void ClearAllAnimationClips(MotionMatchingController controller)
+    public static void ClearAllAnimationClips(MotionMatchingController controller, Action onEdited = null)
     {
         if (controller == null)
             return;
         if (MotionMatchingDatabase.ClearClips(controller.DatabaseFile))
-            ReloadDatabase(controller, true);
+            ReloadDatabase(controller, true, onEdited);
     }
 
     /// <summary>
@@ -223,11 +223,11 @@ public static class MotionMatchingEditorService
     /// management window. Results surface via the editor log; the return
     /// value is a one-line summary.
     /// </summary>
-    public static string BakeValidateAndTest(MotionMatchingController controller)
+    public static string BakeValidateAndTest(MotionMatchingController controller, Action onEdited = null)
     {
         if (controller == null)
             return "No controller.";
-        BakeDatabase(controller);
+        BakeDatabase(controller, onEdited);
         if (!controller.PersistenceValid)
             return "Bake failed; validate and self-test skipped. See log.";
         ValidatePersistence(controller);
@@ -281,7 +281,7 @@ public static class MotionMatchingEditorService
     /// <summary>
     /// tagSet is one '+'-joined tag set ("walk+turn_travel"), split here.
     /// </summary>
-    public static void UpdateRegisteredClip(MotionMatchingController controller, int sourceIndex, string tagSet, bool loop)
+    public static void UpdateRegisteredClip(MotionMatchingController controller, int sourceIndex, string tagSet, bool loop, Action onEdited = null)
     {
         if (controller == null)
             return;
@@ -290,15 +290,15 @@ public static class MotionMatchingEditorService
         string[] tags = tagSet.Split('+');
 
         if (MotionMatchingDatabase.UpdateSourceClip(controller.DatabaseFile, sourceIndex, tags, loop))
-            ReloadDatabase(controller, true);
+            ReloadDatabase(controller, true, onEdited);
     }
 
-    public static void RemoveRegisteredClip(MotionMatchingController controller, int sourceIndex)
+    public static void RemoveRegisteredClip(MotionMatchingController controller, int sourceIndex, Action onEdited = null)
     {
         if (controller == null)
             return;
         if (MotionMatchingDatabase.RemoveSourceClip(controller.DatabaseFile, sourceIndex))
-            ReloadDatabase(controller, true);
+            ReloadDatabase(controller, true, onEdited);
     }
 
     /// <summary>
@@ -308,7 +308,8 @@ public static class MotionMatchingEditorService
         int[] updateIndices,
         string[] updateTags,
         bool[] updateLoops,
-        int[] removeIndices)
+        int[] removeIndices,
+        Action onEdited = null)
     {
         if (controller == null)
             return;
@@ -323,10 +324,10 @@ public static class MotionMatchingEditorService
             loops[i] = updateLoops[i] ? 1 : 0;
 
         if (MotionMatchingDatabase.ApplyClipEdits(controller.DatabaseFile, updateIndices, updateTags, loops, removeIndices))
-            ReloadDatabase(controller, true);
+            ReloadDatabase(controller, true, onEdited);
     }
 
-    public static void BakeDatabase(MotionMatchingController controller)
+    public static void BakeDatabase(MotionMatchingController controller, Action onEdited = null)
     {
         if (controller == null)
             return;
@@ -355,7 +356,7 @@ public static class MotionMatchingEditorService
             return;
         }
 
-        ReloadDatabase(controller, true);
+        ReloadDatabase(controller, true, onEdited);
         Debug.Log($"Motion matching database ready: clips={clips}, samples={samples}.");
     }
 
@@ -389,39 +390,44 @@ public static class MotionMatchingEditorService
     // Weight presets: scene Schema weights are live tuning — never baked
     // into features — so presets apply immediately with no rebake, even
     // mid-play. Rebake is only needed for feature changes.
-    public static void ApplyPresetBaseline(MotionMatchingController controller)
+    public static void ApplyPresetBaseline(MotionMatchingController controller, Action onEdited = null)
     {
         if (controller == null)
             return;
         controller.Schema.PoseWeight = 1.0f;
         controller.Schema.TrajectoryWeight = 2.0f;
-        MarkTuningEdited(controller, "baseline (trajectory-heavy)");
+        MarkTuningEdited(controller, "baseline (trajectory-heavy)", onEdited);
     }
 
-    public static void ApplyPresetPosePrecision(MotionMatchingController controller)
+    public static void ApplyPresetPosePrecision(MotionMatchingController controller, Action onEdited = null)
     {
         if (controller == null)
             return;
         controller.Schema.PoseWeight = 2.5f;
         controller.Schema.TrajectoryWeight = 1.0f;
-        MarkTuningEdited(controller, "pose-heavy precision");
+        MarkTuningEdited(controller, "pose-heavy precision", onEdited);
     }
 
-    public static void ApplyPresetTurnHeavy(MotionMatchingController controller)
+    public static void ApplyPresetTurnHeavy(MotionMatchingController controller, Action onEdited = null)
     {
         if (controller == null)
             return;
         controller.Schema.PoseWeight = 1.0f;
         controller.Schema.TrajectoryWeight = 3.0f;
-        MarkTuningEdited(controller, "turn-heavy");
+        MarkTuningEdited(controller, "turn-heavy", onEdited);
     }
 
-    private static void MarkTuningEdited(MotionMatchingController controller, string preset)
+    private static void MarkTuningEdited(MotionMatchingController controller, string preset, Action onEdited = null)
     {
         Debug.Log($"Motion matching weights preset applied: {preset} " +
             $"(pose={controller.Schema.PoseWeight}, trajectory={controller.Schema.TrajectoryWeight}). No rebake needed.");
-        if (controller.Actor?.Scene != null)
-            Editor.Instance.Scene.MarkSceneEdited(controller.Actor.Scene);
+        try
+        {
+            onEdited?.Invoke();
+        }
+        catch
+        {
+        }
     }
 
     /// <summary>
@@ -562,7 +568,7 @@ public static class MotionMatchingEditorService
         return controller.Database && !controller.Database.WaitForLoaded(0) || ReloadDatabase(controller, false);
     }
 
-    private static bool ReloadDatabase(MotionMatchingController controller, bool markSceneEdited)
+    private static bool ReloadDatabase(MotionMatchingController controller, bool markSceneEdited, Action onEdited = null)
     {
         var loaded = Content.Load<MotionMatchingDatabase>(controller.DatabaseFile);
         if (!loaded)
@@ -573,8 +579,16 @@ public static class MotionMatchingEditorService
 
         controller.Database = loaded;
         controller.RefreshDatabaseStatus();
-        if (markSceneEdited && controller.Actor?.Scene != null)
-            Editor.Instance.Scene.MarkSceneEdited(controller.Actor.Scene);
+        if (markSceneEdited)
+        {
+            try
+            {
+                onEdited?.Invoke();
+            }
+            catch
+            {
+            }
+        }
         return true;
     }
 }

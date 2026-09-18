@@ -31,24 +31,10 @@ struct MOTIONMATCHING_API MotionMatchingPlayerSnapshot
     API_FIELD() float CurrentYaw = 0.0f;
     API_FIELD() bool IsGrounded = false;
     API_FIELD() bool IsSprinting = false;
-    /// <summary>
-    /// Provider-decided procedural layer inputs (angle degrees + bone gate).
-    /// Computed host-side (all layer/gate rules live outside the core);
-    /// playback forwards them to the overlay function verbatim. The
-    /// core never sees host state.
-    /// </summary>
-    API_FIELD() float LayerAngleDeg = 0.0f;
-    API_FIELD() bool GateBone = false;
 
     /// <summary>
-    /// True = the C# provider owns this query's scope decision (editable
-    /// bands/roles on its Tags UI) and the native SelectTags is bypassed.
-    /// False = legacy native decision (self-test and bare callers).
-    /// </summary>
-    API_FIELD() bool ScopeConstrained = false;
-    /// <summary>
     /// Provider-decided tag scope, '+'-joined (e.g. "run+turn_travel").
-    /// Only read when ScopeConstrained is true. A constrained EMPTY set is
+    /// P2: always read (native legacy chooser deleted). An EMPTY set is
     /// an explicit no-match: no candidate may win and the current clip
     /// holds (never fall back to the full pool). Plain String transport:
     /// the scripting marshaller cannot marshal Array&lt;String&gt; struct
@@ -74,15 +60,9 @@ struct MOTIONMATCHING_API MotionMatchingPolicyTuning
     API_FIELD() float PoseWeight = 1.0f;
     API_FIELD() float TrajectoryWeight = 2.0f;
     API_FIELD() float SampleRate = 30.0f;
-    API_FIELD() float IdleSpeedMax = 5.0f;
-    API_FIELD() float WalkSpeedMax = 200.0f;
-    API_FIELD() float RunSpeedMax = 490.0f;
-    API_FIELD() float YawRateThreshold = 0.5f;
     API_FIELD() float FairFightAccum = 40.0f;
     API_FIELD() float FairFightWindow = 0.25f;
-    API_FIELD() int32 TagConfirmRepeats = 2;
     API_FIELD() float SettleToLoopDelay = 0.3f;
-    API_FIELD() float TurnMinSwitchTime = 0.3f;
     API_FIELD() float MinSwitchTime = 0.12f;
     API_FIELD() float SameClipExclusion = 0.25f;
     API_FIELD() float SameClipSeekThreshold = 0.25f;
@@ -98,38 +78,9 @@ struct MOTIONMATCHING_API MotionMatchingPolicyTuning
     API_FIELD() bool VerifyIndexedSearch = false;
     API_FIELD() bool IndexedVerifyAuto = false;
     API_FIELD() bool EffectiveTelemetry = false;
-    API_FIELD() bool EnableFootIK = true;
-    /// <summary>
-    /// P2/P3 driver ownership: the provider enables the airborne-transition
-    /// machine and the standing-turn machine per actor (defaults true =
-    /// historical behavior). A custom provider disables what its rig cannot
-    /// do; the core then runs pure search with no direct-plays, holds or
-    /// facing overrides from that machine.
-    /// </summary>
-    API_FIELD() bool EnableJumpDriver = true;
-    API_FIELD() bool EnableTurnDrive = true;
     API_FIELD() float ContinuityWeight = 0.0025f;
     API_FIELD() float CostFuseThreshold = 2.0f;
-    API_FIELD() float TurnDriveAngle = 25.0f;
-    API_FIELD() float TurnLookahead = 0.2f;
-    API_FIELD() float TurnPatientAngle = 15.0f;
-    API_FIELD() float TurnPatientTime = 1.0f;
-    API_FIELD() float TurnSettleRate = 2.0f;
-    API_FIELD() float BackwardThreshold = 30.0f;
-    API_FIELD() float LateralThreshold = 30.0f;
-    API_FIELD() float LateralZRatio = 0.58f;
 
-    /// <summary>
-    /// Tag ROLE names pushed by the C# controller (editable on its Tags UI,
-    /// validated against the baked database inventory). The core never
-    /// hardcodes gait vocabulary: pools, turn drive and the watchdog compare
-    /// through these roles. Empty = no clip matches that role. Defaults equal
-    /// the historical literals, so behavior is unchanged until renamed.
-    /// </summary>
-    API_FIELD() String JumpTag = TEXT("jump");
-    API_FIELD() String TurnInPlaceTag = TEXT("turn_inplace");
-    API_FIELD() String TurnTravelTag = TEXT("turn_travel");
-    API_FIELD() String RestTag = TEXT("idle");
 };
 
 /// <summary>
@@ -171,31 +122,8 @@ public:
     API_FIELD() int32 SwitchCount = 0;
     API_FIELD() int32 SeekCount = 0;
     API_FIELD() float LastQueryMs = 0.0f;
-    API_FIELD() int32 HoldCount = 0;
-    API_FIELD() int32 TurnReplayCount = 0;
-    API_FIELD() int32 SettleCount = 0;
-    API_FIELD() int32 RecoveryCount = 0;
-    API_FIELD() int32 JumpCount = 0;
     API_FIELD() String LastSwitchReason;
     API_FIELD() String ChooserStatusText;
-    API_FIELD() bool TurnDriveActive = false;
-    API_FIELD() float TurnDriveYaw = 0.0f;
-    API_FIELD() float LastLayerRequested = 0.0f;
-    API_FIELD() float LastLayerPrimary = 0.0f;
-    API_FIELD() float LastLayerSecondary = 0.0f;
-    API_FIELD() bool LastLayerGateApplied = false;
-    API_FIELD() bool LastFootLockL = false;
-    API_FIELD() bool LastFootLockR = false;
-    API_FIELD() float LastFootWeightL = 0.0f;
-    API_FIELD() float LastFootWeightR = 0.0f;
-    API_FIELD() float LastFootCorrL = 0.0f;
-    API_FIELD() float LastFootCorrR = 0.0f;
-    API_FIELD() float LastFootVelocityWorldL = 0.0f;
-    API_FIELD() float LastFootVelocityWorldR = 0.0f;
-    API_FIELD() float LastPoseVelocityRootRelativeL = 0.0f;
-    API_FIELD() float LastPoseVelocityRootRelativeR = 0.0f;
-    API_FIELD() float LastContactHeightL = 0.0f;
-    API_FIELD() float LastContactHeightR = 0.0f;
     API_FIELD() int32 FastPathHits = 0;
     API_FIELD() float LastFastPathAge = 0.0f;
     API_FIELD() String ForcedReason;
@@ -283,66 +211,21 @@ private:
     bool _warnedOnce = false;
     bool _bindingWarned = false;
 
-    // Legacy chooser state. Empty = no assumption: the provider owns the
-    // rest decision every constrained tick, so the core never presumes idle.
-    String _stableLinear;
-    bool _stableYaw = false;
-    String _pendingKey;
-    int32 _pendingCount = 99;
     bool _chooserReseed = false;
 
     Array<float> _clipTravel;
     Array<float> _clipTurnAngle;
     Array<float> _clipNet;
     Array<Array<String>> _clipTags;
-    Array<float> _clipYawTable;
-    Array<int32> _clipYawStart;
-    Array<float> _landImpactTime;
-    int32 _driveClip = -1;
-    float _slowTurnTimer = 0.0f;
 
-    float _lastIdleSpeedWarn = -99.0f;
     float _lastSpikeWarn = -99.0f;
-    bool _turnDriving = false;
-    float _turnStartYaw = 0.0f;
-    float _turnTargetYaw = 0.0f;
-    float _turnInitialErr = 0.0f;
-    float _turnUnwrappedErr = 0.0f;
-    float _turnPrevWrappedErr = 0.0f;
-    float _turnDriveStartTime = 0.0f;
-    float _prevTargetYaw = 0.0f;
-    bool _hasPrevTargetYaw = false;
-    float _camRateDeg = 0.0f;
     Float3 _prevDesVel = Float3::Zero;
-    bool _latchedBackward = false;
-    bool _latchedLateral = false;
     float _prevDesSpeed = 0.0f;
     float _oneshotUntil = -99.0f;
     int32 _reselectClip = -1;
     float _reselectSampleTime = 0.0f;
     float _reselectStartTime = -99.0f;
 
-    int32 _jumpPhase = 0;
-    float _jumpTakeoffTime = -99.0f;
-    int32 _airTicks = 0;
-    float _landHoldUntil = -99.0f;
-    float _takeoffPlanarSpeed = 0.0f;
-    bool _takeoffWasSprint = false;
-    float _defaultInertial = 0.25f;
-    bool _inertialOverridden = false;
-    // P2: airborne-transition pools keyed by measured-speed BUCKET
-    // (0 = rest, 1..3 = ascending tuning ceilings), never gait names.
-    // Membership is measured root motion; the rest/low/mid/high labels are
-    // diagnostic only. Urgent intent (sprinting) forces the top bucket.
-    static constexpr int32 JumpBucketCount = 4;
-    Array<int32> _takeoffPool[JumpBucketCount];
-    Array<int32> _landPoolLight[JumpBucketCount];
-    Array<int32> _landPoolHeavy[JumpBucketCount];
-    Array<int32> _landRoll;
-    Array<int32> _landStumble;
-    Array<int32> _takeoffAny;
-    Array<int32> _landAny;
-    int32 _fallLoop = -1;
 
     MotionMatchingPlayerSnapshot _snapshot;
     MotionMatchingPolicyTuning _tuning;
@@ -364,16 +247,6 @@ private:
     static bool AxesNear(const Float3& a, const Float3& b);
     static bool TimesEqual(const Array<float>& a, const Array<float>& b);
     void UpdateIntentSignals();
-    void TickJump();
-    void StartTakeoff();
-    void DoLanding();
-    int32 SpeedBucket(float speed, bool sprinting) const;
-    static const char* BucketLabel(int32 bucket);
-    int32 PickTakeoffClip(int32 bucket);
-    int32 PickLandClip(int32 bucket, bool heavy);
-    int32 PickSevereLandClip();
-    static float FindTouchdown(MotionMatchingDatabase* db, int32 start, int32 count);
-    void BuildJumpPools();
     int32 BandFromSpeed(float speed) const;
     void RecordPolicyEvent(const char* kind, int32 clipIndex, const String& reason);
     void RunQuery(const Array<TrajectoryPoint>& trajectoryPoints, const Matrix& actorWorld, float frameDt);
@@ -388,19 +261,7 @@ private:
         const Array<float>& trajectory, const MotionMatchingSearchSettings& settings,
         int32 continuityClip, float sinceSwitch, bool recovered, bool valid,
         const MotionMatchingResult& result, const String& reason);
-    bool ShouldHoldTurn();
-    bool IsTurnLikeClip(int32 clipIndex);
-    bool IsMovingBackward(const Array<TrajectoryPoint>& trajectoryPoints);
-    bool IsMovingLateral(const Array<TrajectoryPoint>& trajectoryPoints);
     static float Wrap180(float a);
-    float TurnClipYawAt(int32 clip, float frac);
-    int32 PickTurnClip(float needDeg, float errSign);
-    void MaybeStartTurnDrive(float frameDt);
-    void AdvanceTurnDrive();
-    void ExitTurnDrive(const String& reason);
-    bool ComputeDecelLatchedDirection(const Array<TrajectoryPoint>& trajectoryPoints, bool airborne,
-        float planarSpeed, float desSpeed, bool backwardAxis);
-    Array<String> SelectTags(bool airborne, bool edge, float speed, float yawRate, bool sprinting, bool backward, bool lateral);
     void WarnOnce(const String& message);
     void LogTelemetryLine(float speed, float yawRate, const Array<String>& tags,
         const MotionMatchingResult& result, const Float3& actorPos, float timeError);
