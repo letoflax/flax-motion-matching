@@ -923,10 +923,12 @@ void MotionMatchingRuntimePolicy::RunQuery(const Array<TrajectoryPoint>& traject
     // P5: reuse the last split while the joined scope is unchanged (exact
     // match, no Split per query in steady-state). Bound: <=8 tags; rebuilt
     // only on scope change. Semantics unchanged: same tags array as Split.
-    // The cache is shared with the TryFastPath incumbent check (same key
-    // space: the snapshot strings). A const reference is used (no
-    // Array<String> copy); a miss Splits once and caches (rare: scope
-    // transitions only). tagsReused is captured BEFORE the cache call: the
+    // P5 twins: this RunQuery pair (_queryTagsKey/_queryTagsCache) is
+    // SEPARATE from TryFastPath's pair (_fastAllowedKey/_fastAllowedCache,
+    // see the header + GetFastAllowed) on purpose, so the incumbent check
+    // never consumes RunQuery's scope-change signal. A const reference is
+    // used (no Array<String> copy); a miss Splits once and caches (rare:
+    // scope transitions only). tagsReused is captured BEFORE the cache call: the
     // call updates the key on a miss, so comparing after would always read
     // hit. A const reference is used (no Array<String> copy); tagsReused
     // also gates the ActiveTag/ChooserStatus rebuild below (on a hit the

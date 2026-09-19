@@ -40,6 +40,13 @@ public class MMContractTestProvider : IMotionMatchingInputProvider
 /// hand-built native structs: the generated snapshot/tuning layouts are owned
 /// by the native build. Runs in PLAY mode (pose sampling and playback only
 /// tick live there).
+///
+/// Debt fix (deterministic harness): the runner pauses simulation
+/// (Tools/mm_contract_test.py: play.pause before this op, resume after), so
+/// live facade ticks stop. This test additionally runs on an ISOLATED
+/// controller instance cloned from the live one (same Database/CharacterBody/
+/// Schema/tuning, own native policy): the live controller is never mutated,
+/// so test-1 explicit-empty mirrors cannot race with the scene tick.
 /// </summary>
 public static class MMContractTest
 {
@@ -67,6 +74,47 @@ public static class MMContractTest
 
     private static readonly Transform TestWorld = new Transform(Float3.Zero, Quaternion.Identity, Float3.One);
 
+    // Isolated test controller: same assets/tuning as the live scene object,
+    // but a fresh native policy (own _policy/playback/trace state). Live
+    // mirrors are never written by the checks below. Telemetry/trace overrides
+    // stay off: on/off must not change search decisions (P4 gate), and the
+    // isolated trace is never exported (only the facade's session export runs).
+    private static MotionMatchingController NewIsolated(MotionMatchingController live)
+    {
+        var iso = new MotionMatchingController
+        {
+            Schema = live.Schema,
+            PlayerModel = live.PlayerModel,
+            DatabasePath = live.DatabasePath,
+            Database = live.Database,
+            CharacterBody = live.CharacterBody,
+            CacheFolder = live.CacheFolder,
+            TelemetryOverride = false,
+            IndexedVerifyAuto = live.IndexedVerifyAuto,
+            TraceOverride = false,
+            QueryInterval = live.QueryInterval,
+            SearchEveryFrame = live.SearchEveryFrame,
+            FrameSearchBudget = live.FrameSearchBudget,
+            UseIndexedSearch = live.UseIndexedSearch,
+            TopKCandidates = live.TopKCandidates,
+            VerifyIndexedSearch = live.VerifyIndexedSearch,
+            ContinuityWeight = live.ContinuityWeight,
+            MinSwitchTime = live.MinSwitchTime,
+            ContinuingBias = live.ContinuingBias,
+            ContinuingWindow = live.ContinuingWindow,
+            SwitchMargin = live.SwitchMargin,
+            SameClipExclusion = live.SameClipExclusion,
+            SameClipSeekThreshold = live.SameClipSeekThreshold,
+            CostFuseThreshold = live.CostFuseThreshold,
+            TurnPenaltyWeight = live.TurnPenaltyWeight,
+            TurnPenaltyYawScale = live.TurnPenaltyYawScale,
+            InertializationDuration = live.InertializationDuration,
+            TelemetryLog = false,
+        };
+        iso.Initialize();
+        return iso;
+    }
+
     public static string RunAll(MotionMatchingController controller)
     {
         var lines = new List<string>();
@@ -93,25 +141,29 @@ public static class MMContractTest
             return "CONTRACT FAIL: need 6 sample times, got " +
                 (sampleTimes == null ? "null" : sampleTimes.Length.ToString()) + ".";
 
+        // Isolated instance: all checks below run here; the live scene
+        // controller is never written (see NewIsolated + class comment).
+        var test = NewIsolated(controller);
+
         // 1: explicit-empty scope = no-match, never a silent pool fallback.
         {
             var prov = NewCanned(string.Empty, string.Empty);
-            controller.ResetPlayback();
-            TickProvider(controller, prov, 100);
-            bool statusOk = controller.ChooserStatus.StartsWith("ext:empty");
-            bool reasonOk = controller.LastSwitchReason == "no-result:empty-scope";
+            test.ResetPlayback();
+            TickProvider(test, prov, 100);
+            bool statusOk = test.ChooserStatus.StartsWith("ext:empty");
+            bool reasonOk = test.LastSwitchReason == "no-result:empty-scope";
             Check("explicit-empty", statusOk && reasonOk,
-                "chooser='" + controller.ChooserStatus + "' reason='" + controller.LastSwitchReason + "'");
+                "chooser='" + test.ChooserStatus + "' reason='" + test.LastSwitchReason + "'");
         }
 
         // 2: provider scope is respected (single-tag idle at rest).
         {
             var prov = NewCanned("idle", string.Empty);
-            controller.ResetPlayback();
-            TickProvider(controller, prov, 120);
-            bool ok = controller.ActiveTag == "idle";
+            test.ResetPlayback();
+            TickProvider(test, prov, 120);
+            bool ok = test.ActiveTag == "idle";
             Check("scope-respected", ok,
-                "activeTag='" + controller.ActiveTag + "' winner='" + controller.WinnerClipName + "'");
+                "activeTag='" + test.ActiveTag + "' winner='" + test.WinnerClipName + "'");
         }
 
         // 3: reset leaves the runtime usable (P3: the runtime owns no
@@ -120,11 +172,11 @@ public static class MMContractTest
         // still settle on the scoped tag).
         {
             var prov = NewCanned("idle", string.Empty);
-            controller.ResetPlayback();
-            TickProvider(controller, prov, 120);
-            bool ok = controller.ActiveTag == "idle";
+            test.ResetPlayback();
+            TickProvider(test, prov, 120);
+            bool ok = test.ActiveTag == "idle";
             Check("reset-then-soak", ok,
-                "activeTag='" + controller.ActiveTag + "' after ResetPlayback");
+                "activeTag='" + test.ActiveTag + "' after ResetPlayback");
         }
 
         // 4: per-frame source swap takes effect on the next update (P3: the
@@ -134,15 +186,15 @@ public static class MMContractTest
         {
             var idle = NewCanned("idle", string.Empty);
             var empty = NewCanned(string.Empty, string.Empty);
-            controller.ResetPlayback();
-            TickProvider(controller, idle, 60);
-            TickProvider(controller, empty, 60);
-            bool emptyOk = controller.ChooserStatus.StartsWith("ext:empty");
-            TickProvider(controller, idle, 120);
-            bool recoverOk = controller.ActiveTag == "idle";
+            test.ResetPlayback();
+            TickProvider(test, idle, 60);
+            TickProvider(test, empty, 60);
+            bool emptyOk = test.ChooserStatus.StartsWith("ext:empty");
+            TickProvider(test, idle, 120);
+            bool recoverOk = test.ActiveTag == "idle";
             Check("frame-swap", emptyOk && recoverOk,
-                "emptyChooser='" + controller.ChooserStatus + "' recoveredTag='" + controller.ActiveTag + "'");
-            controller.ResetPlayback();
+                "emptyChooser='" + test.ChooserStatus + "' recoveredTag='" + test.ActiveTag + "'");
+            test.ResetPlayback();
         }
 
         // 5: input carries no gameplay fields (compile-level boundary).
@@ -165,13 +217,13 @@ public static class MMContractTest
         // 6: pose-out equals the internal search locals.
         {
             var prov = NewCanned("idle", string.Empty);
-            controller.ResetPlayback();
-            TickProvider(controller, prov, 30);
+            test.ResetPlayback();
+            TickProvider(test, prov, 30);
             bool ok = false;
             string detail = "TryGetBasePose=false";
-            if (controller.TryGetBasePose(out Matrix[] locals, out int clip, out float cost))
+            if (test.TryGetBasePose(out Matrix[] locals, out int clip, out float cost))
             {
-                var playback = controller.Playback;
+                var playback = test.Playback;
                 Matrix[] internals = playback != null ? playback.GetSearchLocals() : null;
                 if (internals != null && locals.Length == internals.Length && locals.Length > 0)
                 {
@@ -197,16 +249,16 @@ public static class MMContractTest
         // 7: force-hatch lands the requested clip (P0 hatch, logs every call).
         {
             var prov = NewCanned("idle", string.Empty);
-            controller.ResetPlayback();
-            TickProvider(controller, prov, 10);
-            var playback = controller.Playback;
-            int clips = controller.Database != null ? controller.Database.ClipCount : 0;
+            test.ResetPlayback();
+            TickProvider(test, prov, 10);
+            var playback = test.Playback;
+            int clips = test.Database != null ? test.Database.ClipCount : 0;
             bool ok = false;
             string detail = "no playback/clips";
             if (playback != null && clips > 1)
             {
                 int target = (playback.CurrentClip + 1) % clips;
-                controller.ForcePlayClip(target, 0.0f, "contract:force-hatch");
+                test.ForcePlayClip(target, 0.0f, "contract:force-hatch");
                 ok = playback.CurrentClip == target;
                 detail = "forced=" + target + " current=" + playback.CurrentClip;
             }
@@ -218,9 +270,9 @@ public static class MMContractTest
         // the search-winner path and the ForcePlayClip hatch may Play).
         {
             var prov = NewCanned("idle", string.Empty);
-            controller.ResetPlayback();
-            TickProvider(controller, prov, 90);
-            string reason = controller.LastSwitchReason ?? string.Empty;
+            test.ResetPlayback();
+            TickProvider(test, prov, 90);
+            string reason = test.LastSwitchReason ?? string.Empty;
             bool machine = false;
             foreach (string prefix in MachineReasonPrefixes)
             {
@@ -231,7 +283,7 @@ public static class MMContractTest
                 }
             }
             Check("pure-search-no-machine-play", !machine,
-                "reason='" + reason + "' chooser='" + controller.ChooserStatus + "'");
+                "reason='" + reason + "' chooser='" + test.ChooserStatus + "'");
         }
 
         // 9: P2 filter-change-mid-clip invalidates the fast-path: soak idle
@@ -241,11 +293,11 @@ public static class MMContractTest
         {
             var idle = NewCanned("idle", string.Empty);
             var walk = NewCanned("walk", string.Empty);
-            controller.ResetPlayback();
-            TickProvider(controller, idle, 120);
-            string before = controller.ActiveTag ?? string.Empty;
-            TickProvider(controller, walk, 120);
-            string after = controller.ActiveTag ?? string.Empty;
+            test.ResetPlayback();
+            TickProvider(test, idle, 120);
+            string before = test.ActiveTag ?? string.Empty;
+            TickProvider(test, walk, 120);
+            string after = test.ActiveTag ?? string.Empty;
             bool ok = before == "idle" && after == "walk";
             Check("filter-change-invalidates-fastpath", ok,
                 "before='" + before + "' after='" + after + "'");
@@ -253,14 +305,14 @@ public static class MMContractTest
             // on the idle scope keeps idle loops; the recorded filter rides
             // the trace for replay).
             var idleLoopOnly = NewCannedFiltered("idle", string.Empty, 1, 0);
-            TickProvider(controller, idleLoopOnly, 60);
-            bool loopOk = (controller.ActiveTag ?? string.Empty) == "idle";
+            TickProvider(test, idleLoopOnly, 60);
+            bool loopOk = (test.ActiveTag ?? string.Empty) == "idle";
             Check("loopfilter-change-takes-effect", loopOk,
-                "tag='" + controller.ActiveTag + "' chooser='" + controller.ChooserStatus + "'");
-            controller.ResetPlayback();
+                "tag='" + test.ActiveTag + "' chooser='" + test.ChooserStatus + "'");
+            test.ResetPlayback();
         }
 
-        controller.ResetPlayback();
+        test.ResetPlayback();
 
         string verdict = passed == total ? "CONTRACT PASS" : "CONTRACT FAIL";
         return verdict + ": " + passed + "/" + total + " checks\n" + string.Join("\n", lines);

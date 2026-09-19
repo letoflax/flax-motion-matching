@@ -287,14 +287,16 @@ private:
     MotionMatchingPolicyTuning _tuning;
     MotionMatchingTraceEntry _lastEntry;
     // P5 steady-state reuse (all bounded, all record-only, never steer search):
-    // - _queryTagsKey/_queryTagsCache: last AllowedTagSet split (RunQuery +
-    //   TryFastPath incumbent check share it). Bound: tag count per query
+    // - _queryTagsKey/_queryTagsCache: last AllowedTagSet split for RunQuery
+    //   only (TryFastPath uses its own _fastAllowedKey/_fastAllowedCache
+    //   below, never this pair). Bound: tag count per query
     //   (<=8 on the reference DB). Rebuilt only when the joined scope string
     //   changes (exact match); steady-state (same scope) reuses without
     //   Split per query/tick.
     // - _queryExcludedKey/_queryExcludedCache/_queryExcludedJoin: same rule
-    //   for the ExcludedTagSet split and its '+'-joined form (settings +
-    //   trace/telemetry/fastpath entries share them).
+    //   for the ExcludedTagSet split and its '+'-joined form for RunQuery
+    //   settings + trace/telemetry entries (TryFastPath uses its own
+    //   _fastExcludedKey/_fastExcludedCache/_fastExcludedJoin below).
     // - _poseScratch/_prevScratch: Tick pose-sample scratch (44/21 floats).
     //   Passed to the samplers instead of per-tick locals; Resize only when
     //   the feature size changes (schema-fixed sizes).
@@ -345,8 +347,8 @@ private:
     static int32 HashTagSet(const String& tagSet);
     FastPathSignature CaptureFastPathSignature() const;
     static bool FastPathSignaturesDiffer(const FastPathSignature& a, const FastPathSignature& b);
-    // P5 change-only scope caches (shared by RunQuery/TryFastPath/record
-    // paths): Split/Join run only when the joined snapshot string changes.
+    // P5 change-only scope caches (RunQuery pair + fast-path-only twins +
+    // record paths): Split/Join run only when the joined snapshot string changes.
     // Returned references stay valid until the next scope change; callers
     // must not hold them across a Tick that can change the scope.
     const Array<String>& GetCachedAllowed();
