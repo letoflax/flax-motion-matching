@@ -390,6 +390,9 @@ public static class MotionMatchingEditorService
     /// <summary>
     /// Runs the native search self-test (exact queries must return their own
     /// sample with ~zero cost) and prints the per-probe report.
+    /// P4: calls the editor-only native RunSelfTest (USE_EDITOR-guarded C++,
+    /// FLAX_EDITOR-guarded binding). This service lives in the editor module,
+    /// so it only ever compiles in editor builds where the native exists.
     /// </summary>
     public static void RunSearchSelfTest(MotionMatchingController controller)
     {
@@ -401,8 +404,12 @@ public static class MotionMatchingEditorService
             return;
         }
 
+#if FLAX_EDITOR
         bool passed = MotionMatchingSearch.RunSelfTest(controller.Database, out string log);
         Debug.Log($"Motion matching search self-test {(passed ? "PASSED" : "FAILED")}:\n{log}");
+#else
+        Debug.LogWarning("Motion matching self-test stopped: editor-only test is not available in game builds.");
+#endif
     }
 
     // Weight presets: scene Schema weights are live tuning — never baked

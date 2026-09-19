@@ -49,16 +49,23 @@ public:
         API_PARAM(Out) String& error);
 
     /// <summary>
-    /// Self-test without playback: rebuilds raw queries from baked samples
-    /// (a straight copy, since rev-3 stores raw values) and requires the
-    /// search to return the source sample with ~zero cost. Proves the weight
-    /// pipeline, cost math and tie-breaks.
+    /// P4 editor-only self-test without playback: rebuilds raw queries from
+    /// baked samples (a straight copy, since rev-3 stores raw values) and
+    /// requires the search to return the source sample with ~zero cost.
+    /// Proves the weight pipeline, cost math and tie-breaks.
+    /// Guarded by USE_EDITOR (verified Flax 1.12 macro: Engine/Core/Config.h
+    /// defaults it to 0, FlaxEditor.Build.cs defines it for editor targets;
+    /// FLAX_EDITOR has zero hits in engine source). The implementation lives
+    /// in MotionMatchingSearch.SelfTest.cpp (also USE_EDITOR-guarded), so
+    /// Game Release contains no self-test code or strings.
     /// </summary>
     /// <returns>True when every probe passed. Details are appended to log.</returns>
+#if USE_EDITOR
     API_FUNCTION()
     static bool RunSelfTest(
         MotionMatchingDatabase* database,
         API_PARAM(Out) String& log);
+#endif
 
     /// <summary>
     /// Phase 3 UE-parity continuing fast-path: raw cost of ONE baked sample
