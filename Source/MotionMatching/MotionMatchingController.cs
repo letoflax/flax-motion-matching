@@ -181,6 +181,17 @@ public class MotionMatchingController
     public string LastSwitchReason { get; private set; } = string.Empty;
     public string ChooserStatus { get; private set; } = string.Empty;
     public int TraceEntries { get; private set; }
+    // P0 additive profiling mirrors (record-only; copied from the native
+    // policy after each Update, never steer anything).
+    public float LastTickMs { get; private set; }
+    public float LastFastPathMs { get; private set; }
+    public float LastTelemetryMs { get; private set; }
+    public int TickCount { get; private set; }
+    public int FullSearchCount { get; private set; }
+    public float TotalTickMs { get; private set; }
+    public float TotalFullSearchMs { get; private set; }
+    public float TotalFastPathMs { get; private set; }
+    public float TotalTelemetryMs { get; private set; }
 
     // P2: machine/overlay/IK telemetry deleted with their producers
     // (HoldCount, TurnReplayCount, SettleCount, RecoveryCount, JumpCount,
@@ -225,16 +236,113 @@ public class MotionMatchingController
     /// <summary>
     /// P0 additive-only force-clip hatch for future game drivers. Forwards
     /// to playback Play with forceSeek:true and logs the reason on EVERY
-    /// call (anti-abuse). No production callers yet.
+    /// call (anti-abuse). P0 also records a structural "command" trace entry
+    /// (clip/time/reason, no feature vectors) so replay accounts for the
+    /// command. Record-only: policy/fast-path/continuity state sync stays
+    /// future P2 work (the command still bypasses them, as before).
+    /// No production callers yet.
     /// </summary>
     public void ForcePlayClip(int clipIndex, float startTime, string reason)
     {
+        string safeReason = reason ?? string.Empty;
         Debug.Log("MotionMatchingController.ForcePlayClip: clip=" + clipIndex
-            + " startTime=" + startTime + " reason=" + (reason ?? string.Empty));
+            + " startTime=" + startTime + " reason=" + safeReason);
         var playback = Playback;
         if (playback == null)
             return;
         playback.Play(clipIndex, startTime, true);
+        try
+        {
+            var trace = Trace;
+            if (trace != null && trace.Enabled)
+            {
+                // NOTE: C# new on a bound struct does NOT run the C++ member
+                // defaults, so every field below is pinned explicitly. Pose /
+                // Trajectory arrays are set to empty (a command carries no
+                // feature vectors) AND passed as the Record params, because
+                // struct Array fields do not round-trip C#->C++ by design.
+                // Booleans travel packed in TraceFlags (bits mirror
+                // TraceFlag_* in MotionMatchingTrace.h — Flax 1.12 bindings
+                // crash past 64 struct fields): bit4 = UseIndexedSearch,
+                // bit5 = VerifyIndexedSearch, bit6 = ExcludeNonLoopTail
+                // (runtime always applies it); all other bits are false for
+                // a command entry.
+                int traceFlags = 64;
+                if (UseIndexedSearch)
+                    traceFlags |= 16;
+                if (VerifyIndexedSearch)
+                    traceFlags |= 32;
+                var entry = new MotionMatchingTraceEntry
+                {
+                    Kind = "command",
+                    Time = Time.GameTime,
+                    State = PolicyState ?? string.Empty,
+                    Tags = ActiveTag ?? string.Empty,
+                    ExcludedTags = string.Empty,
+                    Speed = 0.0f,
+                    YawRate = 0.0f,
+                    Grounded = true,
+                    Sprinting = false,
+                    DesiredSpeed = 0.0f,
+                    Pose = Array.Empty<float>(),
+                    Trajectory = Array.Empty<float>(),
+                    PoseWeight = Schema.PoseWeight,
+                    TrajectoryWeight = Schema.TrajectoryWeight,
+                    ContinuityWeight = ContinuityWeight,
+                    MinSwitchTime = MinSwitchTime,
+                    CurrentTime = -1.0f,
+                    ExclusionWindow = SameClipExclusion,
+                    ExpectedTime = -1.0f,
+                    ContinuingBias = ContinuingBias,
+                    ContinuingWindow = ContinuingWindow,
+                    SwitchMargin = SwitchMargin,
+                    LoopPreference = 0.0f,
+                    LoopFilter = 0,
+                    ReselectClip = -1,
+                    ReselectSampleTime = 0.0f,
+                    ReselectBanWindow = 0.0f,
+                    TwinBanWindow = 0.0f,
+                    LoopTailExclusion = 0.0f,
+                    FootLockL = 0.0f,
+                    FootLockR = 0.0f,
+                    OneShotBand = 0,
+                    MaxCandidates = 0,
+                    QueryFrame = 0,
+                    TraceFlags = traceFlags,
+                    TopKCandidates = TopKCandidates,
+                    CostFuseThreshold = CostFuseThreshold,
+                    FrameDt = 0.0f,
+                    PlayRate = playback.PlayRate,
+                    DbClipCount = AnimationClipsCount,
+                    DbSampleCount = SampleCount,
+                    ContinuityClip = -1,
+                    SinceSwitch = 999.0f,
+                    RetryKind = 0,
+                    Recovered = false,
+                    Valid = false,
+                    ClipIndex = -1,
+                    SampleIndex = -1,
+                    SampleTime = 0.0f,
+                    Cost = float.MaxValue,
+                    PoseCost = float.MaxValue,
+                    TrajectoryCost = float.MaxValue,
+                    ContinuityCost = 0.0f,
+                    LoopCost = 0.0f,
+                    SecondBestCost = float.MaxValue,
+                    FastThreshold = float.MaxValue,
+                    CommandClip = clipIndex,
+                    CommandTime = startTime,
+                    Reason = safeReason,
+                    Chooser = ChooserStatus ?? string.Empty,
+                    QueryMs = 0.0f,
+                };
+                trace.Record(entry, Array.Empty<float>(), Array.Empty<float>());
+            }
+        }
+        catch
+        {
+            // Trace record must never break the force-clip command itself.
+        }
     }
 
     /// <summary>
@@ -388,6 +496,16 @@ public class MotionMatchingController
         ChooserStatus = _policy.ChooserStatusText;
         TraceEntries = _policy.GetTrace() != null ? _policy.GetTrace().Count : 0;
         FastPathHits = _policy.FastPathHits;
+        // P0 profiling mirrors (record-only).
+        LastTickMs = _policy.LastTickMs;
+        LastFastPathMs = _policy.LastFastPathMs;
+        LastTelemetryMs = _policy.LastTelemetryMs;
+        TickCount = _policy.TickCount;
+        FullSearchCount = _policy.FullSearchCount;
+        TotalTickMs = _policy.TotalTickMs;
+        TotalFullSearchMs = _policy.TotalFullSearchMs;
+        TotalFastPathMs = _policy.TotalFastPathMs;
+        TotalTelemetryMs = _policy.TotalTelemetryMs;
     }
 
     // M6: the policy's query trace (null until the first play tick). The

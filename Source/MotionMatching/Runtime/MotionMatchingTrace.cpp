@@ -215,6 +215,55 @@ bool MotionMatchingTraceLog::ExportJson(const String& path, String& error)
         EscapeInto(sb, e.Chooser);
         sb.Append("\",\"qms\":");
         FormatFloat(sb, e.QueryMs);
+        sb.Append(",\"xtags\":\"");
+        EscapeInto(sb, e.ExcludedTags);
+        sb.Append("\",\"band\":");
+        sb.Append(e.OneShotBand);
+        sb.Append(",\"retry\":");
+        sb.Append(e.RetryKind);
+        // P0: booleans travel packed in TraceFlags (Flax 1.12 bindings
+        // cannot handle >64 struct fields); the JSON keys stay expanded so
+        // tools never see the packing.
+        sb.Append(",\"fedge\":");
+        sb.Append((e.TraceFlags & TraceFlag_ForcedEdge) ? '1' : '0');
+        sb.Append(",\"reseed\":");
+        sb.Append((e.TraceFlags & TraceFlag_Reseeded) ? '1' : '0');
+        sb.Append(",\"ffight\":");
+        sb.Append((e.TraceFlags & TraceFlag_FairFight) ? '1' : '0');
+        sb.Append(",\"oswin\":");
+        sb.Append((e.TraceFlags & TraceFlag_OneshotWindow) ? '1' : '0');
+        sb.Append(",\"maxcand\":");
+        sb.Append(e.MaxCandidates);
+        sb.Append(",\"qframe\":");
+        sb.Append(e.QueryFrame);
+        sb.Append(",\"idx\":");
+        sb.Append((e.TraceFlags & TraceFlag_UseIndexedSearch) ? '1' : '0');
+        sb.Append(",\"topk\":");
+        sb.Append(e.TopKCandidates);
+        sb.Append(",\"verify\":");
+        sb.Append((e.TraceFlags & TraceFlag_VerifyIndexedSearch) ? '1' : '0');
+        sb.Append(",\"excltail\":");
+        sb.Append((e.TraceFlags & TraceFlag_ExcludeNonLoopTail) ? '1' : '0');
+        sb.Append(",\"firml\":");
+        sb.Append((e.TraceFlags & TraceFlag_FirmLockL) ? '1' : '0');
+        sb.Append(",\"firmr\":");
+        sb.Append((e.TraceFlags & TraceFlag_FirmLockR) ? '1' : '0');
+        sb.Append(",\"fuse\":");
+        FormatFloat(sb, e.CostFuseThreshold);
+        sb.Append(",\"dt\":");
+        FormatFloat(sb, e.FrameDt);
+        sb.Append(",\"rate\":");
+        FormatFloat(sb, e.PlayRate);
+        sb.Append(",\"dbclip\":");
+        sb.Append(e.DbClipCount);
+        sb.Append(",\"dbsample\":");
+        sb.Append(e.DbSampleCount);
+        sb.Append(",\"fthresh\":");
+        FormatFloat(sb, e.FastThreshold);
+        sb.Append(",\"cmdclip\":");
+        sb.Append(e.CommandClip);
+        sb.Append(",\"cmdtime\":");
+        FormatFloat(sb, e.CommandTime);
         sb.Append("}\n");
     }
     String text;
@@ -350,10 +399,13 @@ bool MotionMatchingTraceLog::ParseEntry(const String& line, MotionMatchingTraceE
     const Char* text = line.GetText();
     const int32 length = line.Length();
     const int32 version = (int32)GetFloat(text, length, "\"v\":");
-    if (version != 1 && version != SchemaVersion)
+    if (version != 1 && version != 2 && version != SchemaVersion)
         return false;
+    const bool isV3 = version == SchemaVersion;
     entry.Kind = GetString(text, length, "\"kind\":\"");
-    if (entry.Kind != String(TEXT("search")) && entry.Kind != String(TEXT("hold")) && entry.Kind != String(TEXT("replay")))
+    if (entry.Kind != String(TEXT("search")) && entry.Kind != String(TEXT("fastpath")) &&
+        entry.Kind != String(TEXT("command")) && entry.Kind != String(TEXT("reset")) &&
+        entry.Kind != String(TEXT("hold")) && entry.Kind != String(TEXT("replay")))
         return false;
     entry.Time = GetFloat(text, length, "\"t\":");
     entry.State = GetString(text, length, "\"state\":\"");
@@ -410,7 +462,54 @@ bool MotionMatchingTraceLog::ParseEntry(const String& line, MotionMatchingTraceE
     entry.Reason = GetString(text, length, "\"reason\":\"");
     entry.Chooser = GetString(text, length, "\"chooser\":\"");
     entry.QueryMs = GetFloat(text, length, "\"qms\":");
-    if (entry.Kind == String(TEXT("search")) && (entry.Pose.Count() == 0 || entry.Trajectory.Count() == 0))
+    // P0 v3 fields: present only in v3 lines; every lookup is guarded so
+    // v1/v2 lines import with documented defaults. Booleans pack into
+    // TraceFlags (see bit constants in the header).
+    if (isV3)
+    {
+        entry.ExcludedTags = GetString(text, length, "\"xtags\":\"");
+        entry.OneShotBand = (int32)GetFloat(text, length, "\"band\":");
+        entry.RetryKind = (int32)GetFloat(text, length, "\"retry\":");
+        int32 flags = 0;
+        if (GetFloat(text, length, "\"fedge\":") > 0.5f)
+            flags |= TraceFlag_ForcedEdge;
+        if (GetFloat(text, length, "\"reseed\":") > 0.5f)
+            flags |= TraceFlag_Reseeded;
+        if (GetFloat(text, length, "\"ffight\":") > 0.5f)
+            flags |= TraceFlag_FairFight;
+        if (GetFloat(text, length, "\"oswin\":") > 0.5f)
+            flags |= TraceFlag_OneshotWindow;
+        if (GetFloat(text, length, "\"idx\":") > 0.5f)
+            flags |= TraceFlag_UseIndexedSearch;
+        if (GetFloat(text, length, "\"verify\":") > 0.5f)
+            flags |= TraceFlag_VerifyIndexedSearch;
+        if (GetFloat(text, length, "\"excltail\":") > 0.5f)
+            flags |= TraceFlag_ExcludeNonLoopTail;
+        if (GetFloat(text, length, "\"firml\":") > 0.5f)
+            flags |= TraceFlag_FirmLockL;
+        if (GetFloat(text, length, "\"firmr\":") > 0.5f)
+            flags |= TraceFlag_FirmLockR;
+        entry.TraceFlags = flags;
+        entry.MaxCandidates = (int32)GetFloat(text, length, "\"maxcand\":");
+        entry.QueryFrame = (int32)GetFloat(text, length, "\"qframe\":");
+        entry.TopKCandidates = (int32)GetFloat(text, length, "\"topk\":");
+        entry.CostFuseThreshold = GetFloat(text, length, "\"fuse\":");
+        entry.FrameDt = GetFloat(text, length, "\"dt\":");
+        entry.PlayRate = GetFloat(text, length, "\"rate\":");
+        entry.DbClipCount = (int32)GetFloat(text, length, "\"dbclip\":");
+        entry.DbSampleCount = (int32)GetFloat(text, length, "\"dbsample\":");
+        entry.FastThreshold = GetFloat(text, length, "\"fthresh\":");
+        entry.CommandClip = (int32)GetFloat(text, length, "\"cmdclip\":");
+        entry.CommandTime = GetFloat(text, length, "\"cmdtime\":");
+    }
+    // "search" needs feature vectors to re-run FindBest; "fastpath" needs
+    // them to re-run SampleCost. "command"/"reset" are structural (no
+    // vectors by design). Legacy "hold"/"replay" policy events carry none.
+    // A vector-less search/fastpath line is REJECTED here (it can never be
+    // checked) — the old silent skip is what hid incomplete replay.
+    const bool isSearch = entry.Kind == String(TEXT("search"));
+    const bool isFast = entry.Kind == String(TEXT("fastpath"));
+    if ((isSearch || isFast) && (entry.Pose.Count() == 0 || entry.Trajectory.Count() == 0))
         return false;
     return true;
 }
@@ -636,106 +735,266 @@ bool MotionMatchingTraceLog::VerifyReplay(MotionMatchingDatabase* database, int3
         report = String(TEXT("Replay stopped: trace is empty."));
         return false;
     }
+    // P0: every entry is either CHECKED (search via FindBest, fastpath via
+    // SampleCost, command/reset structurally) or SKIPPED with an explicit
+    // reason. A vector-less search/fastpath line can never be checked and
+    // is rejected at import; legacy hold/replay policy events carry no
+    // vectors by design. PASS requires zero mismatches, at least one
+    // checked entry, and no skipped entry that carried checkable input.
     const int32 start = snap.Count() - total;
-    int32 matched = 0;
-    int32 checkedN = 0;
-    int32 skippedN = 0;
+    int32 searchFull = 0;
+    int32 searchEmptyScope = 0;
+    int32 searchRetry1 = 0;
+    int32 searchRetry2 = 0;
+    int32 fastChecked = 0;
+    int32 cmdChecked = 0;
+    int32 cmdReset = 0;
+    int32 skippedLegacy = 0;
+    int32 skippedDbChanged = 0;
+    int32 mismatchWinner = 0;
+    int32 mismatchValidity = 0;
+    int32 mismatchEmptyScope = 0;
+    int32 mismatchFastCost = 0;
+    int32 mismatchFastThreshold = 0;
+    int32 mismatchCommand = 0;
     Array<String> mismatchLines;
     char buffer[512];
+    const String kindSearch(TEXT("search"));
+    const String kindFast(TEXT("fastpath"));
+    const String kindCommand(TEXT("command"));
+    const String kindReset(TEXT("reset"));
+    const int32 liveClips = database->GetClipCount();
+    const int32 liveSamples = database->GetSampleCount();
     for (int32 i = start; i < snap.Count(); i++)
     {
         const MotionMatchingTraceEntry& e = snap[i];
-        if (e.Kind != String(TEXT("search")))
+        // Database identity gate (v3 entries only; v1/v2 record 0 = unknown).
+        // A changed database invalidates winner indices, so such entries are
+        // skipped with an explicit reason instead of compared blindly.
+        if ((e.Kind == kindSearch || e.Kind == kindFast) && e.DbClipCount > 0 &&
+            (e.DbClipCount != liveClips || e.DbSampleCount != liveSamples))
         {
-            skippedN++;
+            skippedDbChanged++;
             continue;
         }
-        if (e.Pose.Count() == 0 || e.Trajectory.Count() == 0)
-            continue;
-        MotionMatchingSearchSettings settings;
-        settings.PoseWeight = e.PoseWeight;
-        settings.TrajectoryWeight = e.TrajectoryWeight;
-        settings.ContinuityWeight = e.ContinuityWeight;
-        settings.MinSwitchTime = e.MinSwitchTime;
-        settings.CurrentTime = e.CurrentTime;
-        settings.SameClipExclusionWindow = e.ExclusionWindow;
-        settings.ExpectedTime = e.ExpectedTime;
-        settings.ContinuingBias = e.ContinuingBias;
-        settings.ContinuingWindow = e.ContinuingWindow;
-        settings.SwitchMargin = e.SwitchMargin;
-        settings.LoopPreference = e.LoopPreference;
-        settings.LoopFilter = (MotionLoopFilter)e.LoopFilter;
-        settings.ReselectClip = e.ReselectClip;
-        settings.ReselectSampleTime = e.ReselectSampleTime;
-        settings.ReselectBanWindow = e.ReselectBanWindow;
-        settings.TwinBanWindow = e.TwinBanWindow;
-        settings.LoopTailExclusion = e.LoopTailExclusion;
-        settings.FootLockL = e.FootLockL;
-        settings.FootLockR = e.FootLockR;
-        settings.QueryYawRate = e.YawRate;
-        Array<String> tags;
-        if (!e.Tags.IsEmpty())
-            e.Tags.Split('+', tags);
-        MotionMatchingResult result;
-        String error;
-        MotionMatchingSearch::FindBest(database, e.Pose, e.Trajectory, settings,
-            e.ContinuityClip, e.SinceSwitch, tags, result, error);
-        const bool wantValid = e.Valid;
-        bool gotValid = result.IsValid;
-        bool same = wantValid == gotValid && (!wantValid || result.SampleIndex == e.SampleIndex);
-        if (!same && e.Recovered)
+        if (e.Kind == kindSearch)
         {
-            settings.CurrentTime = -1.0f;
-            settings.SameClipExclusionWindow = 0.0f;
-            settings.LoopFilter = MotionLoopFilter::LoopOnly;
+            Array<String> tags;
+            if (!e.Tags.IsEmpty())
+                e.Tags.Split('+', tags);
+            if (tags.Count() == 0)
+            {
+                // Explicit-empty scope: the runtime short-circuits to
+                // no-match without searching. The check is structural:
+                // a winner from an empty scope is a contract violation.
+                searchEmptyScope++;
+                if (e.Valid)
+                {
+                    mismatchEmptyScope++;
+                    if (mismatchLines.Count() < 8)
+                    {
+                        snprintf(buffer, sizeof(buffer), "t=%.2f empty-scope-claimed but winner=%d (tags empty must be no-match)",
+                            (double)e.Time, e.SampleIndex);
+                        mismatchLines.Add(String(buffer));
+                    }
+                }
+                continue;
+            }
+            MotionMatchingSearchSettings settings;
+            settings.PoseWeight = e.PoseWeight;
+            settings.TrajectoryWeight = e.TrajectoryWeight;
+            settings.ContinuityWeight = e.ContinuityWeight;
+            settings.MinSwitchTime = e.MinSwitchTime;
+            settings.CurrentTime = e.CurrentTime;
+            settings.SameClipExclusionWindow = e.ExclusionWindow;
+            settings.ExpectedTime = e.ExpectedTime;
+            settings.ContinuingBias = e.ContinuingBias;
+            settings.ContinuingWindow = e.ContinuingWindow;
+            settings.SwitchMargin = e.SwitchMargin;
+            settings.LoopPreference = e.LoopPreference;
+            settings.LoopFilter = (MotionLoopFilter)e.LoopFilter;
+            settings.ReselectClip = e.ReselectClip;
+            settings.ReselectSampleTime = e.ReselectSampleTime;
+            settings.ReselectBanWindow = e.ReselectBanWindow;
+            settings.TwinBanWindow = e.TwinBanWindow;
+            settings.LoopTailExclusion = e.LoopTailExclusion;
+            settings.ExcludeNonLoopTail = (e.TraceFlags & TraceFlag_ExcludeNonLoopTail) != 0;
+            settings.FootLockL = e.FootLockL;
+            settings.FootLockR = e.FootLockR;
+            settings.FirmLockL = (e.TraceFlags & TraceFlag_FirmLockL) != 0;
+            settings.FirmLockR = (e.TraceFlags & TraceFlag_FirmLockR) != 0;
+            settings.OneShotBand = e.OneShotBand;
+            settings.MaxCandidates = e.MaxCandidates;
+            settings.QueryFrame = e.QueryFrame;
+            settings.UseIndexedSearch = (e.TraceFlags & TraceFlag_UseIndexedSearch) != 0;
+            settings.TopKCandidates = e.TopKCandidates > 0 ? e.TopKCandidates : 32;
+            settings.VerifyIndexedSearch = (e.TraceFlags & TraceFlag_VerifyIndexedSearch) != 0;
+            settings.QueryYawRate = e.YawRate;
+            if (!e.ExcludedTags.IsEmpty())
+                settings.ExcludeTags = MotionMatchingDatabase::SplitTagSet(e.ExcludedTags);
+            MotionMatchingResult result;
+            String error;
             MotionMatchingSearch::FindBest(database, e.Pose, e.Trajectory, settings,
-                -1, 999.0f, tags, result, error);
-            gotValid = result.IsValid;
-            same = wantValid == gotValid && (!wantValid || result.SampleIndex == e.SampleIndex);
-        }
-        checkedN++;
-        if (same)
-        {
-            matched++;
-        }
-        else if (mismatchLines.Count() < 8)
-        {
-            const StringAnsi tagsAnsi(e.Tags);
-            const StringAnsi reasonAnsi(e.Reason);
-            if (wantValid)
-                snprintf(buffer, sizeof(buffer), "t=%.2f want=%d ", (double)e.Time, e.SampleIndex);
-            else
-                snprintf(buffer, sizeof(buffer), "t=%.2f want=invalid ", (double)e.Time);
-            String line(buffer);
-            if (gotValid)
+                e.ContinuityClip, e.SinceSwitch, tags, result, error);
+            const bool wantValid = e.Valid;
+            bool gotValid = result.IsValid;
+            bool same = wantValid == gotValid && (!wantValid || result.SampleIndex == e.SampleIndex);
+            const bool isRetry1 = e.Recovered || e.RetryKind == 1;
+            if (!same && isRetry1)
             {
-                snprintf(buffer, sizeof(buffer), "got=%d ", result.SampleIndex);
+                // End-recovery retry reconstruction: the runtime re-ran the
+                // search without exclusion demanding loop clips. Replay the
+                // same second attempt before calling it a mismatch.
+                settings.CurrentTime = -1.0f;
+                settings.SameClipExclusionWindow = 0.0f;
+                settings.LoopFilter = MotionLoopFilter::LoopOnly;
+                settings.ReselectClip = -1;
+                settings.ReselectBanWindow = 0.0f;
+                MotionMatchingSearch::FindBest(database, e.Pose, e.Trajectory, settings,
+                    -1, 999.0f, tags, result, error);
+                gotValid = result.IsValid;
+                same = wantValid == gotValid && (!wantValid || result.SampleIndex == e.SampleIndex);
+            }
+            searchFull++;
+            if (e.RetryKind == 1 || (e.RetryKind == 0 && e.Recovered))
+                searchRetry1++;
+            else if (e.RetryKind == 2)
+                searchRetry2++;
+            if (same)
+            {
+                continue;
+            }
+            if (wantValid != gotValid)
+                mismatchValidity++;
+            else
+                mismatchWinner++;
+            if (mismatchLines.Count() < 8)
+            {
+                const StringAnsi tagsAnsi(e.Tags);
+                const StringAnsi reasonAnsi(e.Reason);
+                if (wantValid)
+                    snprintf(buffer, sizeof(buffer), "t=%.2f want=%d ", (double)e.Time, e.SampleIndex);
+                else
+                    snprintf(buffer, sizeof(buffer), "t=%.2f want=invalid ", (double)e.Time);
+                String line(buffer);
+                if (gotValid)
+                {
+                    snprintf(buffer, sizeof(buffer), "got=%d ", result.SampleIndex);
+                    line += String(buffer);
+                }
+                else
+                {
+                    line += String(TEXT("got=invalid "));
+                }
+                snprintf(buffer, sizeof(buffer), "tags=%s reason=%s retry=%d", tagsAnsi.GetText(), reasonAnsi.GetText(), e.RetryKind);
                 line += String(buffer);
+                mismatchLines.Add(line);
             }
-            else
+        }
+        else if (e.Kind == kindFast)
+        {
+            // Continuation hold: re-score the recorded sample with the
+            // recorded weights and require the recorded cost (text
+            // round-trip tolerance) plus the recorded threshold to hold.
+            float cost = 0.0f;
+            String sampleError;
+            const bool ok = MotionMatchingSearch::SampleCost(database, e.Pose, e.Trajectory,
+                e.SampleIndex, e.PoseWeight, e.TrajectoryWeight, e.YawRate, true, cost, sampleError);
+            fastChecked++;
+            bool costOk = ok && sampleError.IsEmpty() &&
+                fabsf(cost - e.Cost) <= 0.001f * fmaxf(1.0f, fabsf(e.Cost));
+            // MAX_float threshold = unset (legacy): skip the threshold leg.
+            bool threshOk = !ok || e.FastThreshold >= 1e29f || cost <= e.FastThreshold + 0.001f * fmaxf(1.0f, fabsf(e.FastThreshold));
+            if (!costOk)
             {
-                line += String(TEXT("got=invalid "));
+                mismatchFastCost++;
+                if (mismatchLines.Count() < 8)
+                {
+                    snprintf(buffer, sizeof(buffer), "t=%.2f fastpath sample=%d recorded=%.4f recomputed=%.4f",
+                        (double)e.Time, e.SampleIndex, (double)e.Cost, ok ? (double)cost : -1.0);
+                    mismatchLines.Add(String(buffer));
+                }
             }
-            snprintf(buffer, sizeof(buffer), "tags=%s reason=%s", tagsAnsi.GetText(), reasonAnsi.GetText());
-            line += String(buffer);
-            mismatchLines.Add(line);
+            else if (!threshOk)
+            {
+                mismatchFastThreshold++;
+                if (mismatchLines.Count() < 8)
+                {
+                    snprintf(buffer, sizeof(buffer), "t=%.2f fastpath sample=%d cost=%.4f above threshold=%.4f",
+                        (double)e.Time, e.SampleIndex, (double)cost, (double)e.FastThreshold);
+                    mismatchLines.Add(String(buffer));
+                }
+            }
+        }
+        else if (e.Kind == kindCommand || e.Kind == kindReset)
+        {
+            // Force-clip / teleport-reset: no search ran, so the check is
+            // structural — the command must name a clip that exists (reset
+            // records the surviving clip, which may be -1 = none) and must
+            // carry the reason that future P2 sync work will reconcile.
+            const bool isCommand = e.Kind == kindCommand;
+            bool structural = !e.Reason.IsEmpty();
+            if (isCommand)
+                structural = structural && e.CommandClip >= 0 && e.CommandClip < liveClips && e.CommandTime >= 0.0f;
+            cmdChecked++;
+            if (!isCommand)
+                cmdReset++;
+            if (!structural)
+            {
+                mismatchCommand++;
+                if (mismatchLines.Count() < 8)
+                {
+                    const StringAnsi reasonAnsi(e.Reason);
+                    snprintf(buffer, sizeof(buffer), "t=%.2f %s structural: cmdclip=%d cmdtime=%.2f reason=%s",
+                        (double)e.Time, isCommand ? "command" : "reset",
+                        e.CommandClip, (double)e.CommandTime, reasonAnsi.GetText());
+                    mismatchLines.Add(String(buffer));
+                }
+            }
+        }
+        else
+        {
+            // Legacy hold/replay policy events: no vectors by design, never
+            // re-runnable. Counted as skipped with an explicit reason.
+            skippedLegacy++;
         }
     }
+    const int32 searchChecked = searchFull + searchEmptyScope;
+    const int32 checkedTotal = searchChecked + fastChecked + cmdChecked;
+    const int32 skippedTotal = skippedLegacy + skippedDbChanged;
+    const int32 mismatches = mismatchWinner + mismatchValidity + mismatchEmptyScope +
+        mismatchFastCost + mismatchFastThreshold + mismatchCommand;
     {
-        char head[256];
-        snprintf(head, sizeof(head), "search replay %d/%d matched", matched, checkedN);
+        char head[512];
+        snprintf(head, sizeof(head),
+            "replay v3: total=%d search-checked=%d(full=%d empty-scope=%d retry1=%d retry2=%d) "
+            "fastpath-checked=%d commands-checked=%d(reset=%d) skipped=%d(legacy-policy-event=%d db-changed=%d) mismatches=%d",
+            total, searchChecked, searchFull, searchEmptyScope, searchRetry1, searchRetry2,
+            fastChecked, cmdChecked, cmdReset, skippedTotal, skippedLegacy, skippedDbChanged, mismatches);
         report = String(head);
     }
-    if (skippedN > 0)
     {
-        char tail[128];
-        snprintf(tail, sizeof(tail), " (%d hold/replay policy events skipped)", skippedN);
-        report += String(tail);
+        char cats[256];
+        snprintf(cats, sizeof(cats),
+            "mismatches by category: winner=%d validity=%d empty-scope=%d fastpath-cost=%d fastpath-threshold=%d command-structural=%d",
+            mismatchWinner, mismatchValidity, mismatchEmptyScope,
+            mismatchFastCost, mismatchFastThreshold, mismatchCommand);
+        report += String(TEXT("\n"));
+        report += String(cats);
     }
     for (int32 m = 0; m < mismatchLines.Count(); m++)
     {
         report += String(TEXT("\n"));
         report += mismatchLines[m];
     }
-    return matched == checkedN && checkedN > 0;
+    {
+        // PASS only on a complete check: at least one checked entry, zero
+        // mismatches, and no skipped entry that carried checkable input
+        // (a database change under the trace fails the gate honestly).
+        const bool pass = mismatches == 0 && checkedTotal > 0 && skippedDbChanged == 0;
+        report += String(TEXT("\nresult: "));
+        report += String(pass ? TEXT("PASS") : (checkedTotal == 0 ? TEXT("INCOMPLETE (nothing checked)") : TEXT("MISMATCH")));
+    }
+    const bool pass = mismatches == 0 && checkedTotal > 0 && skippedDbChanged == 0;
+    return pass;
 }

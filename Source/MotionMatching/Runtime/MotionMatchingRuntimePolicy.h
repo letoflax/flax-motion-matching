@@ -128,6 +128,23 @@ public:
     API_FIELD() float LastFastPathAge = 0.0f;
     API_FIELD() String ForcedReason;
     API_FIELD() float LastTimeError = 0.0f;
+    // P0 additive profiling counters (record-only; never steer search or
+    // playback). LastQueryMs above already measures the full-scan block
+    // (FindBest + retries); the fields below split the remaining phases so
+    // before/after runs can compare update/search/fast-path/I-O cost.
+    // Whole-Tick wall time (pose sample + query/fast-path + playback).
+    API_FIELD() float LastTickMs = 0.0f;
+    // Continuation SampleCost block inside TryFastPath (hit path only).
+    API_FIELD() float LastFastPathMs = 0.0f;
+    // Synchronous telemetry/audit file I/O (LogTelemetryLine per query +
+    // WriteClipAuditFile at init). Telemetry-off ticks record nothing.
+    API_FIELD() float LastTelemetryMs = 0.0f;
+    API_FIELD() int32 TickCount = 0;
+    API_FIELD() int32 FullSearchCount = 0;
+    API_FIELD() float TotalTickMs = 0.0f;
+    API_FIELD() float TotalFullSearchMs = 0.0f;
+    API_FIELD() float TotalFastPathMs = 0.0f;
+    API_FIELD() float TotalTelemetryMs = 0.0f;
 
     API_PROPERTY() bool GetIsReady() const;
 
@@ -259,8 +276,9 @@ private:
     void EnsureSampleStarts();
     void RecordTrace(float speed, float yawRate, const Array<String>& tags,
         const Array<float>& trajectory, const MotionMatchingSearchSettings& settings,
-        int32 continuityClip, float sinceSwitch, bool recovered, bool valid,
-        const MotionMatchingResult& result, const String& reason);
+        int32 continuityClip, float sinceSwitch, int32 retryKind, bool forcedEdge, bool reseeded,
+        bool fairFight, bool oneshotWindow, float frameDt, float playRate,
+        bool valid, const MotionMatchingResult& result, const String& reason);
     static float Wrap180(float a);
     void WarnOnce(const String& message);
     void LogTelemetryLine(float speed, float yawRate, const Array<String>& tags,

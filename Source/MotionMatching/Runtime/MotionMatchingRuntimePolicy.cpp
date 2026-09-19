@@ -62,6 +62,33 @@ namespace
                 buffer[i] = '.';
         }
     }
+
+    // P0: pack the nine boolean request flags into MotionMatchingTraceEntry
+    // bitmask (see TraceFlag_* in MotionMatchingTrace.h). Record-only.
+    int32 PackTraceFlags(bool forcedEdge, bool reseeded, bool fairFight, bool oneshotWindow,
+        bool useIndexed, bool verifyIndexed, bool exclTail, bool firmL, bool firmR)
+    {
+        int32 flags = 0;
+        if (forcedEdge)
+            flags |= TraceFlag_ForcedEdge;
+        if (reseeded)
+            flags |= TraceFlag_Reseeded;
+        if (fairFight)
+            flags |= TraceFlag_FairFight;
+        if (oneshotWindow)
+            flags |= TraceFlag_OneshotWindow;
+        if (useIndexed)
+            flags |= TraceFlag_UseIndexedSearch;
+        if (verifyIndexed)
+            flags |= TraceFlag_VerifyIndexedSearch;
+        if (exclTail)
+            flags |= TraceFlag_ExcludeNonLoopTail;
+        if (firmL)
+            flags |= TraceFlag_FirmLockL;
+        if (firmR)
+            flags |= TraceFlag_FirmLockR;
+        return flags;
+    }
 }
 
 float MotionMatchingRuntimePolicy::ClampF(float value, float minValue, float maxValue)
@@ -418,11 +445,20 @@ void MotionMatchingRuntimePolicy::WriteClipAuditFile()
     char path[1024];
     snprintf(path, sizeof(path), "%s/MMClipAudit.txt", folderAnsi.GetText());
     const StringAnsi bodyAnsi(text);
+    // P0 profiling (record-only): audit file write time folds into the
+    // telemetry/I-O counter so init cost is visible in the baseline.
+    const auto auditStart = std::chrono::high_resolution_clock::now();
     FILE* file = fopen(path, "wb");
     if (file != nullptr)
     {
         fwrite(bodyAnsi.GetText(), 1, (size_t)bodyAnsi.Length(), file);
         fclose(file);
+    }
+    {
+        const auto auditEnd = std::chrono::high_resolution_clock::now();
+        const float auditMs = (float)std::chrono::duration<double, std::milli>(auditEnd - auditStart).count();
+        LastTelemetryMs = auditMs;
+        TotalTelemetryMs += auditMs;
     }
 }
 
@@ -469,6 +505,12 @@ void MotionMatchingRuntimePolicy::ResetOnTeleport()
     if (_playback != nullptr)
         _playback->SetPlayRate(1.0f);
     LastSwitchReason = String(TEXT("teleport-reset"));
+    // P0: teleport/reset is effective input (it reseeds the chooser to
+    // LoopOnly on the next query). Record it as a structural command entry
+    // so replay accounts for every discontinuity. Record-only: playback and
+    // chooser state above are untouched.
+    if (_trace != nullptr)
+        RecordPolicyEvent("reset", _currentClip, String(TEXT("teleport-reset")));
     // Playback keeps playing (see above): same clip, same time, root
     // stripped Ã¢â‚¬â€ the picture never jumps. Only timers/locks release.
 }
@@ -582,6 +624,9 @@ void MotionMatchingRuntimePolicy::Tick(
     if (!_samplingReady || _database == nullptr || _body == nullptr || _playback == nullptr || _trace == nullptr)
         return;
 
+    // P0 profiling (record-only): whole-Tick wall time. One chrono pair per
+    // tick is nanoseconds; it never steers search or playback.
+    const auto tickStart = std::chrono::high_resolution_clock::now();
     _snapshot = state;
     _tuning = tuning;
     _trajectoryPoints = trajectoryPoints;
@@ -752,6 +797,15 @@ void MotionMatchingRuntimePolicy::Tick(
     // query may leave immediately instead of holding the last frame.
     if (_playback->IsAtEnd)
         _timeSinceSwitch = 999.0f;
+
+    // P0 profiling tail: record whole-Tick time (see tickStart above).
+    {
+        const auto tickEnd = std::chrono::high_resolution_clock::now();
+        const float tickMs = (float)std::chrono::duration<double, std::milli>(tickEnd - tickStart).count();
+        LastTickMs = tickMs;
+        TotalTickMs += tickMs;
+        TickCount++;
+    }
 }
 
 // P2: onset band ceilings are the ex-default provider values (5/200/490).
@@ -770,6 +824,8 @@ int32 MotionMatchingRuntimePolicy::BandFromSpeed(float speed) const
 
 void MotionMatchingRuntimePolicy::RecordPolicyEvent(const char* kind, int32 clipIndex, const String& reason)
 {
+    if (_trace == nullptr)
+        return;
     const MotionMatchingPlayerSnapshot& state = _snapshot;
     const float speed = Float2(state.CurrentVelocity.X, state.CurrentVelocity.Z).Length();
     MotionMatchingTraceEntry entry;
@@ -787,6 +843,13 @@ void MotionMatchingRuntimePolicy::RecordPolicyEvent(const char* kind, int32 clip
     entry.Reason = reason;
     entry.Chooser = ChooserStatusText;
     entry.QueryMs = 0.0f;
+    // P0: reset/command entries carry the reseed flag and the surviving
+    // clip so replay can check them structurally. Vectors stay empty by
+    // design (no search ran on these ticks).
+    entry.TraceFlags = PackTraceFlags(false, _chooserReseed, false, false, false, false, false, false, false);
+    entry.CommandClip = clipIndex;
+    entry.DbClipCount = _database != nullptr ? _database->GetClipCount() : 0;
+    entry.DbSampleCount = _database != nullptr ? _database->GetSampleCount() : 0;
     Array<float> empty;
     _trace->Record(entry, empty, empty);
 }
@@ -880,6 +943,24 @@ void MotionMatchingRuntimePolicy::RunQuery(const Array<TrajectoryPoint>& traject
         ActiveTag = String::Empty;
         ChooserStatusText = String(TEXT("ext:empty (no-match)"));
         LastSwitchReason = String(TEXT("no-result:empty-scope"));
+        // P0: the explicit-empty short-circuit is effective input (a whole
+        // tick decided with no search). Record it with the vectors on hand
+        // so replay checks the no-match structurally. Record-only: the
+        // early return below is unchanged.
+        {
+            MotionMatchingSearchSettings emptySettings;
+            emptySettings.PoseWeight = _tuning.PoseWeight;
+            emptySettings.TrajectoryWeight = _tuning.TrajectoryWeight;
+            emptySettings.ContinuityWeight = _tuning.ContinuityWeight;
+            emptySettings.MinSwitchTime = _tuning.MinSwitchTime;
+            if (!_snapshot.ExcludedTagSet.IsEmpty())
+                emptySettings.ExcludeTags = MotionMatchingDatabase::SplitTagSet(_snapshot.ExcludedTagSet);
+            const float emptyRate = _playback != nullptr ? _playback->GetPlayRate() : 1.0f;
+            MotionMatchingResult emptyResult;
+            RecordTrace(planarSpeed, yawRate, tags, _tickTrajectory, emptySettings,
+                -1, 999.0f, 0, edge, reseeded, fairFight, oneshotWindow, frameDt, emptyRate,
+                false, emptyResult, String(TEXT("no-result:empty-scope")));
+        }
         return;
     }
 
@@ -1070,6 +1151,7 @@ void MotionMatchingRuntimePolicy::RunQuery(const Array<TrajectoryPoint>& traject
     // structurally (LoopOnly) instead of naming a rest gait: the finished
     // one-shot cannot re-win on exact pose match, whatever tag it has.
     bool recovered = false;
+    int32 retryKind = 0;
     if (!result.IsValid && _playback != nullptr && _playback->IsAtEnd)
     {
         MotionMatchingSearchSettings retry = settings;
@@ -1091,11 +1173,15 @@ void MotionMatchingRuntimePolicy::RunQuery(const Array<TrajectoryPoint>& traject
             error = retryError;
             forced = true;
             recovered = true;
+            retryKind = 1;
         }
     }
 
     const auto watchEnd = std::chrono::high_resolution_clock::now();
     LastQueryMs = (float)std::chrono::duration<double, std::milli>(watchEnd - watchStart).count();
+    // P0 profiling: LastQueryMs is the full-scan block (FindBest + retries).
+    TotalFullSearchMs += LastQueryMs;
+    FullSearchCount++;
 
     // Onset fallback: regimes without one-shot coverage (no back starts
     // exist) retry with the full pool instead of freezing on nothing.
@@ -1110,6 +1196,10 @@ void MotionMatchingRuntimePolicy::RunQuery(const Array<TrajectoryPoint>& traject
         {
             result = anyResult;
             error = anyError;
+            // P0: the recorded settings below are already post-mutation, so
+            // replay reproduces this winner directly; the kind only labels
+            // which retry path produced it.
+            retryKind = 2;
         }
     }
 
@@ -1133,7 +1223,8 @@ void MotionMatchingRuntimePolicy::RunQuery(const Array<TrajectoryPoint>& traject
         WarnOnce(String(message));
         LastSwitchReason = String(TEXT("no-result:hold"));
         RecordTrace(planarSpeed, yawRate, tags, trajectory, settings,
-            continuityClip, sinceSwitch, recovered, false, result, String(TEXT("no-result:hold")));
+            continuityClip, sinceSwitch, retryKind, forced, reseeded, fairFight, oneshotWindow, frameDt, playRate,
+            false, result, String(TEXT("no-result:hold")));
         return;
     }
 
@@ -1269,7 +1360,8 @@ void MotionMatchingRuntimePolicy::RunQuery(const Array<TrajectoryPoint>& traject
         }
     }
     RecordTrace(planarSpeed, yawRate, tags, trajectory, settings,
-        continuityClip, sinceSwitch, recovered, true, result, LastSwitchReason);
+        continuityClip, sinceSwitch, retryKind, forced, reseeded, fairFight, oneshotWindow, frameDt, playRate,
+        true, result, LastSwitchReason);
 }
 
 bool MotionMatchingRuntimePolicy::TryFastPath(float frameDt)
@@ -1358,9 +1450,18 @@ bool MotionMatchingRuntimePolicy::TryFastPath(float frameDt)
     const float yawRate = AbsF(_snapshot.AngularVelocity.Y);
     float fast = 0.0f;
     String sampleError;
-    if (!MotionMatchingSearch::SampleCost(db, _latestPose, _tickTrajectory, sample,
+    // P0 profiling (record-only): time the continuation SampleCost block.
+    const auto fastStart = std::chrono::high_resolution_clock::now();
+    const bool sampleOk = MotionMatchingSearch::SampleCost(db, _latestPose, _tickTrajectory, sample,
             _tuning.PoseWeight, _tuning.TrajectoryWeight,
-            yawRate, true, fast, sampleError))
+            yawRate, true, fast, sampleError);
+    {
+        const auto fastEnd = std::chrono::high_resolution_clock::now();
+        const float fastMs = (float)std::chrono::duration<double, std::milli>(fastEnd - fastStart).count();
+        LastFastPathMs = fastMs;
+        TotalFastPathMs += fastMs;
+    }
+    if (!sampleOk)
         return MissFastPath("miss:sample-cost");
 
     const float threshold = _lastScanTotal + _tuning.SwitchMargin + _tuning.ContinuingBias;
@@ -1375,10 +1476,16 @@ bool MotionMatchingRuntimePolicy::TryFastPath(float frameDt)
     {
         const float planarSpeed = Float2(_snapshot.CurrentVelocity.X, _snapshot.CurrentVelocity.Z).Length();
         MotionMatchingTraceEntry entry;
-        entry.Kind = String(TEXT("search"));
+        // P0: fast-path hits are first-class trace entries (Kind fastpath)
+        // WITH the feature vectors they scored, so replay re-runs the same
+        // SampleCost instead of skipping them. Record-only: the hold above
+        // is unchanged.
+        entry.Kind = String(TEXT("fastpath"));
         entry.Time = Time::GetGameTime();
         entry.State = PolicyState;
         entry.Tags = ActiveTag;
+        entry.ExcludedTags = MotionMatchingDatabase::JoinTags(
+            MotionMatchingDatabase::SplitTagSet(_snapshot.ExcludedTagSet));
         entry.Speed = planarSpeed;
         entry.YawRate = yawRate;
         entry.Grounded = _snapshot.IsGrounded;
@@ -1386,6 +1493,23 @@ bool MotionMatchingRuntimePolicy::TryFastPath(float frameDt)
         entry.DesiredSpeed = Float2(_snapshot.DesiredVelocity.X, _snapshot.DesiredVelocity.Z).Length();
         entry.PoseWeight = _tuning.PoseWeight;
         entry.TrajectoryWeight = _tuning.TrajectoryWeight;
+        entry.ContinuityWeight = _tuning.ContinuityWeight;
+        entry.MinSwitchTime = _tuning.MinSwitchTime;
+        entry.ContinuingBias = _tuning.ContinuingBias;
+        entry.ContinuingWindow = _tuning.ContinuingWindow;
+        entry.SwitchMargin = _tuning.SwitchMargin;
+        entry.LoopPreference = 0.0f;
+        entry.LoopFilter = (int32)MotionLoopFilter::Any;
+        entry.MaxCandidates = MaxI(_tuning.FrameSearchBudget, 0);
+        entry.QueryFrame = _policyFrame;
+        entry.TraceFlags = PackTraceFlags(false, false, false, false,
+            _tuning.UseIndexedSearch, _tuning.VerifyIndexedSearch, true, false, false);
+        entry.TopKCandidates = MaxI(1, _tuning.TopKCandidates);
+        entry.CostFuseThreshold = _tuning.CostFuseThreshold;
+        entry.FrameDt = frameDt;
+        entry.PlayRate = currentPlayRate;
+        entry.DbClipCount = db->GetClipCount();
+        entry.DbSampleCount = db->GetSampleCount();
         entry.Valid = true;
         entry.ClipIndex = _currentClip;
         entry.SampleIndex = sample;
@@ -1394,11 +1518,11 @@ bool MotionMatchingRuntimePolicy::TryFastPath(float frameDt)
         entry.PoseCost = -1.0f;
         entry.TrajectoryCost = -1.0f;
         entry.SecondBestCost = threshold;
+        entry.FastThreshold = threshold;
         entry.Reason = String(TEXT("fast:continuing-good"));
         entry.Chooser = ChooserStatusText;
         entry.QueryMs = 0.0f;
-        Array<float> empty;
-        _trace->Record(entry, empty, empty);
+        _trace->Record(entry, _latestPose, _tickTrajectory);
     }
     return true;
 }
@@ -1475,8 +1599,9 @@ void MotionMatchingRuntimePolicy::EnsureSampleStarts()
 
 void MotionMatchingRuntimePolicy::RecordTrace(float speed, float yawRate, const Array<String>& tags,
     const Array<float>& trajectory, const MotionMatchingSearchSettings& settings,
-    int32 continuityClip, float sinceSwitch, bool recovered, bool valid,
-    const MotionMatchingResult& result, const String& reason)
+    int32 continuityClip, float sinceSwitch, int32 retryKind, bool forcedEdge, bool reseeded,
+    bool fairFight, bool oneshotWindow, float frameDt, float playRate,
+    bool valid, const MotionMatchingResult& result, const String& reason)
 {
     if (_latestPose.Count() == 0 || trajectory.Count() == 0)
         return;
@@ -1514,9 +1639,23 @@ void MotionMatchingRuntimePolicy::RecordTrace(float speed, float yawRate, const 
     entry.LoopTailExclusion = settings.LoopTailExclusion;
     entry.FootLockL = settings.FootLockL;
     entry.FootLockR = settings.FootLockR;
+    entry.OneShotBand = settings.OneShotBand;
+    entry.MaxCandidates = settings.MaxCandidates;
+    entry.QueryFrame = settings.QueryFrame;
+    entry.TraceFlags = PackTraceFlags(forcedEdge, reseeded, fairFight, oneshotWindow,
+        settings.UseIndexedSearch, settings.VerifyIndexedSearch, settings.ExcludeNonLoopTail,
+        settings.FirmLockL, settings.FirmLockR);
+    entry.TopKCandidates = settings.TopKCandidates;
+    entry.ExcludedTags = MotionMatchingDatabase::JoinTags(settings.ExcludeTags);
+    entry.RetryKind = retryKind;
+    entry.Recovered = retryKind == 1;
+    entry.CostFuseThreshold = _tuning.CostFuseThreshold;
+    entry.FrameDt = frameDt;
+    entry.PlayRate = playRate;
+    entry.DbClipCount = _database != nullptr ? _database->GetClipCount() : 0;
+    entry.DbSampleCount = _database != nullptr ? _database->GetSampleCount() : 0;
     entry.ContinuityClip = continuityClip;
     entry.SinceSwitch = sinceSwitch;
-    entry.Recovered = recovered;
     entry.Valid = valid;
     entry.ClipIndex = valid ? result.ClipIndex : -1;
     entry.SampleIndex = valid ? result.SampleIndex : -1;
@@ -1617,6 +1756,9 @@ void MotionMatchingRuntimePolicy::LogTelemetryLine(float speed, float yawRate, c
     const StringAnsi folderAnsi(_cacheFolder);
     char path[1024];
     snprintf(path, sizeof(path), "%s/Cache/MMTelemetry.jsonl", folderAnsi.GetText());
+    // P0 profiling (record-only): synchronous per-query file I/O time. The
+    // write itself is untouched; only its wall time is observed.
+    const auto ioStart = std::chrono::high_resolution_clock::now();
     FILE* file = fopen(path, "ab");
     if (file != nullptr)
     {
@@ -1624,6 +1766,12 @@ void MotionMatchingRuntimePolicy::LogTelemetryLine(float speed, float yawRate, c
         fwrite(line, 1, length, file);
         fwrite("\n", 1, 1, file);
         fclose(file);
+    }
+    {
+        const auto ioEnd = std::chrono::high_resolution_clock::now();
+        const float ioMs = (float)std::chrono::duration<double, std::milli>(ioEnd - ioStart).count();
+        LastTelemetryMs = ioMs;
+        TotalTelemetryMs += ioMs;
     }
     // Telemetry must never break gameplay: all failures above are silent.
 }

@@ -8,12 +8,41 @@
 
 class MotionMatchingDatabase;
 
+// P0 trace-flag bits for MotionMatchingTraceEntry::TraceFlags.
+// Flax 1.12 BindingsGenerator.Cpp indexes per-field wrapper caches with
+// fixed bool/string[64] arrays, so a non-POD API_STRUCT with more than 64
+// instance fields crashes binding generation (IndexOutOfRange inside
+// GenerateCpp). The nine boolean request flags below therefore travel as
+// ONE int32 bitmask; the JSON exporter still expands them to named keys so
+// tools never see the packing. Keep the TOTAL instance field count of
+// MotionMatchingTraceEntry at or below 64 (currently 61).
+constexpr int32 TraceFlag_ForcedEdge = 1 << 0;
+constexpr int32 TraceFlag_Reseeded = 1 << 1;
+constexpr int32 TraceFlag_FairFight = 1 << 2;
+constexpr int32 TraceFlag_OneshotWindow = 1 << 3;
+constexpr int32 TraceFlag_UseIndexedSearch = 1 << 4;
+constexpr int32 TraceFlag_VerifyIndexedSearch = 1 << 5;
+constexpr int32 TraceFlag_ExcludeNonLoopTail = 1 << 6;
+constexpr int32 TraceFlag_FirmLockL = 1 << 7;
+constexpr int32 TraceFlag_FirmLockR = 1 << 8;
+
 /// <summary>
 /// One recorded search: everything needed to re-run it bit-exactly.
-/// Kind separates search from policy/playback events: "search" ran FindBest
-/// (replayable), "hold" skipped the query (turn hold), "replay" restarted a
-/// clip with no search (turn replay). Replay verify only re-runs "search"
-/// entries and reports the rest as skipped.
+/// Kind separates search from policy/playback events:
+/// "search" ran FindBest (replayable via FindBest);
+/// "fastpath" held the continuation without a full scan (replayable via
+/// SampleCost from the recorded feature vectors);
+/// "command" is a ForcePlayClip request (structural check only);
+/// "reset" is a ResetOnTeleport/teleport discontinuity (structural check);
+/// "hold" skipped the query (legacy turn hold);
+/// "replay" restarted a clip with no search (legacy turn replay).
+/// Replay verify re-runs "search"/"fastpath", structurally checks
+/// "command"/"reset", and reports the rest as skipped with reasons.
+/// P0: the entry carries the COMPLETE effective request — every runtime
+/// input that can change the winner (OneShotBand, exclusions, retry kind,
+/// force/reset flags, intent windows, budget/stride, index route, tail
+/// rule, fuse threshold, frame dt, play rate, database identity,
+/// fast-path threshold, command clip/time).
 /// </summary>
 API_STRUCT(Namespace="MotionMatching")
 struct MOTIONMATCHING_API MotionMatchingTraceEntry
@@ -66,6 +95,42 @@ struct MOTIONMATCHING_API MotionMatchingTraceEntry
     API_FIELD() String Reason;
     API_FIELD() String Chooser;
     API_FIELD() float QueryMs = 0.0f;
+    // P0 complete-effective-request fields (trace v3, appended — never
+    // reordered). All are recorded, never read by search/playback.
+    // Booleans travel packed in TraceFlags (see bit constants above):
+    // the Flax 1.12 bindings generator cannot handle more than 64 fields
+    // on one API_STRUCT.
+    // Controller-decided exclusions, '+'-joined (merged into search).
+    API_FIELD() String ExcludedTags;
+    // Onset one-shot gait band actually applied (0 = Any).
+    API_FIELD() int32 OneShotBand = 0;
+    // Retry path taken after the first FindBest: 0 none, 1 end-recovery
+    // LoopOnly retry, 2 onset-fallback full-pool retry.
+    API_FIELD() int32 RetryKind = 0;
+    // Packed request flags (TraceFlag_* bits): ForcedEdge (grounded/
+    // airborne edge bypassed continuity), Reseeded (first query after
+    // teleport, LoopOnly), FairFight + OneshotWindow (intent windows),
+    // UseIndexedSearch + VerifyIndexedSearch (index route),
+    // ExcludeNonLoopTail (structural tail rule), FirmLockL/R (search gates).
+    API_FIELD() int32 TraceFlags = 0;
+    // Budgeted-search stride cursor (0 = unstrided full scan).
+    API_FIELD() int32 MaxCandidates = 0;
+    API_FIELD() int32 QueryFrame = 0;
+    // Index route breadth (meaningful with the TraceFlags indexed bit).
+    API_FIELD() int32 TopKCandidates = 32;
+    // Post-search fuse threshold (a switched winner above this holds).
+    API_FIELD() float CostFuseThreshold = 2.0f;
+    // Frame dt + play rate behind ExpectedTime for this query.
+    API_FIELD() float FrameDt = 0.0f;
+    API_FIELD() float PlayRate = 1.0f;
+    // Database identity at record time (invalidate on rebake/reload).
+    API_FIELD() int32 DbClipCount = 0;
+    API_FIELD() int32 DbSampleCount = 0;
+    // Fast-path continuation threshold actually applied (hit iff cost <= this).
+    API_FIELD() float FastThreshold = MAX_float;
+    // Command/reset entries: requested clip/time (structural check).
+    API_FIELD() int32 CommandClip = -1;
+    API_FIELD() float CommandTime = 0.0f;
 };
 
 /// <summary>
@@ -83,7 +148,12 @@ public:
     // Ring capacity: 4096 entries ≈ 60s at 60 Hz queries. Memory stays
     // modest for one tuned character.
     static constexpr int32 Capacity = 4096;
-    static constexpr int32 SchemaVersion = 2;
+    // P0: v3 adds the complete effective request (exclusions, OneShotBand,
+    // retry kind, force/reset flags, intent windows, budget/stride, index
+    // route, tail rule, fuse threshold, frame dt, play rate, DB identity,
+    // fast-path threshold, command clip/time) plus replayable fast-path
+    // vectors and command/reset entries. v2 files still import.
+    static constexpr int32 SchemaVersion = 3;
 
 private:
     MotionMatchingTraceEntry _entries[Capacity];
