@@ -12,11 +12,11 @@ class MotionMatchingDatabase;
 // Flax 1.12 BindingsGenerator.Cpp indexes per-field wrapper caches with
 // fixed bool/string[64] arrays, so a non-POD API_STRUCT with more than 64
 // instance fields crashes binding generation (IndexOutOfRange inside
-// GenerateCpp). The nine boolean request flags below therefore travel as
+// GenerateCpp). The seven boolean request flags below therefore travel as
 // ONE int32 bitmask; the JSON exporter still expands them to named keys so
 // tools never see the packing. Keep the TOTAL instance field count of
-// MotionMatchingTraceEntry at or below 64 (currently 63: 61 + 2 P2 turn-prior
-// tuning fields).
+// MotionMatchingTraceEntry at or below 64 (currently 61: 59 + 2 P2 turn-prior
+// tuning fields; P3 deleted the 2 foot-lock fields).
 constexpr int32 TraceFlag_ForcedEdge = 1 << 0;
 constexpr int32 TraceFlag_Reseeded = 1 << 1;
 constexpr int32 TraceFlag_FairFight = 1 << 2;
@@ -24,8 +24,6 @@ constexpr int32 TraceFlag_OneshotWindow = 1 << 3;
 constexpr int32 TraceFlag_UseIndexedSearch = 1 << 4;
 constexpr int32 TraceFlag_VerifyIndexedSearch = 1 << 5;
 constexpr int32 TraceFlag_ExcludeNonLoopTail = 1 << 6;
-constexpr int32 TraceFlag_FirmLockL = 1 << 7;
-constexpr int32 TraceFlag_FirmLockR = 1 << 8;
 
 /// <summary>
 /// One recorded search: everything needed to re-run it bit-exactly.
@@ -78,8 +76,6 @@ struct MOTIONMATCHING_API MotionMatchingTraceEntry
     API_FIELD() float ReselectBanWindow = 0.0f;
     API_FIELD() float TwinBanWindow = 0.0f;
     API_FIELD() float LoopTailExclusion = 0.0f;
-    API_FIELD() float FootLockL = 0.0f;
-    API_FIELD() float FootLockR = 0.0f;
     API_FIELD() int32 ContinuityClip = -1;
     API_FIELD() float SinceSwitch = 999.0f;
     API_FIELD() bool Recovered = false;
@@ -112,7 +108,8 @@ struct MOTIONMATCHING_API MotionMatchingTraceEntry
     // airborne edge bypassed continuity), Reseeded (first query after
     // teleport, LoopOnly), FairFight + OneshotWindow (intent windows),
     // UseIndexedSearch + VerifyIndexedSearch (index route),
-    // ExcludeNonLoopTail (structural tail rule), FirmLockL/R (search gates).
+    // ExcludeNonLoopTail (structural tail rule).
+    // P3: the firm-lock search gates died with the foot-lock prior (always 0).
     API_FIELD() int32 TraceFlags = 0;
     // Budgeted-search stride cursor (0 = unstrided full scan).
     API_FIELD() int32 MaxCandidates = 0;

@@ -135,8 +135,9 @@ public:
     API_FIELD() float LastTickMs = 0.0f;
     // Continuation SampleCost block inside TryFastPath (hit path only).
     API_FIELD() float LastFastPathMs = 0.0f;
-    // Synchronous telemetry/audit file I/O (LogTelemetryLine per query +
-    // WriteClipAuditFile at init). Telemetry-off ticks record nothing.
+    // Synchronous telemetry file I/O (LogTelemetryLine per query).
+    // P3: the init-time audit write is gone; GenerateClipAudit runs only
+    // on an explicit editor/tool call. Telemetry-off ticks record nothing.
     API_FIELD() float LastTelemetryMs = 0.0f;
     API_FIELD() int32 TickCount = 0;
     API_FIELD() int32 FullSearchCount = 0;
@@ -178,6 +179,16 @@ public:
     /// Search resumes immediately on the next tick with the caller filter.
     /// </summary>
     API_FUNCTION() void ForcePlayClip(int32 clipIndex, float startTime, const String& reason);
+    /// <summary>
+    /// P3 explicit editor/tool command: scans the baked database and writes
+    /// Cache/MMClipAudit.txt on demand (index|name|tags|loop|turn|travel|net|
+    /// yaw|len|speed). Static so it runs in edit mode with no policy/playback
+    /// instance: init/play never call this and never produce the file.
+    /// Returns false with an error when the database is not baked, the cache
+    /// folder is unset, or the file cannot be written.
+    /// </summary>
+    API_FUNCTION() static bool ExportClipAudit(MotionMatchingDatabase* database,
+        const String& cacheFolder, float sampleRate, API_PARAM(Out) String& error);
 
 private:
     struct FastPathSignature
@@ -240,9 +251,7 @@ private:
     int32 _callerCandidateBand = 0;
     float _callerYawRate = 0.0f;
 
-    Array<float> _clipTravel;
-    Array<float> _clipTurnAngle;
-    Array<float> _clipNet;
+    // P3: init-time tag cache only (no motion scan, no audit file).
     Array<Array<String>> _clipTags;
 
     float _lastSpikeWarn = -99.0f;
@@ -264,9 +273,10 @@ private:
     static int32 MaxI(int32 a, int32 b);
 
     float SelectPlayRate();
-    void MeasureClipMotion();
-    void LogAccelAudit();
-    void WriteClipAuditFile();
+    // P3: init caches tag SETS only (EnsureClipTagCache) — the motion scan
+    // and accel log live inside the explicit static ExportClipAudit command,
+    // never in Initialize/Tick.
+    void EnsureClipTagCache();
     void CheckSchemaBinding();
     static bool AxesNear(const Float3& a, const Float3& b);
     static bool TimesEqual(const Array<float>& a, const Array<float>& b);
@@ -290,8 +300,6 @@ private:
     void LogTelemetryLine(float speed, float yawRate, const Array<String>& tags,
         const MotionMatchingResult& result, const Float3& actorPos, float timeError);
     String GetClipName(int32 clipIndex);
-    // Normalized tag SET snapshot (MeasureClipMotion) with DB fallback.
+    // Normalized tag SET snapshot (EnsureClipTagCache at init) with DB fallback.
     const Array<String>& ClipTags(int32 clipIndex);
-    // Primary tag (element 0) for display/audit contexts.
-    String ClipTag(int32 clipIndex);
 };

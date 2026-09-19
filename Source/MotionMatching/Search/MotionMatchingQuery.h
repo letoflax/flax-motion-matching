@@ -166,30 +166,6 @@ struct MOTIONMATCHING_API MotionMatchingSearchSettings
     API_FIELD() float TurnPenaltyYawScale = 4.0f;
 
     /// <summary>
-    /// Foot-lock prior weights (0..1, playback pin weights): a firmly locked
-    /// foot must not trade for a swinging candidate mid-plant (measured:
-    /// lock transfers coincide with the biggest world-Y foot jumps). Baked
-    /// contact (offsets via PoseSearchSchema::GetContactFeatureOffset, raw =
-    /// norm*std+mean) disagreeing with a firm lock pays FootLockPenalty x
-    /// weight, folded into ContinuityCost.
-    /// Recorded in the trace (0 when unset), so replay stays bit-exact.
-    /// Default off (self-test safe).
-    /// </summary>
-    API_FIELD() float FootLockL = 0.0f;
-    API_FIELD() float FootLockR = 0.0f;
-
-    /// <summary>
-    /// D1 / PLAN §5.2 firm-lock gates from the playback state machine (H1b:
-    /// LockState == Locked). The foot-lock search prior is applied only while
-    /// the corresponding lock is FIRM; FootLockL/R remain the visual pin
-    /// weights for scaling, so the ramp still shows in the pose but a
-    /// non-firm (Planting/Releasing) foot never steers candidate ranking.
-    /// Default off (self-test and direct callers keep legacy behavior).
-    /// </summary>
-    API_FIELD() bool FirmLockL = false;
-    API_FIELD() bool FirmLockR = false;
-
-    /// <summary>
     /// Onset one-shot gait filter (0 = Any). When set (Walk/Run/Sprint),
     /// ONE-SHOT candidates whose baked speed band disagrees are skipped, so a
     /// walk onset cannot coin-flip a run start: at the onset instant the

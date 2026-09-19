@@ -45,55 +45,11 @@ namespace
         return a * w / (1.0f + Math::Max(queryYawRate, 0.0f) * s);
     }
 
-    // Foot-lock prior (Wave feet): a firmly pinned foot must not trade for
-    // a swinging one mid-plant (measured: lock transfers coincide with the
-    // biggest world-Y foot jumps at switches). D1/PLAN �5.2: the prior fires
-    // only while the playback lock is FIRM (H1b LockState == Locked). The pin
-    // weight still scales it, but a non-firm Planting/Releasing ramp must not
-    // steer candidate ranking � the visual ramp stays in playback.
-    // Folded into ContinuityCost like the straightness prior (>= 0, so block
-    // pruning stays valid with no extra headroom).
-    // N1b rev 3: baked contacts are RAW flags (1 = planted), so planted iff
-    // the raw value is >= 0.5 (no z-score decode).
-    // Rev-3 scale: same hold ratio as the old 15.0 against typical costs.
-    // (foot-ik branch: softened, see below.)
-    constexpr float FootLockPenalty = 0.05f;
-    float FootLockCost(
-        const MotionMatchingDatabase& database,
-        const float* bakedPose,
-        int32 poseFeatureSize,
-        const MotionMatchingSearchSettings& settings)
-    {
-        const bool firmL = settings.FirmLockL;
-        const bool firmR = settings.FirmLockR;
-        if (!firmL && !firmR)
-            return 0.0f;
-        const float lockL = Math::Clamp(settings.FootLockL, 0.0f, 1.0f);
-        const float lockR = Math::Clamp(settings.FootLockR, 0.0f, 1.0f);
-        float lockCost = 0.0f;
-        // N1: contact offsets via channel metadata, never size-2/-1.
-    // foot-ik branch (soft): 0.05, down from 0.15. The old value rivaled a
-    // whole winner cost (0.01-0.2), so a firm pin effectively VETOED any
-    // phase-mismatched candidate � flips waited for phase-aligned winners
-    // (+0.3-0.7s measured). 0.05 still breaks ties toward contact agreement
-    // without outvoting a clearly better pose/trajectory match.
-        // Bounds + finite-value guards before decode (IsReadyForQuery checks
-        // counts; values are verified here so a corrupt flag can never NaN
-        // the cost and break pruning).
-        const int32 dimL = PoseSearchSchema::GetContactFeatureOffset(0);
-        const int32 dimR = PoseSearchSchema::GetContactFeatureOffset(1);
-        if (firmL && lockL > 0.0f && dimL >= 0 && dimL < poseFeatureSize &&
-            std::isfinite(bakedPose[dimL]) && bakedPose[dimL] < 0.5f)
-        {
-            lockCost += FootLockPenalty * lockL;
-        }
-        if (firmR && lockR > 0.0f && dimR >= 0 && dimR < poseFeatureSize &&
-            std::isfinite(bakedPose[dimR]) && bakedPose[dimR] < 0.5f)
-        {
-            lockCost += FootLockPenalty * lockR;
-        }
-        return lockCost;
-    }
+    // P3: foot-lock search prior deleted (FootLockCost + FootLockL/R +
+    // FirmLockL/R). The runtime always fed it zero (verified: 4004/4004
+    // trace entries flock=(0,0) firm=(0,0)), so removal is query-identical.
+    // Baked contact channels + feature extraction + DB stay untouched;
+    // Game-side IK owns its own contact state.
 
     // N1 weight contract: schema weights are stored, never baked. The search
     // applies each block weight exactly ONCE. Negative inputs clamp to 0;
@@ -409,10 +365,10 @@ namespace
     // ---- S1 shared cost terms (PLAN �7.2, �16 Search, �18.7) ----
     // One definition per term. SearchPass (FindBest), FindTopCandidates,
     // FullSampleCost (SampleCost + the brute-force verifier) all build their
-    // costs from these helpers, so no path can drift from another. Turn and
-    // foot terms are the existing TurnPenalty / FootLockCost above.
+    // costs from these helpers, so no path can drift from another. The turn
+    // term is the existing TurnPenalty above (P3: foot-lock prior deleted).
     //
-    // Pruning invariant kept: every prior is non-negative (turn + foot +
+    // Pruning invariant kept: every prior is non-negative (turn +
     // continuity switch penalty) so a pruned candidate can never earn cost
     // back; the only negative terms (continuing bias, loop preference) get
     // explicit headroom added to the prune bound in SearchPass.
@@ -577,7 +533,6 @@ namespace
         if (applyTurnPenalty && settings.TurnPenaltyWeight > 0.0f)
             continuityCost += TurnPenalty(database.GetClipTurnAngle(clipIndex), settings.QueryYawRate,
                 settings.TurnPenaltyWeight, settings.TurnPenaltyYawScale);
-        continuityCost += FootLockCost(database, bakedPose, poseFeatureSize, settings);
         const float loopCost = LoopPreferenceTerm(database.GetClipLoop(clipIndex), loopPreference);
         return poseCost + trajectoryCost + continuityCost + loopCost;
     }
@@ -964,7 +919,6 @@ namespace
             if (settings.TurnPenaltyWeight > 0.0f)
                 continuityCost += TurnPenalty(cachedTurnAngle, settings.QueryYawRate,
                     settings.TurnPenaltyWeight, settings.TurnPenaltyYawScale);
-            continuityCost += FootLockCost(database, bakedPose, poseFeatureSize, settings);
             // Rest-loop bonus lives in its own telemetry block (a loop clip at
             // rest outranks one-shot end stances structurally, not via continuity).
             const float loopCost = LoopPreferenceTerm(cachedLoopFlag, loopPreference);
@@ -1065,7 +1019,7 @@ namespace
     // Coarse-prefilter query: linear block retrieval over allowed tags +
     // EXACT rerank with the same terms/filters as SearchPass (shared helpers
     // above: Pose/TrajectoryBlockCost, ContinuityTerm, TurnPenalty,
-    // FootLockCost, LoopPreferenceTerm, IsContinuationSample). Anything this
+    // LoopPreferenceTerm, IsContinuationSample). Anything this
     // path cannot decide falls back to SearchPass (caller). Differences from
     // SearchPass, all deliberate:
     //  - scope = per-tag block top-512 pooled to a global top retrieve
@@ -1391,8 +1345,7 @@ namespace
             if (settings.TurnPenaltyWeight > 0.0f)
                 continuityCost += TurnPenalty(cachedTurnAngle, settings.QueryYawRate,
                     settings.TurnPenaltyWeight, settings.TurnPenaltyYawScale);
-            continuityCost += FootLockCost(database, bakedPose, poseFeatureSize, settings);
-            const float loopCost = LoopPreferenceTerm(cachedLoopFlag, loopPreference);
+        const float loopCost = LoopPreferenceTerm(cachedLoopFlag, loopPreference);
             const float cost = poseCost + trajectoryCost + continuityCost + loopCost;
 
             if (cachedLoopFlag)
@@ -1657,7 +1610,6 @@ void MotionMatchingSearch::FindTopCandidates(
         if (settings.TurnPenaltyWeight > 0.0f)
             continuityCost += TurnPenalty(cachedTurnAngle, settings.QueryYawRate,
                 settings.TurnPenaltyWeight, settings.TurnPenaltyYawScale);
-        continuityCost += FootLockCost(*database, bakedPose, poseFeatureSize, settings);
         const float loopCost = LoopPreferenceTerm(cachedLoopFlag, loopPreference);
         const float cost = poseCost + trajectoryCost + continuityCost + loopCost;
 
@@ -1941,9 +1893,10 @@ bool MotionMatchingSearch::SampleCost(
     }
 
     // S1 term parity: the fast-path estimate uses the same FullSampleCost term
-    // definitions as the hot pass, with no playback context (continuity/loop/
-    // foot disabled exactly as before: raw pose + trajectory + straightness).
+    // definitions as the hot pass, with no playback context (continuity/loop
+    // disabled exactly as before: raw pose + trajectory + straightness).
     // P2: turn prior weights ride explicit params (trace-recorded tuning).
+    // P3: foot-lock prior deleted (was zero here too).
     MotionMatchingSearchSettings costSettings;
     costSettings.PoseWeight = poseWeight;
     costSettings.TrajectoryWeight = trajectoryWeight;
@@ -1955,8 +1908,6 @@ bool MotionMatchingSearch::SampleCost(
     costSettings.ExpectedTime = -1.0f;
     costSettings.ContinuingBias = 0.0f;
     costSettings.LoopPreference = 0.0f;
-    costSettings.FootLockL = 0.0f;
-    costSettings.FootLockR = 0.0f;
 
     // N1b rev 3: raw query; FullSampleCost builds its own scale pass.
     cost = FullSampleCost(
@@ -3073,8 +3024,10 @@ bool MotionMatchingSearch::RunSelfTest(
 
     // Phase K: prior term parity. The brute-force reference now uses the SAME
     // FullSampleCost all-terms function as the hot pass, so it covers
-    // continuity/bias, loop preference and the foot-lock prior � the cases the
-    // old raw-block reference could not see (PLAN �7.2/�18.7).
+    // continuity/bias and loop preference — the cases the old raw-block
+    // reference could not see (PLAN §7.2/§18.7).
+    // P3: the footlock case died with the foot-lock search prior (it always
+    // ran at zero at runtime; contact features stay in the DB untouched).
     int32 phaseKTest = 0;
     int32 phaseKPass = 0;
     {
@@ -3083,7 +3036,6 @@ bool MotionMatchingSearch::RunSelfTest(
             const Char* Label;
             float Continuity;
             float LoopPreference;
-            float FootLock;
             int32 CurrentClip;
             float ExpectedTime;
         };
@@ -3093,11 +3045,10 @@ bool MotionMatchingSearch::RunSelfTest(
         {
             const int32 sourceClip = sampleClipIndices[source];
             buildExactQuery(source, queryPose, queryTrajectory);
-            const KCase cases[3] =
+            const KCase cases[2] =
             {
-                { TEXT("continuity"), 1.0f, 0.0f, 0.0f, sourceClip, sampleTimesArr[source] },
-                { TEXT("loop"), 0.0f, 100.0f, 0.0f, -1, -1.0f },
-                { TEXT("footlock"), 0.0f, 0.0f, 1.0f, -1, -1.0f },
+                { TEXT("continuity"), 1.0f, 0.0f, sourceClip, sampleTimesArr[source] },
+                { TEXT("loop"), 0.0f, 100.0f, -1, -1.0f },
             };
             for (const KCase& kc : cases)
             {
@@ -3112,12 +3063,6 @@ bool MotionMatchingSearch::RunSelfTest(
                 k.TwinBanWindow = 0.0f;
                 k.LoopTailExclusion = 0.0f;
                 k.LoopPreference = kc.LoopPreference;
-                k.FootLockL = kc.FootLock;
-                k.FootLockR = kc.FootLock;
-                // D1/�5.2: the prior is gated on the firm flag now, so the
-                // parity probe must opt in exactly as the runtime does.
-                k.FirmLockL = kc.FootLock > 0.0f;
-                k.FirmLockR = kc.FootLock > 0.0f;
                 MotionMatchingResult result;
                 String error;
                 FindBest(database, queryPose, queryTrajectory, k, kc.CurrentClip, MAX_float, noTags, result, error);

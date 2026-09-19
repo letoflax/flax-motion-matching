@@ -219,6 +219,24 @@ public static class MotionMatchingEditorService
     }
 
     /// <summary>
+    /// P3 explicit audit command: scans the baked database and writes
+    /// Cache/MMClipAudit.txt on demand. Runtime init/play never produces
+    /// this file — tools must call this first (bridge clip_audit op or the
+    /// tuning window) instead of assuming a play session wrote it.
+    /// Returns a one-line summary or error.
+    /// </summary>
+    public static string GenerateClipAudit(MotionMatchingController controller)
+    {
+        if (controller == null)
+            return "Clip audit failed: no controller.";
+        if (!EnsureDatabaseLoaded(controller) || !controller.Database)
+            return "Clip audit failed: database is not loaded.";
+        if (controller.GenerateClipAudit(out string error))
+            return "Clip audit written: Cache/MMClipAudit.txt.";
+        return "Clip audit failed: " + error;
+    }
+
+    /// <summary>
     /// Bake, then reload + validate, then self-test — one pipeline for the
     /// management window. Results surface via the editor log; the return
     /// value is a one-line summary.

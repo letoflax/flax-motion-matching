@@ -29,18 +29,6 @@ namespace
     constexpr bool EnableLoopTailExclusion = false;
     constexpr float SameSegmentTwinBan = 0.12f;
     constexpr float NonLoopTailExclusion = 0.3f;
-    constexpr float JumpRiseVelY = 300.0f;
-    constexpr int32 JumpMinAirTicks = 6;
-    constexpr float JumpLandHoldLight = 0.15f;
-    constexpr float JumpLandHoldHeavy = 0.30f;
-    constexpr float JumpLandHoldSevere = 0.45f;
-    constexpr float JumpFallVelY = -50.0f;
-    constexpr float JumpTakeoffMaxTime = 0.45f;
-    constexpr float JumpLightMaxAir = 0.55f;
-    constexpr float JumpSevereMinAir = 1.6f;
-    constexpr float JumpBlendLight = 0.08f;
-    constexpr float JumpBlendHeavy = 0.18f;
-    constexpr float JumpBlendSevere = 0.25f;
     constexpr float PiF = 3.14159265358979323846f;
 
     void FormatFloatText(float value, char* buffer, int32 capacity)
@@ -63,10 +51,11 @@ namespace
         }
     }
 
-    // P0: pack the nine boolean request flags into MotionMatchingTraceEntry
+    // P0: pack the seven boolean request flags into MotionMatchingTraceEntry
     // bitmask (see TraceFlag_* in MotionMatchingTrace.h). Record-only.
+    // P3: FirmLockL/R died with the foot-lock search prior (always false).
     int32 PackTraceFlags(bool forcedEdge, bool reseeded, bool fairFight, bool oneshotWindow,
-        bool useIndexed, bool verifyIndexed, bool exclTail, bool firmL, bool firmR)
+        bool useIndexed, bool verifyIndexed, bool exclTail)
     {
         int32 flags = 0;
         if (forcedEdge)
@@ -83,10 +72,6 @@ namespace
             flags |= TraceFlag_VerifyIndexedSearch;
         if (exclTail)
             flags |= TraceFlag_ExcludeNonLoopTail;
-        if (firmL)
-            flags |= TraceFlag_FirmLockL;
-        if (firmR)
-            flags |= TraceFlag_FirmLockR;
         return flags;
     }
 }
@@ -231,7 +216,12 @@ void MotionMatchingRuntimePolicy::Initialize(
     _hasPrevPositions = false;
     _usedSearchSnapshot = false;
     _searchSnapshotLength = 0;
-    MeasureClipMotion();
+    // P3: init caches only the per-clip tag SETS (cheap, per-clip copy for
+    // the fast-path incumbent check). The full motion scan (travel/turn/net
+    // over every sample) and the audit file write moved to the explicit
+    // GenerateClipAudit editor/tool command below — init never scans the DB
+    // or touches MMClipAudit.txt.
+    EnsureClipTagCache();
     _samplingReady = true;
     PolicyState = String(TEXT("Locomotion"));
     _trace->Clear();
@@ -255,43 +245,64 @@ void MotionMatchingRuntimePolicy::Shutdown()
         Delete(_trace);
         _trace = nullptr;
     }
-    _clipTravel.Clear();
-    _clipTurnAngle.Clear();
-    _clipNet.Clear();
     _clipTags.Clear();
     PolicyState = String(TEXT("Disabled"));
 }
 
-void MotionMatchingRuntimePolicy::MeasureClipMotion()
+void MotionMatchingRuntimePolicy::EnsureClipTagCache()
 {
-    _clipTravel.Clear();
-    _clipTurnAngle.Clear();
-    _clipNet.Clear();
+    // P3: init-time cache only — per-clip tag SET copies, no sample scan.
+    // Every per-clip/per-frame reader goes through ClipTags() and never
+    // touches native strings again. The motion scan (travel/turn/net over
+    // every sample) lives in GenerateClipAudit below and never runs at init.
     _clipTags.Clear();
     MotionMatchingDatabase* db = _database;
     if (db == nullptr || !db->IsBaked())
         return;
+    const int32 clipCount = db->GetClipCount();
+    _clipTags.Resize(clipCount);
+    for (int32 c = 0; c < clipCount; c++)
+        _clipTags[c] = db->GetClipTags(c);
+}
 
+bool MotionMatchingRuntimePolicy::ExportClipAudit(MotionMatchingDatabase* db, const String& cacheFolder, float sampleRate, String& error)
+{
+    // P3 explicit editor/tool command (the ONLY writer of MMClipAudit.txt).
+    // Static: runs in edit mode with no policy/playback instance. Init/play
+    // never call this — tools run it on demand (editor service / bridge
+    // clip_audit op). Same file format as the old init-time write
+    // (index|name|tags|loop|turn|travel|net|yaw|len|speed), computed into
+    // locals — no scan arrays survive on the runtime.
+    error = String::Empty;
+    if (db == nullptr || !db->IsBaked())
+    {
+        error = String(TEXT("Clip audit stopped: database is not baked."));
+        return false;
+    }
+    if (cacheFolder.IsEmpty())
+    {
+        error = String(TEXT("Clip audit stopped: cache folder is not set."));
+        return false;
+    }
     const int32 clipCount = db->GetClipCount();
     const Array<int32>& counts = db->GetClipSampleCounts();
     const Array<Float3>& positions = db->GetRootPositions();
     const Array<Float3>& forwards = db->GetRootForwards();
     if (counts.Count() == 0 || positions.Count() == 0 || forwards.Count() == 0)
-        return;
-
-    _clipTravel.Resize(clipCount);
-    _clipTurnAngle.Resize(clipCount);
-    _clipNet.Resize(clipCount);
-    // Snapshot tag SETS once: every per-clip/per-frame reader below goes
-    // through ClipTags() and never touches native strings again.
-    _clipTags.Resize(clipCount);
-    for (int32 c = 0; c < clipCount; c++)
-        _clipTags[c] = db->GetClipTags(c);
+    {
+        error = String(TEXT("Clip audit stopped: database motion arrays are empty."));
+        return false;
+    }
+    Array<float> travel;
+    Array<float> turnAngle;
+    Array<float> net;
+    travel.Resize(clipCount);
+    turnAngle.Resize(clipCount);
+    net.Resize(clipCount);
     int32 cursor = 0;
     for (int32 c = 0; c < clipCount && cursor < positions.Count(); c++)
     {
         float path = 0.0f;
-        float yPath = 0.0f;
         float yaw = 0.0f;
         const int32 n = c < counts.Count() ? counts[c] : 0;
         Float3 first = cursor < positions.Count() ? positions[cursor] : Float3::Zero;
@@ -300,17 +311,13 @@ void MotionMatchingRuntimePolicy::MeasureClipMotion()
         {
             const Float3 dp = positions[cursor + i] - positions[cursor + i - 1];
             path += Float2(dp.X, dp.Z).Length();
-            yPath += AbsF(dp.Y);
             last = positions[cursor + i];
             const Float2 a(forwards[cursor + i - 1].X, forwards[cursor + i - 1].Z);
             const Float2 b(forwards[cursor + i].X, forwards[cursor + i].Z);
             if (a.LengthSquared() > 0.000001f && b.LengthSquared() > 0.000001f)
             {
                 // Signed yaw travel (radians, engine convention): same
-                // atan2(x, z) formula everywhere, so bucket matching and
-                // facing steering agree by design.
-                // NOTE: ports the C# verbatim (Atan2(a.X, a.Y) Ã¢â‚¬â€ Float2
-                // fields are X=first, Y=second, i.e. world X and Z).
+                // atan2(x, z) formula everywhere.
                 const float ya = atan2f(a.X, a.Y);
                 const float yb = atan2f(b.X, b.Y);
                 float dy = yb - ya;
@@ -320,116 +327,120 @@ void MotionMatchingRuntimePolicy::MeasureClipMotion()
                     dy += 2.0f * PiF;
                 yaw += dy;
             }
-            // NOTE (P2): per-sample yaw table deleted with the turn driver;
-            // clip totals above are kept for the search straightness prior.
         }
-        const float net = Float2(last.X - first.X, last.Z - first.Z).Length();
-        _clipTravel[c] = path;
-        _clipTurnAngle[c] = yaw;
-        _clipNet[c] = net;
+        const float netDist = Float2(last.X - first.X, last.Z - first.Z).Length();
+        travel[c] = path;
+        turnAngle[c] = yaw;
+        net[c] = netDist;
         cursor += n;
     }
     LOG(Info, "Motion matching clip audit: {} clips measured.", clipCount);
-    LogAccelAudit();
-    WriteClipAuditFile();
-}
-
-void MotionMatchingRuntimePolicy::LogAccelAudit()
-{
-    MotionMatchingDatabase* db = _database;
-    if (db == nullptr || !db->IsBaked())
-        return;
-    const Array<int32>& counts = db->GetClipSampleCounts();
-    const Array<Float3>& velocities = db->GetRootVelocities();
-    if (counts.Count() == 0 || velocities.Count() == 0)
-        return;
-    const float dt = 1.0f / MaxF(_liveSchema.SampleRate, 1.0f);
-    Array<String> tagNames;
-    Array<float> tagPeak;
-    Array<double> tagSum;
-    Array<int32> tagNum;
-    int32 cursor = 0;
-    const int32 clipCount = db->GetClipCount();
-    for (int32 c = 0; c < clipCount && cursor < velocities.Count(); c++)
+    // Accel audit (was LogAccelAudit at init): per-tag peak/avg planar
+    // acceleration from baked root velocities, log only.
     {
-        const int32 n = c < counts.Count() ? counts[c] : 0;
-        // Multi-tag: one sample's accel counts into EVERY tag its clip
-        // carries (membership counting, same as RebuildTagCounts).
-        const Array<String>& tagSet = ClipTags(c);
-        for (int32 i = 1; i < n && cursor + i < velocities.Count(); i++)
+        const Array<Float3>& velocities = db->GetRootVelocities();
+        if (velocities.Count() > 0)
         {
-            const Float3 dv = velocities[cursor + i] - velocities[cursor + i - 1];
-            const float a = Float2(dv.X, dv.Z).Length() / dt;
-            for (const String& tag : tagSet)
+            const float dt = 1.0f / MaxF(sampleRate, 1.0f);
+            Array<String> tagNames;
+            Array<float> tagPeak;
+            Array<double> tagSum;
+            Array<int32> tagNum;
+            int32 vcursor = 0;
+            for (int32 c = 0; c < clipCount && vcursor < velocities.Count(); c++)
             {
-                int32 found = -1;
-                for (int32 k = 0; k < tagNames.Count(); k++)
+                const int32 n = c < counts.Count() ? counts[c] : 0;
+                // Multi-tag: one sample's accel counts into EVERY tag its
+                // clip carries (membership counting, same as RebuildTagCounts).
+                const Array<String>& tagSet = db->GetClipTags(c);
+                for (int32 i = 1; i < n && vcursor + i < velocities.Count(); i++)
                 {
-                    if (tagNames[k] == tag)
+                    const Float3 dv = velocities[vcursor + i] - velocities[vcursor + i - 1];
+                    const float a = Float2(dv.X, dv.Z).Length() / dt;
+                    for (const String& tag : tagSet)
                     {
-                        found = k;
-                        break;
+                        int32 found = -1;
+                        for (int32 k = 0; k < tagNames.Count(); k++)
+                        {
+                            if (tagNames[k] == tag)
+                            {
+                                found = k;
+                                break;
+                            }
+                        }
+                        if (found < 0)
+                        {
+                            tagNames.Add(tag);
+                            tagPeak.Add(a);
+                            tagSum.Add((double)a);
+                            tagNum.Add(1);
+                        }
+                        else
+                        {
+                            if (a > tagPeak[found])
+                                tagPeak[found] = a;
+                            tagSum[found] += (double)a;
+                            tagNum[found]++;
+                        }
                     }
                 }
-                if (found < 0)
-                {
-                    tagNames.Add(tag);
-                    tagPeak.Add(a);
-                    tagSum.Add((double)a);
-                    tagNum.Add(1);
-                }
-                else
-                {
-                    if (a > tagPeak[found])
-                        tagPeak[found] = a;
-                    tagSum[found] += (double)a;
-                    tagNum[found]++;
-                }
+                vcursor += n;
             }
+            char message[1024];
+            int32 offset = snprintf(message, sizeof(message), "Motion matching accel audit (u/s^2 by tag): ");
+            for (int32 k = 0; k < tagNames.Count() && offset < 900; k++)
+            {
+                const StringAnsi nameAnsi(tagNames[k]);
+                const double avg = tagSum[k] / (double)MaxI(tagNum[k], 1);
+                offset += snprintf(message + offset, sizeof(message) - (size_t)offset, "%s%s peak=%.0f avg=%.0f",
+                    k > 0 ? "; " : "", nameAnsi.GetText(), (double)tagPeak[k], avg);
+            }
+            LOG(Info, "{}", String(message));
         }
-        cursor += n;
     }
-    char message[1024];
-    int32 offset = snprintf(message, sizeof(message), "Motion matching accel audit (u/s^2 by tag): ");
-    for (int32 k = 0; k < tagNames.Count() && offset < 900; k++)
-    {
-        const StringAnsi nameAnsi(tagNames[k]);
-        const double avg = tagSum[k] / (double)MaxI(tagNum[k], 1);
-        offset += snprintf(message + offset, sizeof(message) - (size_t)offset, "%s%s peak=%.0f avg=%.0f",
-            k > 0 ? "; " : "", nameAnsi.GetText(), (double)tagPeak[k], avg);
-    }
-    LOG(Info, "{}", String(message));
-}
-
-void MotionMatchingRuntimePolicy::WriteClipAuditFile()
-{
-    if (_clipTravel.Count() == 0 || _clipNet.Count() == 0 || _clipTurnAngle.Count() == 0)
-        return;
-    if (_cacheFolder.IsEmpty())
-        return;
-    MotionMatchingDatabase* db = _database;
-    if (db == nullptr)
-        return;
     const Array<float>& lengths = db->GetClipLengths();
     StringBuilder sb;
     char line[512];
-    for (int32 c = 0; c < _clipTravel.Count(); c++)
+    for (int32 c = 0; c < clipCount; c++)
     {
-        const String name = GetClipName(c);
+        Animation* anim = db->GetClipAnimation(c);
+        String name;
+        if (anim != nullptr)
+        {
+            const StringAnsi pathAnsi(anim->GetPath());
+            const char* path = pathAnsi.GetText();
+            const int32 length = pathAnsi.Length();
+            int32 start = 0;
+            int32 dot = -1;
+            for (int32 i = 0; i < length; i++)
+            {
+                if (path[i] == '/' || path[i] == '\\')
+                    start = i + 1;
+                else if (path[i] == '.')
+                    dot = i;
+            }
+            const int32 end = (dot > start) ? dot : length;
+            if (end > start)
+                name = String(path + start, end - start);
+        }
+        if (name.IsEmpty())
+        {
+            char fallback[32];
+            snprintf(fallback, sizeof(fallback), "#%d", c);
+            name = String(fallback);
+        }
         const float len = lengths.Count() > c ? lengths[c] : 0.0f;
-        const float spd = len > 0.01f ? _clipTravel[c] / len : 0.0f;
-        bool loop = false;
-        bool turnLike = false;
+        const float spd = len > 0.01f ? travel[c] / len : 0.0f;
         // Audit file tag column is '+'-joined (tools split it back).
-        const String tag = MotionMatchingDatabase::JoinTags(ClipTags(c));
-        loop = db->GetClipLoop(c);
-        turnLike = db->GetClipTurnLike(c);
+        const String tag = MotionMatchingDatabase::JoinTags(db->GetClipTags(c));
+        const bool loop = db->GetClipLoop(c);
+        const bool turnLike = db->GetClipTurnLike(c);
         const StringAnsi nameAnsi(name);
         const StringAnsi tagAnsi(tag);
         char fTravel[32], fNet[32], fYaw[32], fLen[32], fSpd[32];
-        FormatFloatText(_clipTravel[c], fTravel, sizeof(fTravel));
-        FormatFloatText(_clipNet[c], fNet, sizeof(fNet));
-        FormatFloatText(_clipTurnAngle[c], fYaw, sizeof(fYaw));
+        FormatFloatText(travel[c], fTravel, sizeof(fTravel));
+        FormatFloatText(net[c], fNet, sizeof(fNet));
+        FormatFloatText(turnAngle[c], fYaw, sizeof(fYaw));
         FormatFloatText(len, fLen, sizeof(fLen));
         FormatFloatText(spd, fSpd, sizeof(fSpd));
         snprintf(line, sizeof(line), "%d|%s|%s|%s|%s|%s|%s|%s|%s|%s\n",
@@ -440,25 +451,19 @@ void MotionMatchingRuntimePolicy::WriteClipAuditFile()
     }
     String text;
     sb.ToString(text);
-    const StringAnsi folderAnsi(_cacheFolder);
+    const StringAnsi folderAnsi(cacheFolder);
     char path[1024];
     snprintf(path, sizeof(path), "%s/MMClipAudit.txt", folderAnsi.GetText());
     const StringAnsi bodyAnsi(text);
-    // P0 profiling (record-only): audit file write time folds into the
-    // telemetry/I-O counter so init cost is visible in the baseline.
-    const auto auditStart = std::chrono::high_resolution_clock::now();
     FILE* file = fopen(path, "wb");
-    if (file != nullptr)
+    if (file == nullptr)
     {
-        fwrite(bodyAnsi.GetText(), 1, (size_t)bodyAnsi.Length(), file);
-        fclose(file);
+        error = String(TEXT("Clip audit stopped: cannot write MMClipAudit.txt."));
+        return false;
     }
-    {
-        const auto auditEnd = std::chrono::high_resolution_clock::now();
-        const float auditMs = (float)std::chrono::duration<double, std::milli>(auditEnd - auditStart).count();
-        LastTelemetryMs = auditMs;
-        TotalTelemetryMs += auditMs;
-    }
+    fwrite(bodyAnsi.GetText(), 1, (size_t)bodyAnsi.Length(), file);
+    fclose(file);
+    return true;
 }
 
 void MotionMatchingRuntimePolicy::ResetOnTeleport()
@@ -586,12 +591,6 @@ const Array<String>& MotionMatchingRuntimePolicy::ClipTags(int32 clipIndex)
         return _database->GetClipTags(clipIndex);
     static const Array<String> empty;
     return empty;
-}
-
-String MotionMatchingRuntimePolicy::ClipTag(int32 clipIndex)
-{
-    const Array<String>& set = ClipTags(clipIndex);
-    return set.HasItems() ? set[0] : String::Empty;
 }
 
 void MotionMatchingRuntimePolicy::WarnOnce(const String& message)
@@ -846,7 +845,7 @@ void MotionMatchingRuntimePolicy::RecordPolicyEvent(const char* kind, int32 clip
     // P0: reset/command entries carry the reseed flag and the surviving
     // clip so replay can check them structurally. Vectors stay empty by
     // design (no search ran on these ticks).
-    entry.TraceFlags = PackTraceFlags(false, _chooserReseed, false, false, false, false, false, false, false);
+    entry.TraceFlags = PackTraceFlags(false, _chooserReseed, false, false, false, false, false);
     entry.CommandClip = clipIndex;
     entry.DbClipCount = _database != nullptr ? _database->GetClipCount() : 0;
     entry.DbSampleCount = _database != nullptr ? _database->GetSampleCount() : 0;
@@ -1011,15 +1010,9 @@ void MotionMatchingRuntimePolicy::RunQuery(const Array<TrajectoryPoint>& traject
     settings.QueryYawRate = yawRate;
     settings.TurnPenaltyWeight = _tuning.TurnPenaltyWeight;
     settings.TurnPenaltyYawScale = _tuning.TurnPenaltyYawScale;
-    // Foot-lock prior weights: playback pin weights (0..1, clamped).
-    // Recorded in the trace below, so replay stays bit-exact.
-    // P2: no plugin lock pins exist (solver deleted); the search prior
-    // stays structurally (settings + FootLockCost + selftest Phase K) but
-    // never fires at runtime. Game-side IK owns its own contact state.
-    settings.FootLockL = 0.0f;
-    settings.FootLockR = 0.0f;
-    settings.FirmLockL = false;
-    settings.FirmLockR = false;
+    // P3: foot-lock search prior deleted (was hard-zeroed here since the
+    // plugin solver died; Game-side IK owns its own contact state). Contact
+    // channels + feature extraction + DB stay untouched.
     // P2 caller filter (Game selection policy output): reseed forces LoopOnly
     // (neutral structural rule, no gait read); otherwise the caller filter
     // rides verbatim. The core never derives LoopFilter/OneShotBand from
@@ -1431,7 +1424,7 @@ bool MotionMatchingRuntimePolicy::TryFastPath(float frameDt)
         entry.MaxCandidates = MaxI(_tuning.FrameSearchBudget, 0);
         entry.QueryFrame = _policyFrame;
         entry.TraceFlags = PackTraceFlags(false, false, false, false,
-            _tuning.UseIndexedSearch, _tuning.VerifyIndexedSearch, true, false, false);
+            _tuning.UseIndexedSearch, _tuning.VerifyIndexedSearch, true);
         entry.TopKCandidates = MaxI(1, _tuning.TopKCandidates);
         entry.CostFuseThreshold = _tuning.CostFuseThreshold;
         entry.TurnPenaltyWeight = _tuning.TurnPenaltyWeight;
@@ -1590,14 +1583,11 @@ void MotionMatchingRuntimePolicy::RecordTrace(float speed, float yawRate, const 
     entry.ReselectBanWindow = settings.ReselectBanWindow;
     entry.TwinBanWindow = settings.TwinBanWindow;
     entry.LoopTailExclusion = settings.LoopTailExclusion;
-    entry.FootLockL = settings.FootLockL;
-    entry.FootLockR = settings.FootLockR;
     entry.OneShotBand = settings.OneShotBand;
     entry.MaxCandidates = settings.MaxCandidates;
     entry.QueryFrame = settings.QueryFrame;
     entry.TraceFlags = PackTraceFlags(forcedEdge, reseeded, fairFight, oneshotWindow,
-        settings.UseIndexedSearch, settings.VerifyIndexedSearch, settings.ExcludeNonLoopTail,
-        settings.FirmLockL, settings.FirmLockR);
+        settings.UseIndexedSearch, settings.VerifyIndexedSearch, settings.ExcludeNonLoopTail);
     entry.TopKCandidates = settings.TopKCandidates;
     entry.ExcludedTags = MotionMatchingDatabase::JoinTags(settings.ExcludeTags);
     entry.RetryKind = retryKind;

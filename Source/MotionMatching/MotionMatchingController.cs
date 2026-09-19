@@ -259,6 +259,33 @@ public class MotionMatchingController
     }
 
     /// <summary>
+    /// P3 explicit audit command (the ONLY writer of MMClipAudit.txt).
+    /// Static native export: runs in edit mode with no play/policy instance.
+    /// Runtime init/play never scans the database or writes the file — call
+    /// this from the editor service / bridge clip_audit op when tools need
+    /// per-clip travel/turn/speed data.
+    /// </summary>
+    public bool GenerateClipAudit(out string error)
+    {
+        error = string.Empty;
+        if (Database == null || !Database.IsBaked)
+        {
+            error = "Clip audit stopped: database is not baked.";
+            return false;
+        }
+        try
+        {
+            return MotionMatchingRuntimePolicy.ExportClipAudit(
+                Database, CacheFolder ?? string.Empty, Schema.SampleRate, out error);
+        }
+        catch (System.Exception ex)
+        {
+            error = "Clip audit stopped: " + ex.Message;
+            return false;
+        }
+    }
+
+    /// <summary>
     /// P3 explicit init (replaces the Script OnEnable): the game facade
     /// assigns Schema/PlayerModel/DatabasePath/CharacterBody + session
     /// config first, then calls this. Content.Load works outside Scripts —

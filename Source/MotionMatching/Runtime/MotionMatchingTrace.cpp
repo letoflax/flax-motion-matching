@@ -179,10 +179,6 @@ bool MotionMatchingTraceLog::ExportJson(const String& path, String& error)
         FormatFloat(sb, e.TwinBanWindow);
         sb.Append(",\"tailexcl\":");
         FormatFloat(sb, e.LoopTailExclusion);
-        sb.Append(",\"flockL\":");
-        FormatFloat(sb, e.FootLockL);
-        sb.Append(",\"flockR\":");
-        FormatFloat(sb, e.FootLockR);
         sb.Append(",\"contclip\":");
         sb.Append(e.ContinuityClip);
         sb.Append(",\"sincesw\":");
@@ -244,10 +240,6 @@ bool MotionMatchingTraceLog::ExportJson(const String& path, String& error)
         sb.Append((e.TraceFlags & TraceFlag_VerifyIndexedSearch) ? '1' : '0');
         sb.Append(",\"excltail\":");
         sb.Append((e.TraceFlags & TraceFlag_ExcludeNonLoopTail) ? '1' : '0');
-        sb.Append(",\"firml\":");
-        sb.Append((e.TraceFlags & TraceFlag_FirmLockL) ? '1' : '0');
-        sb.Append(",\"firmr\":");
-        sb.Append((e.TraceFlags & TraceFlag_FirmLockR) ? '1' : '0');
         sb.Append(",\"fuse\":");
         FormatFloat(sb, e.CostFuseThreshold);
         sb.Append(",\"dt\":");
@@ -448,8 +440,6 @@ bool MotionMatchingTraceLog::ParseEntry(const String& line, MotionMatchingTraceE
         entry.TwinBanWindow = 0.0f;
         entry.LoopTailExclusion = 0.0f;
     }
-    entry.FootLockL = GetFloat(text, length, "\"flockL\":");
-    entry.FootLockR = GetFloat(text, length, "\"flockR\":");
     entry.ContinuityClip = (int32)GetFloat(text, length, "\"contclip\":");
     entry.SinceSwitch = GetFloat(text, length, "\"sincesw\":");
     entry.Recovered = GetFloat(text, length, "\"recovered\":") > 0.5f;
@@ -489,10 +479,8 @@ bool MotionMatchingTraceLog::ParseEntry(const String& line, MotionMatchingTraceE
             flags |= TraceFlag_VerifyIndexedSearch;
         if (GetFloat(text, length, "\"excltail\":") > 0.5f)
             flags |= TraceFlag_ExcludeNonLoopTail;
-        if (GetFloat(text, length, "\"firml\":") > 0.5f)
-            flags |= TraceFlag_FirmLockL;
-        if (GetFloat(text, length, "\"firmr\":") > 0.5f)
-            flags |= TraceFlag_FirmLockR;
+        // P3: pre-P3 firm-lock trace keys are ignored — the foot-lock
+        // search prior is deleted and every post-P2 entry recorded 0.
         entry.TraceFlags = flags;
         entry.MaxCandidates = (int32)GetFloat(text, length, "\"maxcand\":");
         entry.QueryFrame = (int32)GetFloat(text, length, "\"qframe\":");
@@ -835,10 +823,6 @@ bool MotionMatchingTraceLog::VerifyReplay(MotionMatchingDatabase* database, int3
             settings.TwinBanWindow = e.TwinBanWindow;
             settings.LoopTailExclusion = e.LoopTailExclusion;
             settings.ExcludeNonLoopTail = (e.TraceFlags & TraceFlag_ExcludeNonLoopTail) != 0;
-            settings.FootLockL = e.FootLockL;
-            settings.FootLockR = e.FootLockR;
-            settings.FirmLockL = (e.TraceFlags & TraceFlag_FirmLockL) != 0;
-            settings.FirmLockR = (e.TraceFlags & TraceFlag_FirmLockR) != 0;
             settings.OneShotBand = e.OneShotBand;
             settings.MaxCandidates = e.MaxCandidates;
             settings.QueryFrame = e.QueryFrame;
