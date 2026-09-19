@@ -494,6 +494,26 @@ void MotionMatchingRuntimePolicy::ResetOnTeleport()
     _hasLastActorPos = false;
     _chooserReseed = true;
     ActiveTag = String::Empty;
+    // P5: invalidate the change-only scope caches (both RunQuery's pair and
+    // the fast-path-only pair) so the first post-reset query rebuilds the
+    // splits AND the ActiveTag/ChooserStatus diagnostics even when the scope
+    // string is unchanged across the reset. Keys AND caches are cleared
+    // together: clearing the key alone would false-hit when the scope
+    // legitimately equals the cleared value (empty scope "" would reuse the
+    // stale pre-reset split and search the wrong scope instead of taking
+    // the explicit-empty no-match path). Clearing both restores the
+    // invariant key==scope ==> cache==Split(scope) with zero steady-state
+    // cost (reset/teleport only; the next query rebuilds once).
+    _queryTagsKey = String::Empty;
+    _queryTagsCache.Clear();
+    _queryExcludedKey = String::Empty;
+    _queryExcludedCache.Clear();
+    _queryExcludedJoin = String::Empty;
+    _fastAllowedKey = String::Empty;
+    _fastAllowedCache.Clear();
+    _fastExcludedKey = String::Empty;
+    _fastExcludedCache.Clear();
+    _fastExcludedJoin = String::Empty;
     _reselectClip = -1;
     _reselectStartTime = -99.0f;
     _lastScanTotal = MAX_float;
@@ -630,7 +650,14 @@ void MotionMatchingRuntimePolicy::Tick(
     // P0 profiling (record-only): whole-Tick wall time. One chrono pair per
     // tick is nanoseconds; it never steers search or playback.
     const auto tickStart = std::chrono::high_resolution_clock::now();
-    _snapshot = state;
+    // P5: field-wise change-only snapshot copy. MotionMatchingPlayerSnapshot
+    // carries two native Strings; a blind struct copy reallocates both every
+    // tick. Scope strings only change on transitions, so steady-state ticks
+    // copy nothing (plain == compares, no allocation).
+    if (state.AllowedTagSet != _snapshot.AllowedTagSet)
+        _snapshot.AllowedTagSet = state.AllowedTagSet;
+    if (state.ExcludedTagSet != _snapshot.ExcludedTagSet)
+        _snapshot.ExcludedTagSet = state.ExcludedTagSet;
     _tuning = tuning;
     // P2 caller filter (Game selection policy output): the ONLY LoopFilter /
     // CandidateBand / YawRate the core uses. Clamped to the valid range;
@@ -638,8 +665,8 @@ void MotionMatchingRuntimePolicy::Tick(
     _callerLoopFilter = callerLoopFilter >= 0 && callerLoopFilter <= 2 ? callerLoopFilter : 0;
     _callerCandidateBand = callerCandidateBand >= 0 && callerCandidateBand <= 3 ? callerCandidateBand : 0;
     _callerYawRate = callerYawRate >= 0.0f && callerYawRate < 1e29f ? callerYawRate : 0.0f;
-    _trajectoryPoints = trajectoryPoints;
-    _sampleTimes = trajectorySampleTimes;
+    // P5: _trajectoryPoints/_sampleTimes dead copies deleted (were written
+    // every tick but never read; RunQuery uses its params + _tickTrajectory).
 
     const float frameDt = MaxF(deltaTime, 0.000001f);
     _timeSinceSwitch += frameDt;
@@ -672,7 +699,9 @@ void MotionMatchingRuntimePolicy::Tick(
     // playback tick). A source switch reseeds velocities (one
     // zero-velocity frame) because the two poses differ by layer/IK.
     bool justSeeded = false;
-    const Array<Matrix> searchLocals = _playback->GetSearchLocals();
+    // P5: const reference (no Array-by-value copy; GetSearchLocals stays for
+    // diagnostics/tools, Tick uses the ref).
+    const Array<Matrix>& searchLocals = _playback->GetSearchLocalsRef();
     const bool haveSnapshot = searchLocals.Count() > 0;
     if (haveSnapshot != _usedSearchSnapshot ||
         (haveSnapshot && searchLocals.Count() != _searchSnapshotLength))
@@ -683,19 +712,20 @@ void MotionMatchingRuntimePolicy::Tick(
     }
     const float sampleDt = _hasPrevPositions ? frameDt : 0.0f;
     bool sampled = false;
-    Array<float> pose;
-    Array<float> prev;
+    // P5: member scratch instead of per-tick locals (Resize only when the
+    // feature size changes; schema-fixed 44/prev sizes, so steady-state
+    // reuses without native reallocation).
     Matrix rootWorld;
     String poseError;
     if (haveSnapshot)
     {
         sampled = MotionMatchingQuery::SampleSearchPose(_body, searchLocals, _nodes, sampleDt,
-            _prevPositions, _database->GetSchema(), pose, prev, rootWorld, poseError);
+            _prevPositions, _database->GetSchema(), _poseScratch, _prevScratch, rootWorld, poseError);
     }
     else
     {
         sampled = MotionMatchingQuery::SampleLivePose(_body, _nodes, sampleDt, _prevPositions,
-            pose, prev, rootWorld, poseError);
+            _poseScratch, _prevScratch, rootWorld, poseError);
     }
     if (sampled)
     {
@@ -704,8 +734,8 @@ void MotionMatchingRuntimePolicy::Tick(
             _hasPrevPositions = true;
             justSeeded = true;
         }
-        _prevPositions = prev;
-        _latestPose = pose;
+        _prevPositions = _prevScratch;
+        _latestPose = _poseScratch;
         _latestRootWorld = rootWorld;
         _poseValid = true;
     }
@@ -742,13 +772,13 @@ void MotionMatchingRuntimePolicy::Tick(
             _packedTrajectory[i * 6 + 4] = trajectoryPoints[i].Facing.Y;
             _packedTrajectory[i * 6 + 5] = trajectoryPoints[i].Facing.Z;
         }
-        Array<float> tickTraj;
+        // P5: build into member scratch (no per-tick local Array).
         String trajError;
         if (!MotionMatchingQuery::BuildLiveTrajectory(_packedTrajectory, actorWorld, _latestRootWorld,
-                _database->GetSchema(), tickTraj, trajError))
+                _database->GetSchema(), _tickTrajScratch, trajError))
             _tickTrajectory.Clear();
         else
-            _tickTrajectory = tickTraj;
+            _tickTrajectory = _tickTrajScratch;
     }
 
 
@@ -875,7 +905,8 @@ void MotionMatchingRuntimePolicy::RunQuery(const Array<TrajectoryPoint>& traject
     // YawRate per tick (Tick params). Diagnostics that used movement record
     // neutral values (speed/des 0); yaw rides the caller value for the turn
     // prior + replay.
-    PolicyState = String(TEXT("Locomotion"));
+    // P5: PolicyState is set once at Initialize ("Locomotion"); the per-query
+    // re-assignment of the same literal is deleted (no String alloc per scan).
     const float yawRate = _callerYawRate;
     bool forced = false;
 
@@ -889,11 +920,32 @@ void MotionMatchingRuntimePolicy::RunQuery(const Array<TrajectoryPoint>& traject
     // provider owns hysteresis/bands/roles game-side; empty allowed is an
     // explicit no-match: hold current, never fall back to any pool.
     _chooserReseed = false;
-    Array<String> tags = MotionMatchingDatabase::SplitTagSet(_snapshot.AllowedTagSet);
-    ActiveTag = MotionMatchingDatabase::JoinTags(tags);
-    ChooserStatusText = String(TEXT("ext:")) + ActiveTag;
+    // P5: reuse the last split while the joined scope is unchanged (exact
+    // match, no Split per query in steady-state). Bound: <=8 tags; rebuilt
+    // only on scope change. Semantics unchanged: same tags array as Split.
+    // The cache is shared with the TryFastPath incumbent check (same key
+    // space: the snapshot strings). A const reference is used (no
+    // Array<String> copy); a miss Splits once and caches (rare: scope
+    // transitions only). tagsReused is captured BEFORE the cache call: the
+    // call updates the key on a miss, so comparing after would always read
+    // hit. A const reference is used (no Array<String> copy); tagsReused
+    // also gates the ActiveTag/ChooserStatus rebuild below (on a hit the
+    // values are already correct).
+    const bool tagsReused = (_snapshot.AllowedTagSet == _queryTagsKey);
+    const Array<String>& tags = GetCachedAllowed();
+    if (!tagsReused)
+    {
+        ActiveTag = MotionMatchingDatabase::JoinTags(tags);
+        ChooserStatusText = String(TEXT("ext:")) + ActiveTag;
+    }
     if (tags.Count() == 0)
     {
+        // P5: the empty markers are set on EVERY empty tick (not only on a
+        // scope change): an empty tick must report empty even when the scope
+        // did not change since the last query. Empty scope never occurs in
+        // steady play (suite scopes are always non-empty), so these small
+        // String writes cost nothing steady-state and keep the trace reason
+        // exact on every empty tick.
         ActiveTag = String::Empty;
         ChooserStatusText = String(TEXT("ext:empty (no-match)"));
         LastSwitchReason = String(TEXT("no-result:empty-scope"));
@@ -913,13 +965,18 @@ void MotionMatchingRuntimePolicy::RunQuery(const Array<TrajectoryPoint>& traject
             emptySettings.QueryYawRate = yawRate;
             emptySettings.TurnPenaltyWeight = _tuning.TurnPenaltyWeight;
             emptySettings.TurnPenaltyYawScale = _tuning.TurnPenaltyYawScale;
+            // P5: change-only excluded split (same shared cache as the main
+            // path below; empty ExcludedTagSet disables with no Split).
             if (!_snapshot.ExcludedTagSet.IsEmpty())
-                emptySettings.ExcludeTags = MotionMatchingDatabase::SplitTagSet(_snapshot.ExcludedTagSet);
+                emptySettings.ExcludeTags = GetCachedExcluded();
             const float emptyRate = _playback != nullptr ? _playback->GetPlayRate() : 1.0f;
             MotionMatchingResult emptyResult;
+            // P5: LastSwitchReason already carries "no-result:empty-scope"
+            // (set in the miss branch above); reuse it instead of building
+            // the same literal again for the trace reason.
             RecordTrace(0.0f, yawRate, tags, _tickTrajectory, emptySettings,
                 -1, 999.0f, 0, false, reseeded, false, false, frameDt, emptyRate,
-                false, emptyResult, String(TEXT("no-result:empty-scope")));
+                false, emptyResult, LastSwitchReason);
         }
         return;
     }
@@ -1028,8 +1085,9 @@ void MotionMatchingRuntimePolicy::RunQuery(const Array<TrajectoryPoint>& traject
     settings.OneShotBand = _callerCandidateBand;
     // Controller-decided exclusions ride the snapshot (plain-String
     // transport, split here). Independent of the include scope above.
+    // P5: change-only split via the shared cache (steady-state reuses).
     if (!_snapshot.ExcludedTagSet.IsEmpty())
-        settings.ExcludeTags = MotionMatchingDatabase::SplitTagSet(_snapshot.ExcludedTagSet);
+        settings.ExcludeTags = GetCachedExcluded();
     settings.CollectClassDiagnostics = _tuning.EffectiveTelemetry;
 
     // §18.8: capture the query signature this full scan anchors the fast
@@ -1112,9 +1170,10 @@ void MotionMatchingRuntimePolicy::RunQuery(const Array<TrajectoryPoint>& traject
         snprintf(message, sizeof(message), "Motion matching search produced nothing: %s", errorAnsi.GetText());
         WarnOnce(String(message));
         LastSwitchReason = String(TEXT("no-result:hold"));
+        // P5: reuse the reason just stored (same literal, no second build).
         RecordTrace(0.0f, yawRate, tags, trajectory, settings,
             continuityClip, sinceSwitch, retryKind, forced, reseeded, false, false, frameDt, playRate,
-            false, result, String(TEXT("no-result:hold")));
+            false, result, LastSwitchReason);
         return;
     }
 
@@ -1295,8 +1354,12 @@ bool MotionMatchingRuntimePolicy::TryFastPath(float frameDt)
     // a scope change that keeps the same hash (impossible by construction,
     // but cheap to enforce) or a LoopOnly<->OneShotOnly flip must never
     // hold a clip the new filter forbids. Empty scope never holds.
+    // P5: change-only splits via the fast-path-only caches (separate keys
+    // from RunQuery's pair, so this check never consumes the scope-change
+    // signal); steady-state ticks reuse with no Split per tick. Semantics
+    // unchanged: the same arrays Split would return.
     {
-        Array<String> allowedNow = MotionMatchingDatabase::SplitTagSet(_snapshot.AllowedTagSet);
+        const Array<String>& allowedNow = GetFastAllowed();
         if (allowedNow.Count() == 0)
             return MissFastPath("miss:empty-scope");
         const Array<String>& incumbentTags = ClipTags(_currentClip);
@@ -1313,7 +1376,7 @@ bool MotionMatchingRuntimePolicy::TryFastPath(float frameDt)
             return MissFastPath("miss:scope-changed");
         if (!_snapshot.ExcludedTagSet.IsEmpty())
         {
-            const Array<String> excludedNow = MotionMatchingDatabase::SplitTagSet(_snapshot.ExcludedTagSet);
+            const Array<String>& excludedNow = GetFastExcluded();
             for (const String& t : incumbentTags)
             {
                 if (excludedNow.Contains(t))
@@ -1398,6 +1461,11 @@ bool MotionMatchingRuntimePolicy::TryFastPath(float frameDt)
     FastPathHits++;
     LastFastPathAge = Time::GetGameTime() - _lastFullScanTime;
     LastSwitchReason = String(TEXT("fast:continuing-good"));
+    // P5: build + record the hit entry only when the trace is enabled.
+    // When disabled the hold above is unchanged and no entry Strings are
+    // built (steady-state shipping ticks allocate nothing here). The
+    // fast-path-only excluded join is used (never touches RunQuery's key).
+    if (_trace != nullptr && _trace->Enabled)
     {
         MotionMatchingTraceEntry entry;
         // P0: fast-path hits are first-class trace entries (Kind fastpath)
@@ -1410,8 +1478,7 @@ bool MotionMatchingRuntimePolicy::TryFastPath(float frameDt)
         entry.Time = Time::GetGameTime();
         entry.State = PolicyState;
         entry.Tags = ActiveTag;
-        entry.ExcludedTags = MotionMatchingDatabase::JoinTags(
-            MotionMatchingDatabase::SplitTagSet(_snapshot.ExcludedTagSet));
+        entry.ExcludedTags = GetFastExcludedJoin();
         entry.Speed = 0.0f;
         entry.YawRate = yawRate;
         entry.Grounded = true;
@@ -1519,6 +1586,68 @@ bool MotionMatchingRuntimePolicy::FastPathSignaturesDiffer(const FastPathSignatu
         a.Clip != b.Clip || a.ClipTime != b.ClipTime || a.DatabaseId != b.DatabaseId;
 }
 
+// P5 shared change-only scope caches: Split/Join run only when the joined
+// snapshot string differs from the cached key (exact match). Steady-state
+// (same scope every tick) returns the stored arrays/strings with no
+// allocation; a scope transition rebuilds once. Content-identical to
+// SplitTagSet/JoinTags of the same input (same helpers, same input).
+const Array<String>& MotionMatchingRuntimePolicy::GetCachedAllowed()
+{
+    if (_snapshot.AllowedTagSet != _queryTagsKey)
+    {
+        _queryTagsCache = MotionMatchingDatabase::SplitTagSet(_snapshot.AllowedTagSet);
+        _queryTagsKey = _snapshot.AllowedTagSet;
+    }
+    return _queryTagsCache;
+}
+
+const Array<String>& MotionMatchingRuntimePolicy::GetCachedExcluded()
+{
+    if (_snapshot.ExcludedTagSet != _queryExcludedKey)
+    {
+        _queryExcludedCache = MotionMatchingDatabase::SplitTagSet(_snapshot.ExcludedTagSet);
+        _queryExcludedKey = _snapshot.ExcludedTagSet;
+        _queryExcludedJoin = MotionMatchingDatabase::JoinTags(_queryExcludedCache);
+    }
+    return _queryExcludedCache;
+}
+
+const String& MotionMatchingRuntimePolicy::GetCachedExcludedJoin()
+{
+    GetCachedExcluded();
+    return _queryExcludedJoin;
+}
+
+// P5 fast-path-only twins: identical change-only rule on separate keys so
+// the incumbent check never consumes RunQuery's scope-change signal (see
+// the header member comment). Content-identical to Split/Join.
+const Array<String>& MotionMatchingRuntimePolicy::GetFastAllowed()
+{
+    if (_snapshot.AllowedTagSet != _fastAllowedKey)
+    {
+        _fastAllowedCache = MotionMatchingDatabase::SplitTagSet(_snapshot.AllowedTagSet);
+        _fastAllowedKey = _snapshot.AllowedTagSet;
+    }
+    return _fastAllowedCache;
+}
+
+const Array<String>& MotionMatchingRuntimePolicy::GetFastExcluded()
+{
+    if (_snapshot.ExcludedTagSet != _fastExcludedKey)
+    {
+        _fastExcludedCache = MotionMatchingDatabase::SplitTagSet(_snapshot.ExcludedTagSet);
+        _fastExcludedKey = _snapshot.ExcludedTagSet;
+        _fastExcludedJoin = MotionMatchingDatabase::JoinTags(_fastExcludedCache);
+    }
+    return _fastExcludedCache;
+}
+
+const String& MotionMatchingRuntimePolicy::GetFastExcludedJoin()
+{
+    GetFastExcluded();
+    return _fastExcludedJoin;
+}
+
 void MotionMatchingRuntimePolicy::NotifySearch()
 {
     if (_playback != nullptr)
@@ -1553,6 +1682,13 @@ void MotionMatchingRuntimePolicy::RecordTrace(float speed, float yawRate, const 
     bool fairFight, bool oneshotWindow, float frameDt, float playRate,
     bool valid, const MotionMatchingResult& result, const String& reason)
 {
+    // P5: no record work (and no entry String builds) when the trace is
+    // disabled. The hold/search decision above is unchanged; only the
+    // diagnostics entry is skipped. _lastEntry then keeps the last
+    // enabled-tick value (test sessions always enable the trace via
+    // TraceOverride; shipping play never reads the last entry per tick).
+    if (_trace == nullptr || !_trace->Enabled)
+        return;
     if (_latestPose.Count() == 0 || trajectory.Count() == 0)
         return;
     MotionMatchingTraceEntry entry;
@@ -1595,7 +1731,10 @@ void MotionMatchingRuntimePolicy::RecordTrace(float speed, float yawRate, const 
     entry.TraceFlags = PackTraceFlags(forcedEdge, reseeded, fairFight, oneshotWindow,
         settings.UseIndexedSearch, settings.VerifyIndexedSearch, settings.ExcludeNonLoopTail);
     entry.TopKCandidates = settings.TopKCandidates;
-    entry.ExcludedTags = MotionMatchingDatabase::JoinTags(settings.ExcludeTags);
+    // P5: settings.ExcludeTags is always the shared change-only cache (all
+    // three RunQuery call sites assign GetCachedExcluded()), so the joined
+    // form is the cached join — no Join per query. Content-identical.
+    entry.ExcludedTags = GetCachedExcludedJoin();
     entry.RetryKind = retryKind;
     entry.Recovered = retryKind == 1;
     entry.CostFuseThreshold = _tuning.CostFuseThreshold;
@@ -1707,6 +1846,9 @@ void MotionMatchingRuntimePolicy::RecordTelemetry(float yawRate, const Array<Str
     // here so off-ticks are a single branch with zero allocation).
     if (!_tuning.EffectiveTelemetry)
         return;
+    // P5: tags rides ActiveTag now (see below); the array param is kept for
+    // signature stability (bridge/tools call sites + header decl).
+    (void)tags;
     const auto ioStart = std::chrono::high_resolution_clock::now();
     TelemetryRecord rec;
     rec.Time = Time::GetGameTime();
@@ -1738,12 +1880,11 @@ void MotionMatchingRuntimePolicy::RecordTelemetry(float yawRate, const Array<Str
     rec.OneShotTotal = result.OneShotTotalCount;
     rec.LoopPreference = LoopPreferenceApplied;
     rec.ActorPos = actorPos;
-    for (int32 i = 0; i < tags.Count(); i++)
-    {
-        if (i > 0)
-            rec.Tags += String(TEXT("+"));
-        rec.Tags += tags[i];
-    }
+    // P5: single copy of the already-joined scope instead of a per-tag
+    // concat loop. Content-identical: the only RecordTelemetry call site
+    // passes the allowed-tags array whose Join is ActiveTag (non-empty
+    // valid-result path; ActiveTag is rebuilt on every scope change).
+    rec.Tags = ActiveTag;
     _telemetryRing[_telemetryHead] = rec;
     _telemetryHead = (_telemetryHead + 1) % TelemetryCapacity;
     if (_telemetryCount < TelemetryCapacity)

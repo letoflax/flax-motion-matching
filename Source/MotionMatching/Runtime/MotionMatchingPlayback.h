@@ -86,6 +86,28 @@ public:
     API_FUNCTION() void ResetOnTeleport();
     API_FUNCTION() void NotifySearchExecuted(int64 tickFrameId);
     API_FUNCTION() Array<Matrix> GetSearchLocals() const;
+    /// <summary>
+    /// P5 zero-alloc pose read: bone count for the copy API below. Returns 0
+    /// when no search pose is available. Bound: model bone count (91 on the
+    /// reference rig, reuse buffers cap 512).
+    /// </summary>
+    API_FUNCTION() int32 GetSearchLocalsCount() const;
+    /// <summary>
+    /// P5 zero-alloc pose read: copies one bone local into the caller struct
+    /// (no managed array allocation, unlike GetSearchLocals). Returns false
+    /// when the index is out of range (outLocal set to identity). The caller
+    /// reuses its own buffers and resizes only when GetSearchLocalsCount
+    /// changes. Same snapshot data as GetSearchLocals (post-inertial search
+    /// pose); the native history is never aliased with game-owned buffers.
+    /// </summary>
+    API_FUNCTION() bool GetSearchLocal(int32 index, API_PARAM(Out) Matrix& outLocal) const;
+    /// <summary>
+    /// P5 internal fast path (no bindings): const reference to the search
+    /// snapshot for the policy Tick sampler. Avoids the Array-by-value copy
+    /// in GetSearchLocals (which stays for diagnostics/tools). Not exposed
+    /// to scripting (no API_FUNCTION) so it needs no binding regen.
+    /// </summary>
+    const Array<Matrix>& GetSearchLocalsRef() const { return _searchLocals; }
     API_FUNCTION() void Tick(float deltaTime, AnimatedModel* body, bool grounded);
 
 private:

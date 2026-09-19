@@ -59,6 +59,37 @@ public:
         float facingHalflife,
         float deltaTime
     );
+    /// <summary>
+    /// P5 zero-alloc trajectory update: same prediction as CalculateTrajectory
+    /// but returns void (no managed array allocation). The predicted points
+    /// are read back with GetPredictedCount/GetPredictedPoint below into
+    /// caller-reused buffers. Kept in lockstep with CalculateTrajectory by
+    /// sharing the same core (this method forwards to it and discards the
+    /// reference; the native _points member holds the result).
+    /// </summary>
+    API_FUNCTION() void UpdateTrajectory(
+        const Transform& currentTransform,
+        const Float3& currentVelocity,
+        const Float3& currentAcceleration,
+        const Float3& currentAngularVelocity,
+        const Float3& desiredVelocity,
+        const Quaternion& desiredRotation,
+        const Array<float>& sampleOffsets,
+        float positionHalflife,
+        float facingHalflife,
+        float deltaTime
+    );
+    /// <summary>
+    /// P5 zero-alloc trajectory read: predicted point count (6 for the
+    /// current schema). Bound: schema point count (6, hard cap 16).
+    /// </summary>
+    API_FUNCTION() int32 GetPredictedCount() const;
+    /// <summary>
+    /// P5 zero-alloc trajectory read: copies one predicted point into the
+    /// caller struct (no managed array allocation). Returns false when the
+    /// index is out of range (outPoint set to origin/forward).
+    /// </summary>
+    API_FUNCTION() bool GetPredictedPoint(int32 index, API_PARAM(Out) TrajectoryPoint& outPoint) const;
 
     /// <summary>
     /// Resets history buffer to a given start transform.

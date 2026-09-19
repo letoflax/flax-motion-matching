@@ -246,6 +246,22 @@ Array<Matrix> MotionMatchingPlayback::GetSearchLocals() const
     return _searchLocals;
 }
 
+int32 MotionMatchingPlayback::GetSearchLocalsCount() const
+{
+    return _searchLocals.Count();
+}
+
+bool MotionMatchingPlayback::GetSearchLocal(int32 index, Matrix& outLocal) const
+{
+    if (index < 0 || index >= _searchLocals.Count())
+    {
+        outLocal = Matrix::Identity;
+        return false;
+    }
+    outLocal = _searchLocals[index];
+    return true;
+}
+
 
 
 void MotionMatchingPlayback::AssertTickOrder()

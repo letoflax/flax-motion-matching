@@ -95,7 +95,8 @@ public class DefaultLocomotionProvider : Script, IMotionMatchingInputProvider
     // but resolves through the editable GaitBands/roles above).
     private string _scopeStable = "idle";
     private bool _scopeStableYaw;
-    private string _scopePendingKey = "idle|0";
+    private string _scopePendingTag = "idle";
+    private bool _scopePendingYaw;
     private int _scopePendingCount = 99;
     private bool _scopeReseed;
     private bool _scopeWasAirborne;
@@ -104,8 +105,39 @@ public class DefaultLocomotionProvider : Script, IMotionMatchingInputProvider
     private Float3 _scopeLastActorPos = Float3.Zero;
     private bool _scopeHasLastActorPos;
     private bool _predictorReseed;
+    // P5 steady-state reuse (all bounded, scope semantics unchanged):
+    // gait/inventory/role caches below are rebuilt only when their source
+    // config changes (ordinal/value compares, no allocation on compare);
+    // steady-state ticks reuse them with no List/HashSet/Split/Join/ToLower.
+    // The scope string itself is cached by validated set: same set returns
+    // the same string instance (no Join per tick); a changed set Joins once.
+    private GaitBand[] _bandsNorm = Array.Empty<GaitBand>();
+    private string[] _inventoryLower = Array.Empty<string>();
+    private string[] _inventorySrcRef;
+    private int _inventorySrcLen = -1;
+    private string _roleJumpLower = "jump";
+    private string _roleJumpSrc = "jump";
+    private string _roleBackLower = "back";
+    private string _roleBackSrc = "back";
+    private string _roleStrafeLower = "strafe";
+    private string _roleStrafeSrc = "strafe";
+    private string _roleTurnInPlaceLower = "turn_inplace";
+    private string _roleTurnInPlaceSrc = "turn_inplace";
+    private string _roleTurnTravelLower = "turn_travel";
+    private string _roleTurnTravelSrc = "turn_travel";
+    private string _gameplaySrc;
+    private string[] _gameplayWant = Array.Empty<string>();
+    private string _excludeSrc;
+    private string _excludeLower = string.Empty;
+    private readonly HashSet<string> _wantScratch = new HashSet<string>(StringComparer.Ordinal);
+    private readonly string[] _setScratch = new string[2];
+    private readonly string[] _keptScratch = new string[2];
+    private string _scopeCache = string.Empty;
+    private readonly string[] _scopeKeptCache = new string[2];
+    private int _scopeKeptCount = -1;
     private readonly HashSet<string> _scopeWarned = new HashSet<string>();
-    private string _validatedInventoryKey;
+    private string[] _validatedInventoryRef;
+    private int _validatedInventoryLen = -1;
 
     /// <summary>
     /// Pushes this frame's movement snapshot. Called by the host driver
@@ -140,9 +172,8 @@ public class DefaultLocomotionProvider : Script, IMotionMatchingInputProvider
         // policy overwrites them per tick in the facade); QueryYawRate rides
         // the snapshot yaw verbatim for the turn prior (Game owns the meaning).
         frame.AllowedTagSet = scope ?? string.Empty;
-        frame.ExcludedTagSet = string.IsNullOrWhiteSpace(GameplayExclude)
-            ? string.Empty
-            : GameplayExclude.Trim().ToLowerInvariant();
+        // P5: change-only lowered exclusion (no Trim/ToLower per tick).
+        frame.ExcludedTagSet = GetExcludedLower();
         frame.LoopFilter = 0;
         frame.CandidateBand = 0;
         float yaw = _snap.AngularVelocity.Y;
@@ -173,7 +204,10 @@ public class DefaultLocomotionProvider : Script, IMotionMatchingInputProvider
         frame.LoopFilter = 0;
         frame.CandidateBand = 0;
         frame.QueryYawRate = 0.0f;
-        string rest = RestBandTag();
+        // P5: rest band from the normalized cache (no per-tick scan/alloc).
+        EnsureNormalizedBands();
+        EnsureInventoryCache(ctx.DatabaseTags);
+        string rest = _bandsNorm.Length > 0 ? _bandsNorm[0].Tag : string.Empty;
         if (string.IsNullOrEmpty(rest))
         {
             frame.AllowedTagSet = string.Empty;
@@ -182,11 +216,9 @@ public class DefaultLocomotionProvider : Script, IMotionMatchingInputProvider
         }
         else
         {
-            frame.AllowedTagSet = FilterScopeTags(new string[] { rest }, ctx.DatabaseTags, "idle-default");
+            frame.AllowedTagSet = FilterScopeSingle(rest, ctx.DatabaseTags, "idle-default");
         }
-        frame.ExcludedTagSet = string.IsNullOrWhiteSpace(GameplayExclude)
-            ? string.Empty
-            : GameplayExclude.Trim().ToLowerInvariant();
+        frame.ExcludedTagSet = GetExcludedLower();
         return frame;
     }
 
@@ -248,7 +280,13 @@ public class DefaultLocomotionProvider : Script, IMotionMatchingInputProvider
         float[] sampleOffsets = ctx.SampleTimes;
         _lastTransform = ctx.ActorWorld;
         _lastSampleTimes = sampleOffsets ?? Array.Empty<float>();
-        _points = _predictor.CalculateTrajectory(
+        // P5 zero-alloc trajectory read: UpdateTrajectory runs the same
+        // prediction as CalculateTrajectory but returns void (no managed
+        // array allocation at the binding). Points are copied back into the
+        // reused _points buffer; resize only when the schema point count
+        // changes. Bound: schema point count (6, hard cap 16). Semantics
+        // identical (same native core, same _points content/order).
+        _predictor.UpdateTrajectory(
             _lastTransform,
             _snap.CurrentVelocity,
             _snap.Acceleration,
@@ -258,28 +296,222 @@ public class DefaultLocomotionProvider : Script, IMotionMatchingInputProvider
             sampleOffsets,
             _snap.PositionHalflife,
             _snap.FacingHalflife,
-            ctx.DeltaTime
-        ) ?? Array.Empty<TrajectoryPoint>();
+            ctx.DeltaTime);
+        int n = _predictor.GetPredictedCount();
+        if (n < 0 || n > 16)
+            n = 0;
+        if (_points.Length != n)
+            _points = new TrajectoryPoint[n];
+        for (int i = 0; i < n; i++)
+        {
+            TrajectoryPoint p;
+            if (_predictor.GetPredictedPoint(i, out p))
+                _points[i] = p;
+            else
+                _points[i] = new TrajectoryPoint();
+        }
     }
 
-    // Rest-band tag (first band by MaxSpeed) for the native idle watchdog.
-    private string RestBandTag()
+    // P5: normalized band cache (trimmed + lowered, ascending MaxSpeed).
+    // Rebuilt only when the GaitBands content changes. Change detection is
+    // allocation-free steady-state: array reference + length + per-item
+    // string-reference/MaxSpeed compares (strings are immutable, so a
+    // reference change IS a content change; rebuilt on any difference).
+    private GaitBand[] _bandsSrcRef;
+    private int _bandsNormSrcLen = -1;
+    private string[] _bandsRawTags = Array.Empty<string>();
+    private float[] _bandsRawMax = Array.Empty<float>();
+
+    private void EnsureNormalizedBands()
     {
-        if (GaitBands == null || GaitBands.Length == 0)
-            return string.Empty;
-        string rest = string.Empty;
-        float best = float.MaxValue;
-        foreach (var band in GaitBands)
+        GaitBand[] src = GaitBands;
+        if (src != null && ReferenceEquals(src, _bandsSrcRef) && src.Length == _bandsNormSrcLen && BandsItemsEqual(src))
+            return;
+        RebuildNormalizedBands(src);
+    }
+
+    private bool BandsItemsEqual(GaitBand[] src)
+    {
+        if (_bandsRawTags.Length != src.Length)
+            return false;
+        for (int i = 0; i < src.Length; i++)
         {
-            if (string.IsNullOrWhiteSpace(band.Tag))
-                continue;
-            if (band.MaxSpeed < best)
+            if (!ReferenceEquals(src[i].Tag, _bandsRawTags[i]) || src[i].MaxSpeed != _bandsRawMax[i])
+                return false;
+        }
+        return true;
+    }
+
+    private void RebuildNormalizedBands(GaitBand[] src)
+    {
+        _bandsSrcRef = src;
+        _bandsNormSrcLen = src != null ? src.Length : -1;
+        if (src != null)
+        {
+            if (_bandsRawTags.Length != src.Length)
             {
-                best = band.MaxSpeed;
-                rest = band.Tag.Trim().ToLowerInvariant();
+                _bandsRawTags = new string[src.Length];
+                _bandsRawMax = new float[src.Length];
+            }
+            for (int i = 0; i < src.Length; i++)
+            {
+                _bandsRawTags[i] = src[i].Tag;
+                _bandsRawMax[i] = src[i].MaxSpeed;
             }
         }
-        return rest;
+        int n = CountValidBands(src);
+        if (_bandsNorm.Length != n)
+            _bandsNorm = new GaitBand[n];
+        if (src == null)
+        {
+            _scopeKeptCount = -1;
+            return;
+        }
+        int w = 0;
+        for (int i = 0; i < src.Length; i++)
+        {
+            string tag = src[i].Tag;
+            if (string.IsNullOrWhiteSpace(tag))
+                continue;
+            _bandsNorm[w++] = new GaitBand { Tag = tag.Trim().ToLowerInvariant(), MaxSpeed = src[i].MaxSpeed };
+        }
+        // Insertion sort by MaxSpeed (band counts are tiny: 4 by default).
+        for (int i = 1; i < n; i++)
+        {
+            GaitBand key = _bandsNorm[i];
+            int j = i - 1;
+            while (j >= 0 && _bandsNorm[j].MaxSpeed > key.MaxSpeed)
+            {
+                _bandsNorm[j + 1] = _bandsNorm[j];
+                j--;
+            }
+            _bandsNorm[j + 1] = key;
+        }
+        _scopeKeptCount = -1;
+    }
+
+    private static int CountValidBands(GaitBand[] src)
+    {
+        if (src == null)
+            return 0;
+        int n = 0;
+        for (int i = 0; i < src.Length; i++)
+        {
+            if (!string.IsNullOrWhiteSpace(src[i].Tag))
+                n++;
+        }
+        return n;
+    }
+
+    // P5: lowered inventory cache. Change detection is reference + length
+    // (the inventory array is set once per database load, never mutated in
+    // place). Rebuild also drops the scope-string cache: the validated set
+    // may change with the inventory. Returns true when rebuilt.
+    private bool EnsureInventoryCache(string[] inventory)
+    {
+        if (ReferenceEquals(inventory, _inventorySrcRef) &&
+            (inventory == null || inventory.Length == _inventorySrcLen))
+            return false;
+        _inventorySrcRef = inventory;
+        _inventorySrcLen = inventory != null ? inventory.Length : -1;
+        int n = 0;
+        if (inventory != null)
+        {
+            for (int i = 0; i < inventory.Length; i++)
+            {
+                if (!string.IsNullOrWhiteSpace(inventory[i]))
+                    n++;
+            }
+        }
+        if (_inventoryLower.Length != n)
+            _inventoryLower = new string[n];
+        int w = 0;
+        if (inventory != null)
+        {
+            for (int i = 0; i < inventory.Length; i++)
+            {
+                if (string.IsNullOrWhiteSpace(inventory[i]))
+                    continue;
+                _inventoryLower[w++] = inventory[i].Trim().ToLowerInvariant();
+            }
+        }
+        _scopeKeptCount = -1;
+        return true;
+    }
+
+    // P5: lowered role cache (Jump/Back/Strafe/TurnInPlace/TurnTravel).
+    // Rebuilt only when a role source string changes (value compare, no
+    // allocation); steady-state ticks reuse the lowered copies.
+    private void EnsureRoles()
+    {
+        if (JumpTag != _roleJumpSrc)
+        {
+            _roleJumpSrc = JumpTag;
+            _roleJumpLower = string.IsNullOrWhiteSpace(JumpTag) ? string.Empty : JumpTag.Trim().ToLowerInvariant();
+        }
+        if (BackTag != _roleBackSrc)
+        {
+            _roleBackSrc = BackTag;
+            _roleBackLower = string.IsNullOrWhiteSpace(BackTag) ? string.Empty : BackTag.Trim().ToLowerInvariant();
+        }
+        if (StrafeTag != _roleStrafeSrc)
+        {
+            _roleStrafeSrc = StrafeTag;
+            _roleStrafeLower = string.IsNullOrWhiteSpace(StrafeTag) ? string.Empty : StrafeTag.Trim().ToLowerInvariant();
+        }
+        if (TurnInPlaceTag != _roleTurnInPlaceSrc)
+        {
+            _roleTurnInPlaceSrc = TurnInPlaceTag;
+            _roleTurnInPlaceLower = string.IsNullOrWhiteSpace(TurnInPlaceTag) ? string.Empty : TurnInPlaceTag.Trim().ToLowerInvariant();
+        }
+        if (TurnTravelTag != _roleTurnTravelSrc)
+        {
+            _roleTurnTravelSrc = TurnTravelTag;
+            _roleTurnTravelLower = string.IsNullOrWhiteSpace(TurnTravelTag) ? string.Empty : TurnTravelTag.Trim().ToLowerInvariant();
+        }
+    }
+
+    // P5: parsed gameplay-want cache. Split/trim/lower run only when the
+    // GameplayTags source string changes (rare: driver-forced scopes).
+    private void EnsureGameplayWant()
+    {
+        if (GameplayTags == _gameplaySrc)
+            return;
+        _gameplaySrc = GameplayTags;
+        if (string.IsNullOrWhiteSpace(GameplayTags))
+        {
+            _gameplayWant = Array.Empty<string>();
+            return;
+        }
+        string[] parts = GameplayTags.Split('+');
+        int n = 0;
+        for (int i = 0; i < parts.Length; i++)
+        {
+            if (!string.IsNullOrWhiteSpace(parts[i]))
+                n++;
+        }
+        string[] want = new string[n];
+        int w = 0;
+        for (int i = 0; i < parts.Length; i++)
+        {
+            if (string.IsNullOrWhiteSpace(parts[i]))
+                continue;
+            want[w++] = parts[i].Trim().ToLowerInvariant();
+        }
+        _gameplayWant = want;
+    }
+
+    // P5: lowered exclusion cache for the frame ExcludedTagSet. Rebuilt
+    // only when GameplayExclude changes; blank stays string.Empty.
+    private string GetExcludedLower()
+    {
+        if (GameplayExclude == _excludeSrc)
+            return _excludeLower;
+        _excludeSrc = GameplayExclude;
+        _excludeLower = string.IsNullOrWhiteSpace(GameplayExclude)
+            ? string.Empty
+            : GameplayExclude.Trim().ToLowerInvariant();
+        return _excludeLower;
     }
 
     /// <summary>
@@ -291,22 +523,17 @@ public class DefaultLocomotionProvider : Script, IMotionMatchingInputProvider
     /// </summary>
     private string ComputeTagScope(MotionMatchingInputContext ctx)
     {
-        if (GaitBands == null || GaitBands.Length == 0)
+        // P5: normalized bands/roles/inventory come from the change-only
+        // caches above (no List/HashSet/Split/Join/ToLower per tick).
+        EnsureNormalizedBands();
+        EnsureRoles();
+        EnsureInventoryCache(ctx.DatabaseTags);
+        if (_bandsNorm.Length == 0)
             return string.Empty;
 
-        var bands = new List<GaitBand>();
-        foreach (var band in GaitBands)
-        {
-            if (string.IsNullOrWhiteSpace(band.Tag))
-                continue;
-            bands.Add(new GaitBand { Tag = band.Tag.Trim().ToLowerInvariant(), MaxSpeed = band.MaxSpeed });
-        }
-        if (bands.Count == 0)
-            return string.Empty;
-        bands.Sort((a, b) => a.MaxSpeed.CompareTo(b.MaxSpeed));
-        string rest = bands[0].Tag;
-        float restMax = bands[0].MaxSpeed;
-        string top = bands[bands.Count - 1].Tag;
+        string rest = _bandsNorm[0].Tag;
+        float restMax = _bandsNorm[0].MaxSpeed;
+        string top = _bandsNorm[_bandsNorm.Length - 1].Tag;
 
         float planarSpeed = (float)Math.Sqrt(
             _snap.CurrentVelocity.X * _snap.CurrentVelocity.X +
@@ -338,12 +565,13 @@ public class DefaultLocomotionProvider : Script, IMotionMatchingInputProvider
 
         if (airborne)
         {
-            _scopeStable = JumpTag;
+            _scopeStable = _roleJumpLower;
             _scopeStableYaw = false;
-            _scopePendingKey = JumpTag + "|0";
+            _scopePendingTag = _roleJumpLower;
+            _scopePendingYaw = false;
             _scopePendingCount = 99;
             _scopeReseed = false;
-            return FilterScopeTags(new string[] { JumpTag }, ctx.DatabaseTags, "airborne");
+            return FilterScopeSingle(_roleJumpLower, ctx.DatabaseTags, "airborne");
         }
 
         bool backward = ScopeDecelLatchedDirection(true, airborne, planarSpeed, desSpeed, ctx.SampleTimes);
@@ -355,15 +583,15 @@ public class DefaultLocomotionProvider : Script, IMotionMatchingInputProvider
         string linear;
         bool linearIsBand;
         int linearBandIndex;
-        if (backward && planarSpeed > restMax && IsKnownRole(BackTag, ctx.DatabaseTags))
+        if (backward && planarSpeed > restMax && IsKnownRoleLower(_roleBackLower, ctx.DatabaseTags))
         {
-            linear = BackTag.Trim().ToLowerInvariant();
+            linear = _roleBackLower;
             linearIsBand = false;
             linearBandIndex = -1;
         }
-        else if (lateral && planarSpeed > restMax && IsKnownRole(StrafeTag, ctx.DatabaseTags))
+        else if (lateral && planarSpeed > restMax && IsKnownRoleLower(_roleStrafeLower, ctx.DatabaseTags))
         {
-            linear = StrafeTag.Trim().ToLowerInvariant();
+            linear = _roleStrafeLower;
             linearIsBand = false;
             linearBandIndex = -1;
         }
@@ -371,42 +599,49 @@ public class DefaultLocomotionProvider : Script, IMotionMatchingInputProvider
         {
             linear = top;
             linearIsBand = true;
-            linearBandIndex = bands.Count - 1;
+            linearBandIndex = _bandsNorm.Length - 1;
         }
         else
         {
-            linearBandIndex = bands.Count - 1;
-            for (int i = 0; i < bands.Count; i++)
+            linearBandIndex = _bandsNorm.Length - 1;
+            for (int i = 0; i < _bandsNorm.Length; i++)
             {
-                if (planarSpeed <= bands[i].MaxSpeed)
+                if (planarSpeed <= _bandsNorm[i].MaxSpeed)
                 {
                     linearBandIndex = i;
                     break;
                 }
             }
-            linear = bands[linearBandIndex].Tag;
+            linear = _bandsNorm[linearBandIndex].Tag;
             linearIsBand = true;
         }
 
         bool yaw = yawRate >= YawRateThreshold;
-        string key = linear + "|" + (yaw ? "1" : "0");
-        string stableKey = _scopeStable + "|" + (_scopeStableYaw ? "1" : "0");
+        // P5: hysteresis keys compared as (tag, yaw-bit) pairs instead of
+        // joined "tag|0/1" strings (the old key concat allocated per tick).
+        // _scopeStable/_scopePendingTag hold normalized tags, so ordinal
+        // value compares are exact with no allocation.
+        bool sameAsStable = yaw == _scopeStableYaw &&
+            string.Equals(linear, _scopeStable, StringComparison.Ordinal);
         // Instant adoption on edges and pure band crossings (speed never
         // flickers); everything else waits out TagConfirmRepeats. Non-rest
         // bands only: entering rest stays delayed (natural settle tail).
-        int stableBandIndex = BandIndexOf(bands, _scopeStable);
-        bool leavingRest = _scopeStable == rest && linear != rest;
+        int stableBandIndex = BandIndexOf(_scopeStable);
+        bool leavingRest = string.Equals(_scopeStable, rest, StringComparison.Ordinal) &&
+            !string.Equals(linear, rest, StringComparison.Ordinal);
         bool bandChange = linearIsBand && linearBandIndex > 0 &&
             stableBandIndex > 0;
-        if (edge || key == stableKey || reseed || leavingRest || bandChange)
+        if (edge || sameAsStable || reseed || leavingRest || bandChange)
         {
             _scopeStable = linear;
             _scopeStableYaw = yaw;
-            _scopePendingKey = key;
+            _scopePendingTag = linear;
+            _scopePendingYaw = yaw;
             _scopePendingCount = 99;
             _scopeReseed = false;
         }
-        else if (key == _scopePendingKey)
+        else if (yaw == _scopePendingYaw &&
+            string.Equals(linear, _scopePendingTag, StringComparison.Ordinal))
         {
             _scopePendingCount++;
             if (_scopePendingCount >= Math.Max(TagConfirmRepeats, 1))
@@ -417,66 +652,79 @@ public class DefaultLocomotionProvider : Script, IMotionMatchingInputProvider
         }
         else
         {
-            _scopePendingKey = key;
+            _scopePendingTag = linear;
+            _scopePendingYaw = yaw;
             _scopePendingCount = 1;
         }
 
-        var set = new List<string> { _scopeStable };
+        // P5: two-slot scratch instead of List<string> (stable + one turn
+        // role max). Turn roles ride the pre-lowered cache (no per-tick
+        // Trim/ToLower); known-check is an ordinal scan of the lowered
+        // inventory (no HashSet per tick).
+        int setCount = 1;
+        _setScratch[0] = _scopeStable;
         if (_scopeStableYaw)
         {
-            string turnRole = _scopeStable == rest ? TurnInPlaceTag : TurnTravelTag;
-            if (IsKnownRole(turnRole, ctx.DatabaseTags))
-                set.Add(turnRole.Trim().ToLowerInvariant());
+            string turnRole = string.Equals(_scopeStable, rest, StringComparison.Ordinal)
+                ? _roleTurnInPlaceLower : _roleTurnTravelLower;
+            if (!string.IsNullOrEmpty(turnRole) && IsKnownRoleLower(turnRole, ctx.DatabaseTags))
+                _setScratch[setCount++] = turnRole;
         }
 
         // Gameplay scope from game code intersects the locomotion scope. An
         // empty intersection keeps locomotion (a full-pool fallback would be
         // worse: it could play a clip the game explicitly forbade).
-        if (!string.IsNullOrWhiteSpace(GameplayTags))
+        // P5: the want-set is parsed only when GameplayTags changes (cached);
+        // intersection filters the scratch in place (no HashSet/Split per
+        // tick; the reused _wantScratch HashSet is Cleared, never rebuilt).
+        EnsureGameplayWant();
+        if (_gameplayWant.Length > 0)
         {
-            var want = new HashSet<string>();
-            foreach (string raw in GameplayTags.Split('+'))
+            _wantScratch.Clear();
+            for (int i = 0; i < _gameplayWant.Length; i++)
+                _wantScratch.Add(_gameplayWant[i]);
+            int keptCount = 0;
+            for (int i = 0; i < setCount; i++)
             {
-                string tag = raw.Trim().ToLowerInvariant();
-                if (!string.IsNullOrEmpty(tag))
-                    want.Add(tag);
+                if (_wantScratch.Contains(_setScratch[i]))
+                    _setScratch[keptCount++] = _setScratch[i];
             }
-            if (want.Count > 0)
+            if (keptCount > 0)
             {
-                var both = new List<string>();
-                foreach (string tag in set)
-                {
-                    if (want.Contains(tag))
-                        both.Add(tag);
-                }
-                if (both.Count > 0)
-                    set = both;
-                else
-                    ScopeWarnOnce("gameplay-miss:" + GameplayTags.Trim().ToLowerInvariant(),
-                        "Motion matching scope: gameplay tags '" + GameplayTags.Trim() +
-                        "' exclude the locomotion scope '" + string.Join("+", set) +
-                        "'; keeping locomotion.");
+                setCount = keptCount;
+            }
+            else
+            {
+                string wantKey = GameplayTags.Trim().ToLowerInvariant();
+                string have = setCount > 1
+                    ? _setScratch[0] + "+" + _setScratch[1]
+                    : (setCount > 0 ? _setScratch[0] : string.Empty);
+                ScopeWarnOnce("gameplay-miss:" + wantKey,
+                    "Motion matching scope: gameplay tags '" + GameplayTags.Trim() +
+                    "' exclude the locomotion scope '" + have +
+                    "'; keeping locomotion.");
             }
         }
 
-        return FilterScopeTags(set.ToArray(), ctx.DatabaseTags, "scope");
+        return FilterScopeSet(setCount, ctx.DatabaseTags, "scope");
     }
 
     private void ResetScopeState(string rest)
     {
         _scopeStable = rest;
         _scopeStableYaw = false;
-        _scopePendingKey = rest + "|0";
+        _scopePendingTag = rest;
+        _scopePendingYaw = false;
         _scopePendingCount = 99;
         _scopeReseed = true;
         _scopeHasLastActorPos = false;
     }
 
-    private int BandIndexOf(List<GaitBand> bands, string tag)
+    private int BandIndexOf(string tag)
     {
-        for (int i = 0; i < bands.Count; i++)
+        for (int i = 0; i < _bandsNorm.Length; i++)
         {
-            if (bands[i].Tag == tag)
+            if (string.Equals(_bandsNorm[i].Tag, tag, StringComparison.Ordinal))
                 return i;
         }
         return -1;
@@ -484,52 +732,112 @@ public class DefaultLocomotionProvider : Script, IMotionMatchingInputProvider
 
     // Role known = present in the baked inventory, or inventory unavailable
     // (database not loaded: allow everything, validation happens per-scope).
-    private bool IsKnownRole(string role, string[] inventory)
+    // P5: ordinal scan of the lowered inventory cache (no Trim/ToLower per
+    // item per tick). The role must already be lowered by the caller.
+    private bool IsKnownRoleLower(string loweredRole, string[] inventory)
     {
-        if (string.IsNullOrWhiteSpace(role))
+        if (string.IsNullOrEmpty(loweredRole))
             return false;
         if (inventory == null || inventory.Length == 0)
             return true;
-        string tag = role.Trim().ToLowerInvariant();
-        foreach (string known in inventory)
+        for (int i = 0; i < _inventoryLower.Length; i++)
         {
-            if (known != null && known.Trim().ToLowerInvariant() == tag)
+            if (string.Equals(_inventoryLower[i], loweredRole, StringComparison.Ordinal))
                 return true;
         }
         return false;
     }
 
-    // Drops scope tags missing from the baked inventory (with a warning).
-    private string FilterScopeTags(string[] set, string[] inventory, string context)
+    // Single-tag validate path (airborne scope): no array allocation.
+    private string FilterScopeSingle(string loweredTag, string[] inventory, string context)
     {
-        if (set == null || set.Length == 0)
-            return string.Empty;
+        _setScratch[0] = loweredTag;
+        return FilterScopeSet(1, inventory, context);
+    }
+
+    // Drops scope tags missing from the baked inventory (with a warning).
+    // P5: validates the scratch in place (items are already normalized by
+    // the callers) and caches the joined scope string by validated set: an
+    // unchanged set returns the same string instance (no Join per tick); a
+    // changed set Joins once (max 2 tags: stable + one turn role).
+    // Content-identical to the old FilterScopeTags for the same input.
+    private string FilterScopeSet(int count, string[] inventory, string context)
+    {
+        int kept = 0;
         if (inventory == null || inventory.Length == 0)
-            return string.Join("+", set);
-        var known = new HashSet<string>();
-        foreach (string tag in inventory)
         {
-            if (!string.IsNullOrWhiteSpace(tag))
-                known.Add(tag.Trim().ToLowerInvariant());
-        }
-        var kept = new List<string>();
-        foreach (string raw in set)
-        {
-            string tag = (raw ?? string.Empty).Trim().ToLowerInvariant();
-            if (string.IsNullOrEmpty(tag))
-                continue;
-            if (kept.Contains(tag))
-                continue;
-            if (!known.Contains(tag))
+            for (int i = 0; i < count && kept < 2; i++)
             {
-                ScopeWarnOnce("unknown-tag:" + tag,
-                    "Motion matching scope (" + context + "): tag '" + tag +
-                    "' is not in the baked database; dropping it.");
-                continue;
+                string tag = _setScratch[i];
+                if (string.IsNullOrEmpty(tag))
+                    continue;
+                bool dup = false;
+                for (int k = 0; k < kept; k++)
+                {
+                    if (string.Equals(_keptScratch[k], tag, StringComparison.Ordinal))
+                    {
+                        dup = true;
+                        break;
+                    }
+                }
+                if (!dup)
+                    _keptScratch[kept++] = tag;
             }
-            kept.Add(tag);
         }
-        return string.Join("+", kept.ToArray());
+        else
+        {
+            for (int i = 0; i < count && kept < 2; i++)
+            {
+                string tag = _setScratch[i];
+                if (string.IsNullOrEmpty(tag))
+                    continue;
+                bool dup = false;
+                for (int k = 0; k < kept; k++)
+                {
+                    if (string.Equals(_keptScratch[k], tag, StringComparison.Ordinal))
+                    {
+                        dup = true;
+                        break;
+                    }
+                }
+                if (dup)
+                    continue;
+                if (!IsKnownRoleLower(tag, inventory))
+                {
+                    ScopeWarnOnce("unknown-tag:" + tag,
+                        "Motion matching scope (" + context + "): tag '" + tag +
+                        "' is not in the baked database; dropping it.");
+                    continue;
+                }
+                _keptScratch[kept++] = tag;
+            }
+        }
+        if (kept == _scopeKeptCount)
+        {
+            bool same = true;
+            for (int k = 0; k < kept; k++)
+            {
+                if (!string.Equals(_keptScratch[k], _scopeKeptCache[k], StringComparison.Ordinal))
+                {
+                    same = false;
+                    break;
+                }
+            }
+            if (same)
+                return _scopeCache;
+        }
+        string scope;
+        if (kept == 0)
+            scope = string.Empty;
+        else if (kept == 1)
+            scope = _keptScratch[0];
+        else
+            scope = _keptScratch[0] + "+" + _keptScratch[1];
+        _scopeKeptCount = kept;
+        for (int k = 0; k < kept; k++)
+            _scopeKeptCache[k] = _keptScratch[k];
+        _scopeCache = scope;
+        return scope;
     }
 
     private void ScopeWarnOnce(string key, string message)
@@ -545,10 +853,15 @@ public class DefaultLocomotionProvider : Script, IMotionMatchingInputProvider
     // or the scope it feeds silently loses candidates.
     private void ValidateInventory(string[] inventory)
     {
-        string key = inventory == null ? "null" : string.Join("+", inventory);
-        if (key == _validatedInventoryKey)
+        // P5: identity is reference + length (the inventory array is set
+        // once per database load and never mutated in place), so the
+        // steady-state check allocates nothing (the old string.Join key
+        // built a string every tick).
+        if (ReferenceEquals(inventory, _validatedInventoryRef) &&
+            (inventory == null || inventory.Length == _validatedInventoryLen))
             return;
-        _validatedInventoryKey = key;
+        _validatedInventoryRef = inventory;
+        _validatedInventoryLen = inventory != null ? inventory.Length : -1;
         if (inventory == null || inventory.Length == 0)
             return;
         var known = new HashSet<string>();

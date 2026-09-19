@@ -285,9 +285,43 @@ private:
 
     MotionMatchingPlayerSnapshot _snapshot;
     MotionMatchingPolicyTuning _tuning;
-    Array<TrajectoryPoint> _trajectoryPoints;
-    Array<float> _sampleTimes;
     MotionMatchingTraceEntry _lastEntry;
+    // P5 steady-state reuse (all bounded, all record-only, never steer search):
+    // - _queryTagsKey/_queryTagsCache: last AllowedTagSet split (RunQuery +
+    //   TryFastPath incumbent check share it). Bound: tag count per query
+    //   (<=8 on the reference DB). Rebuilt only when the joined scope string
+    //   changes (exact match); steady-state (same scope) reuses without
+    //   Split per query/tick.
+    // - _queryExcludedKey/_queryExcludedCache/_queryExcludedJoin: same rule
+    //   for the ExcludedTagSet split and its '+'-joined form (settings +
+    //   trace/telemetry/fastpath entries share them).
+    // - _poseScratch/_prevScratch: Tick pose-sample scratch (44/21 floats).
+    //   Passed to the samplers instead of per-tick locals; Resize only when
+    //   the feature size changes (schema-fixed sizes).
+    // - _tickTrajScratch: BuildLiveTrajectory scratch (30 floats). Same rule.
+    // P5: the per-tick _trajectoryPoints/_sampleTimes member copies are
+    // deleted (they were written every Tick but never read; RunQuery uses
+    // its params + _tickTrajectory). _snapshot itself is assigned field-wise
+    // only on change (Tick) so steady-state copies no native Strings.
+    String _queryTagsKey;
+    Array<String> _queryTagsCache;
+    String _queryExcludedKey;
+    Array<String> _queryExcludedCache;
+    String _queryExcludedJoin;
+    // P5 TryFastPath incumbent-check caches: SEPARATE keys from the RunQuery
+    // pair above on purpose. The fast path runs before RunQuery on the same
+    // tick; sharing one key would let the incumbent check consume the
+    // scope-change signal, so RunQuery would then see a false cache hit and
+    // skip the ActiveTag/ChooserStatus rebuild (stale chooser after a filter
+    // change or reset). Same bound + same change-only rule.
+    String _fastAllowedKey;
+    Array<String> _fastAllowedCache;
+    String _fastExcludedKey;
+    Array<String> _fastExcludedCache;
+    String _fastExcludedJoin;
+    Array<float> _poseScratch;
+    Array<float> _prevScratch;
+    Array<float> _tickTrajScratch;
 
     static float ClampF(float value, float minValue, float maxValue);
     static float MaxF(float a, float b);
@@ -311,6 +345,18 @@ private:
     static int32 HashTagSet(const String& tagSet);
     FastPathSignature CaptureFastPathSignature() const;
     static bool FastPathSignaturesDiffer(const FastPathSignature& a, const FastPathSignature& b);
+    // P5 change-only scope caches (shared by RunQuery/TryFastPath/record
+    // paths): Split/Join run only when the joined snapshot string changes.
+    // Returned references stay valid until the next scope change; callers
+    // must not hold them across a Tick that can change the scope.
+    const Array<String>& GetCachedAllowed();
+    const Array<String>& GetCachedExcluded();
+    const String& GetCachedExcludedJoin();
+    // P5 fast-path-only twins (see the member comment above): the incumbent
+    // eligibility check must never consume RunQuery's change signal.
+    const Array<String>& GetFastAllowed();
+    const Array<String>& GetFastExcluded();
+    const String& GetFastExcludedJoin();
     void NotifySearch();
     void EnsureSampleStarts();
     void RecordTrace(float speed, float yawRate, const Array<String>& tags,

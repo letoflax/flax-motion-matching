@@ -221,6 +221,40 @@ const Array<TrajectoryPoint>& MotionMatchingTrajectory::CalculateTrajectory(
     return _points;
 }
 
+void MotionMatchingTrajectory::UpdateTrajectory(
+    const Transform& currentTransform,
+    const Float3& currentVelocity,
+    const Float3& currentAcceleration,
+    const Float3& currentAngularVelocity,
+    const Float3& desiredVelocity,
+    const Quaternion& desiredRotation,
+    const Array<float>& sampleOffsets,
+    float positionHalflife,
+    float facingHalflife,
+    float deltaTime)
+{
+    CalculateTrajectory(currentTransform, currentVelocity, currentAcceleration,
+        currentAngularVelocity, desiredVelocity, desiredRotation,
+        sampleOffsets, positionHalflife, facingHalflife, deltaTime);
+}
+
+int32 MotionMatchingTrajectory::GetPredictedCount() const
+{
+    return _points.Count();
+}
+
+bool MotionMatchingTrajectory::GetPredictedPoint(int32 index, TrajectoryPoint& outPoint) const
+{
+    if (index < 0 || index >= _points.Count())
+    {
+        outPoint.Position = Float3::Zero;
+        outPoint.Facing = Float3::Forward;
+        return false;
+    }
+    outPoint = _points[index];
+    return true;
+}
+
 void MotionMatchingTrajectory::Reset(const Transform& transform)
 {
     _currentTime = 0.0f;

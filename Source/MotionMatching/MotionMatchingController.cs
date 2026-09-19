@@ -210,7 +210,30 @@ public class MotionMatchingController
     private MotionMatchingRuntimePolicy _policy;
     private bool _telemetryWarned;
 
-    public float[] TrajectorySampleTimes => Database?.TrajectorySampleTimes ?? Schema.TrajectorySampleTimes;
+    public float[] TrajectorySampleTimes
+    {
+        get
+        {
+            // P5: the Database getter is a native binding that allocates a
+            // managed float[] per call; the baked times never change under a
+            // loaded database in play, so cache the array and refresh only
+            // when the database reference changes. Callers (facade tick +
+            // Update, 2x per tick) share the instance; nobody mutates it.
+            // The null-database fallback (unbaked: the policy never ticks)
+            // reads live with no caching.
+            if (Database == null)
+                return Schema.TrajectorySampleTimes;
+            if (!ReferenceEquals(Database, _sampleTimesDb))
+            {
+                _sampleTimesDb = Database;
+                _sampleTimesCache = Database.TrajectorySampleTimes ?? Schema.TrajectorySampleTimes;
+            }
+            return _sampleTimesCache;
+        }
+    }
+
+    private MotionMatchingDatabase _sampleTimesDb;
+    private float[] _sampleTimesCache = Array.Empty<float>();
 
     public bool IsReady => _policy != null && _policy.IsReady;
 
@@ -236,6 +259,40 @@ public class MotionMatchingController
         if (playback == null)
             return false;
         locals = playback.GetSearchLocals() ?? System.Array.Empty<Matrix>();
+        winnerClip = _policy.WinnerClip;
+        winnerCost = _policy.WinnerCost;
+        return true;
+    }
+
+    /// <summary>
+    /// P5 zero-alloc base-pose read: copies the playback search locals into
+    /// the caller-owned buffer (no managed array allocation, unlike
+    /// TryGetBasePose which allocates via GetSearchLocals). The caller
+    /// reuses its buffer and resizes only when the bone count changes
+    /// (read it via Playback.GetSearchLocalsCount first). Bound: model bone
+    /// count (91 on the reference rig, callers cap at 512). Same snapshot
+    /// data as TryGetBasePose (post-inertial search pose); the native
+    /// history is never aliased with the caller buffer (per-bone copy).
+    /// Returns false (no copy) when the policy is not ready, the buffer is
+    /// null, or its length differs from the bone count.
+    /// </summary>
+    public bool TryGetBasePoseInto(Matrix[] buffer, out int winnerClip, out float winnerCost)
+    {
+        winnerClip = -1;
+        winnerCost = float.MaxValue;
+        if (_policy == null || !_policy.IsReady || buffer == null)
+            return false;
+        var playback = _policy.GetPlayback();
+        if (playback == null)
+            return false;
+        int n = playback.GetSearchLocalsCount();
+        if (n <= 0 || n > 512 || buffer.Length != n)
+            return false;
+        for (int i = 0; i < n; i++)
+        {
+            if (!playback.GetSearchLocal(i, out buffer[i]))
+                return false;
+        }
         winnerClip = _policy.WinnerClip;
         winnerCost = _policy.WinnerCost;
         return true;
