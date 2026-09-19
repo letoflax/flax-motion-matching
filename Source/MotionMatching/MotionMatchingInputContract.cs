@@ -57,37 +57,35 @@ public struct MotionMatchingInputContext
 
 /// <summary>
 /// Everything motion matching needs for one tick, produced in one call.
-/// Movement is copied straight into the native snapshot; scope strings are
-/// '+'-joined and split natively (the scripting marshaller cannot move
-/// Array-String struct fields across the boundary).
-/// P2: movement + trajectory + scope only. All gameplay decisions (gait
+/// P2: trajectory + scope + caller filter only. All gameplay decisions (gait
 /// roles, speed ceilings, yaw/direction thresholds, driver flags, overlay
-/// angles/gates) live game-side in the provider/snapshot and never cross
-/// into the core. Empty AllowedTagSet = explicit no-match.
+/// angles/gates, velocities, grounded/sprint) live game-side in the provider/
+/// selection policy and never cross into the core. The core executes
+/// Allowed/Excluded/LoopFilter/CandidateBand/QueryYawRate verbatim.
+/// Empty AllowedTagSet = explicit no-match.
 /// </summary>
 public struct MotionMatchingFrameInput
 {
-    // 1. Movement (snapshot movement block).
-    public Float3 Velocity;
-    public Float3 DesiredVelocity;
-    public Float3 Acceleration;
-    public Float3 AngularVelocity;
-    public float TargetYaw;
-    public float CurrentYaw;
-    public bool IsGrounded;
-    public bool IsSprinting;
-
-    // 2. Predicted trajectory, character-local, aligned 1:1 with the
+    // 1. Predicted trajectory, character-local, aligned 1:1 with the
     // sample times from the context. Empty/null = prediction failed;
     // the core skips the query exactly like today's trajError path.
     public TrajectoryPoint[] Points;
 
-    // 3. Scope: '+'-joined include/exclude tag sets decided provider-side.
+    // 2. Scope: '+'-joined include/exclude tag sets decided provider-side.
     // Empty AllowedTagSet = explicit no-match (hold current, never fall
     // back to any pool). The native legacy chooser is deleted, so every
     // query is provider-scoped.
     public string AllowedTagSet;
     public string ExcludedTagSet;
+
+    // 3. P2 caller filter (Game LocomotionSelectionPolicy output):
+    // LoopFilter mirrors MotionLoopFilter (0 Any, 1 LoopOnly, 2 OneShotOnly);
+    // CandidateBand mirrors BakedClipSpeedBand DB ids (0 Any, 1 Walk, 2 Run,
+    // 3 Sprint); QueryYawRate (rad/s, >= 0) scales the straightness prior.
+    // The core never infers these from movement.
+    public int LoopFilter;
+    public int CandidateBand;
+    public float QueryYawRate;
 }
 
 // P1: the P0 additive-only DTOs (MotionMatchingQueryFilter,

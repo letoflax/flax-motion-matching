@@ -101,23 +101,15 @@ public class MotionMatchingController
 
     public float SwitchMargin = 0.008f;
 
-    // foot-ik branch flip work: fair-fight intent accumulator trip level
-    // (u/s accumulated with 0.7/tick decay) and unbiased-scan latch window
-    // (seconds). A 45deg walk flip slews ~20u/s per tick and trips in 2-3
-    // ticks; steady-motion noise stays an order of magnitude below.
-    public float FairFightAccum = 40.0f;
-    public float FairFightWindow = 0.25f;
+    // foot-ik branch flip work: P2 DELETED (FairFightAccum/Window died with
+    // the native intent accumulator; the Game selection policy owns onset/
+    // fair-fight and passes only the resulting filter per tick). Values
+    // preserved Game-side in LocomotionSelectionConfig (40/0.25).
 
     // Heuristic thresholds below were hardcoded constants (codex review):
     // exposed live so tuning moves numbers instead of code. No rebake needed.
-    public float SettleToLoopDelay = 0.3f;
-
-    // Rest-loop preference (loops win ties at rest so one-shot breaks/stops
-    // cannot re-win forever on exact pose match). Rev-3 units: rest gaps run
-    // ~0.005-0.02 measured, so 0.02 settles rest without touching transitions
-    // (preference is zero unless restCalm). Raised from 0.005 after measured
-    // Idle_Break churn in suite phase 10.
-    public float RestLoopPreference = 0.02f;
+    // P2: SettleToLoopDelay died with the native settle branch (Game policy
+    // owns settle; value preserved Game-side in LocomotionSelectionConfig).
 
     public float SameClipExclusion = 0.25f;
 
@@ -135,6 +127,12 @@ public class MotionMatchingController
     // query) — hold current instead of cascading. Rev-3 units: legit switches
     // peak ~0.9 measured, so 2.0 keeps headroom without ever firing legally.
     public float CostFuseThreshold = 2.0f;
+
+    // P2 straightness prior (was hardcoded 0.03/4.0 in MotionMatchingSearch):
+    // Game-owned tuning, values preserved from the calibration. Recorded in
+    // the trace so brute-force, indexed and replay share one formula.
+    public float TurnPenaltyWeight = 0.03f;
+    public float TurnPenaltyYawScale = 4.0f;
 
     // Inertialization decay time (replaces linear-crossfade BlendDuration;
     // single path, no parallel blend modes).
@@ -234,114 +232,29 @@ public class MotionMatchingController
     }
 
     /// <summary>
-    /// P0 additive-only force-clip hatch for future game drivers. Forwards
-    /// to playback Play with forceSeek:true and logs the reason on EVERY
-    /// call (anti-abuse). P0 also records a structural "command" trace entry
-    /// (clip/time/reason, no feature vectors) so replay accounts for the
-    /// command. Record-only: policy/fast-path/continuity state sync stays
-    /// future P2 work (the command still bypasses them, as before).
-    /// No production callers yet.
+    /// P2 single authoritative force-clip hatch (the only hatch besides the
+    /// search-winner Plays inside the native RunQuery). Forwards to the
+    /// native policy ForcePlayClip, which synchronizes playback clip/time,
+    /// policy current clip/time, continuity baseline, fast-path
+    /// invalidation, inertial state, telemetry reason and the trace command
+    /// entry in one call. Search resumes immediately on the next tick with
+    /// the caller filter (no hold). Logs the reason on EVERY call.
+    /// No production callers yet (drivers use it when mm_drivers is set).
     /// </summary>
     public void ForcePlayClip(int clipIndex, float startTime, string reason)
     {
         string safeReason = reason ?? string.Empty;
         Debug.Log("MotionMatchingController.ForcePlayClip: clip=" + clipIndex
             + " startTime=" + startTime + " reason=" + safeReason);
-        var playback = Playback;
-        if (playback == null)
+        if (_policy == null || !_policy.IsReady)
             return;
-        playback.Play(clipIndex, startTime, true);
         try
         {
-            var trace = Trace;
-            if (trace != null && trace.Enabled)
-            {
-                // NOTE: C# new on a bound struct does NOT run the C++ member
-                // defaults, so every field below is pinned explicitly. Pose /
-                // Trajectory arrays are set to empty (a command carries no
-                // feature vectors) AND passed as the Record params, because
-                // struct Array fields do not round-trip C#->C++ by design.
-                // Booleans travel packed in TraceFlags (bits mirror
-                // TraceFlag_* in MotionMatchingTrace.h — Flax 1.12 bindings
-                // crash past 64 struct fields): bit4 = UseIndexedSearch,
-                // bit5 = VerifyIndexedSearch, bit6 = ExcludeNonLoopTail
-                // (runtime always applies it); all other bits are false for
-                // a command entry.
-                int traceFlags = 64;
-                if (UseIndexedSearch)
-                    traceFlags |= 16;
-                if (VerifyIndexedSearch)
-                    traceFlags |= 32;
-                var entry = new MotionMatchingTraceEntry
-                {
-                    Kind = "command",
-                    Time = Time.GameTime,
-                    State = PolicyState ?? string.Empty,
-                    Tags = ActiveTag ?? string.Empty,
-                    ExcludedTags = string.Empty,
-                    Speed = 0.0f,
-                    YawRate = 0.0f,
-                    Grounded = true,
-                    Sprinting = false,
-                    DesiredSpeed = 0.0f,
-                    Pose = Array.Empty<float>(),
-                    Trajectory = Array.Empty<float>(),
-                    PoseWeight = Schema.PoseWeight,
-                    TrajectoryWeight = Schema.TrajectoryWeight,
-                    ContinuityWeight = ContinuityWeight,
-                    MinSwitchTime = MinSwitchTime,
-                    CurrentTime = -1.0f,
-                    ExclusionWindow = SameClipExclusion,
-                    ExpectedTime = -1.0f,
-                    ContinuingBias = ContinuingBias,
-                    ContinuingWindow = ContinuingWindow,
-                    SwitchMargin = SwitchMargin,
-                    LoopPreference = 0.0f,
-                    LoopFilter = 0,
-                    ReselectClip = -1,
-                    ReselectSampleTime = 0.0f,
-                    ReselectBanWindow = 0.0f,
-                    TwinBanWindow = 0.0f,
-                    LoopTailExclusion = 0.0f,
-                    FootLockL = 0.0f,
-                    FootLockR = 0.0f,
-                    OneShotBand = 0,
-                    MaxCandidates = 0,
-                    QueryFrame = 0,
-                    TraceFlags = traceFlags,
-                    TopKCandidates = TopKCandidates,
-                    CostFuseThreshold = CostFuseThreshold,
-                    FrameDt = 0.0f,
-                    PlayRate = playback.PlayRate,
-                    DbClipCount = AnimationClipsCount,
-                    DbSampleCount = SampleCount,
-                    ContinuityClip = -1,
-                    SinceSwitch = 999.0f,
-                    RetryKind = 0,
-                    Recovered = false,
-                    Valid = false,
-                    ClipIndex = -1,
-                    SampleIndex = -1,
-                    SampleTime = 0.0f,
-                    Cost = float.MaxValue,
-                    PoseCost = float.MaxValue,
-                    TrajectoryCost = float.MaxValue,
-                    ContinuityCost = 0.0f,
-                    LoopCost = 0.0f,
-                    SecondBestCost = float.MaxValue,
-                    FastThreshold = float.MaxValue,
-                    CommandClip = clipIndex,
-                    CommandTime = startTime,
-                    Reason = safeReason,
-                    Chooser = ChooserStatus ?? string.Empty,
-                    QueryMs = 0.0f,
-                };
-                trace.Record(entry, Array.Empty<float>(), Array.Empty<float>());
-            }
+            _policy.ForcePlayClip(clipIndex, startTime, safeReason);
         }
         catch
         {
-            // Trace record must never break the force-clip command itself.
+            // The force-clip command itself must never throw to drivers.
         }
     }
 
@@ -426,15 +339,12 @@ public class MotionMatchingController
             Debug.LogWarning("Motion matching telemetry/trace is ACTIVE (debug-only: per-query clones + file logging). Turn off TelemetryLog for shipping builds.");
         }
 
+        // P2: the snapshot carries the caller scope only (movement fields
+        // died with the native gameplay state). LoopFilter/CandidateBand/
+        // YawRate ride explicit Tick params (never inferred); the core uses
+        // them verbatim. No new native struct field (bindings cap 64).
         var snapshot = new MotionMatchingPlayerSnapshot
         {
-            CurrentVelocity = input.Velocity,
-            DesiredVelocity = input.DesiredVelocity,
-            AngularVelocity = input.AngularVelocity,
-            TargetYaw = input.TargetYaw,
-            CurrentYaw = input.CurrentYaw,
-            IsGrounded = input.IsGrounded,
-            IsSprinting = input.IsSprinting,
             AllowedTagSet = input.AllowedTagSet ?? string.Empty,
             ExcludedTagSet = input.ExcludedTagSet ?? string.Empty,
         };
@@ -443,16 +353,12 @@ public class MotionMatchingController
             PoseWeight = Schema.PoseWeight,
             TrajectoryWeight = Schema.TrajectoryWeight,
             SampleRate = Schema.SampleRate,
-            FairFightAccum = FairFightAccum,
-            FairFightWindow = FairFightWindow,
-            SettleToLoopDelay = SettleToLoopDelay,
             MinSwitchTime = MinSwitchTime,
             SameClipExclusion = SameClipExclusion,
             SameClipSeekThreshold = SameClipSeekThreshold,
             ContinuingBias = ContinuingBias,
             ContinuingWindow = ContinuingWindow,
             SwitchMargin = SwitchMargin,
-            RestLoopPreference = RestLoopPreference,
             FrameSearchBudget = FrameSearchBudget,
             SearchEveryFrame = SearchEveryFrame,
             QueryInterval = QueryInterval,
@@ -463,10 +369,16 @@ public class MotionMatchingController
             EffectiveTelemetry = EffectiveTelemetry,
             ContinuityWeight = ContinuityWeight,
             CostFuseThreshold = CostFuseThreshold,
+            TurnPenaltyWeight = TurnPenaltyWeight,
+            TurnPenaltyYawScale = TurnPenaltyYawScale,
         };
+        int callerLoop = input.LoopFilter >= 0 && input.LoopFilter <= 2 ? input.LoopFilter : 0;
+        int callerBand = input.CandidateBand >= 0 && input.CandidateBand <= 3 ? input.CandidateBand : 0;
+        float callerYaw = input.QueryYawRate >= 0.0f && input.QueryYawRate < 1e29f ? input.QueryYawRate : 0.0f;
         _policy.Tick(deltaTime, snapshot,
             input.Points ?? Array.Empty<TrajectoryPoint>(),
-            actorWorld.GetWorld(), TrajectorySampleTimes, tuning);
+            actorWorld.GetWorld(), TrajectorySampleTimes, tuning,
+            callerLoop, callerBand, callerYaw);
 
         PolicyState = _policy.PolicyState;
         WinnerSample = _policy.WinnerSample;

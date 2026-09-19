@@ -264,6 +264,10 @@ bool MotionMatchingTraceLog::ExportJson(const String& path, String& error)
         sb.Append(e.CommandClip);
         sb.Append(",\"cmdtime\":");
         FormatFloat(sb, e.CommandTime);
+        sb.Append(",\"tpw\":");
+        FormatFloat(sb, e.TurnPenaltyWeight);
+        sb.Append(",\"tpscale\":");
+        FormatFloat(sb, e.TurnPenaltyYawScale);
         sb.Append("}\n");
     }
     String text;
@@ -501,6 +505,18 @@ bool MotionMatchingTraceLog::ParseEntry(const String& line, MotionMatchingTraceE
         entry.FastThreshold = GetFloat(text, length, "\"fthresh\":");
         entry.CommandClip = (int32)GetFloat(text, length, "\"cmdclip\":");
         entry.CommandTime = GetFloat(text, length, "\"cmdtime\":");
+        // P2 turn-prior tuning: missing keys (pre-P2 traces) fall back to
+        // the preserved 0.03/4.0 calibration so old files still import.
+        if (FindKey(text, length, "\"tpw\":") >= 0)
+        {
+            entry.TurnPenaltyWeight = GetFloat(text, length, "\"tpw\":");
+            entry.TurnPenaltyYawScale = GetFloat(text, length, "\"tpscale\":");
+        }
+        else
+        {
+            entry.TurnPenaltyWeight = 0.03f;
+            entry.TurnPenaltyYawScale = 4.0f;
+        }
     }
     // "search" needs feature vectors to re-run FindBest; "fastpath" needs
     // them to re-run SampleCost. "command"/"reset" are structural (no
@@ -830,6 +846,8 @@ bool MotionMatchingTraceLog::VerifyReplay(MotionMatchingDatabase* database, int3
             settings.TopKCandidates = e.TopKCandidates > 0 ? e.TopKCandidates : 32;
             settings.VerifyIndexedSearch = (e.TraceFlags & TraceFlag_VerifyIndexedSearch) != 0;
             settings.QueryYawRate = e.YawRate;
+            settings.TurnPenaltyWeight = e.TurnPenaltyWeight;
+            settings.TurnPenaltyYawScale = e.TurnPenaltyYawScale;
             if (!e.ExcludedTags.IsEmpty())
                 settings.ExcludeTags = MotionMatchingDatabase::SplitTagSet(e.ExcludedTags);
             MotionMatchingResult result;
@@ -894,12 +912,14 @@ bool MotionMatchingTraceLog::VerifyReplay(MotionMatchingDatabase* database, int3
         else if (e.Kind == kindFast)
         {
             // Continuation hold: re-score the recorded sample with the
-            // recorded weights and require the recorded cost (text
-            // round-trip tolerance) plus the recorded threshold to hold.
+            // recorded weights (incl. the P2 turn-prior tuning) and require
+            // the recorded cost (text round-trip tolerance) plus the recorded
+            // threshold to hold.
             float cost = 0.0f;
             String sampleError;
             const bool ok = MotionMatchingSearch::SampleCost(database, e.Pose, e.Trajectory,
-                e.SampleIndex, e.PoseWeight, e.TrajectoryWeight, e.YawRate, true, cost, sampleError);
+                e.SampleIndex, e.PoseWeight, e.TrajectoryWeight, e.YawRate, true,
+                e.TurnPenaltyWeight, e.TurnPenaltyYawScale, cost, sampleError);
             fastChecked++;
             bool costOk = ok && sampleError.IsEmpty() &&
                 fabsf(cost - e.Cost) <= 0.001f * fmaxf(1.0f, fabsf(e.Cost));

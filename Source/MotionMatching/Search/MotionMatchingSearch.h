@@ -66,6 +66,8 @@ public:
     /// weights plus the straightness prior, no continuity/loop terms). The
     /// policy scores the expected next sample of the playing clip every tick
     /// and skips the full scan while it stays within threshold.
+    /// P2: turn prior weights ride explicit params (Game tuning, trace-
+    /// recorded); callers pass them verbatim, never literals.
     /// </summary>
     /// <returns>False with an actionable error on bad database, sizes or index.</returns>
     API_FUNCTION()
@@ -78,6 +80,8 @@ public:
         float trajectoryWeight,
         float queryYawRate,
         bool applyTurnPenalty,
+        float turnPenaltyWeight,
+        float turnPenaltyYawScale,
         API_PARAM(Out) float& cost,
         API_PARAM(Out) String& error);
 

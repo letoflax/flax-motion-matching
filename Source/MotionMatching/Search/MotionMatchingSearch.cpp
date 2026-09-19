@@ -19,30 +19,30 @@ namespace
     constexpr float MinimumStandardDeviation = 0.000001f;
     constexpr float SelfTestMaxCost = 0.0001f;
 
-    // Straightness prior (fixed structural calibration, NOT live knobs):
-    // penalty = |clipTurnAngle| * Weight / (1 + yawRate * YawScale).
-    // Calibrated from an observed steal (Reface_180 won at cost 9.3 while
-    // moving straight): 180deg -> +9.4 straight, ~+1.0 while turning hard
-    // (2 rad/s). Fixed so replay stays deterministic with zero unrecorded
-    // inputs; QueryYawRate rides the per-query settings (replay-safe).
+    // Straightness prior (P2: Game-owned tuning via settings, values preserved
+    // from the 0.03/4.0 calibration): penalty = |clipTurnAngle| * Weight /
+    // (1 + yawRate * YawScale). Recorded in the trace; brute-force, indexed
+    // and replay share this one definition.
     // Phase 2 UE-parity verdict (measured): grouped L/R normalization did
-    // NOT retire this � with weight 0, turn one-shots flood steady strafe/
+    // NOT retire this — with weight 0, turn one-shots flood steady strafe/
     // diagonal phases (suite 2/12 vs 5-6/12). The penalty is load-bearing
     // for pool purity beyond asymmetry compensation, so it stays (rescaled
     // to rev-3 cost units below: same ratio against typical dissimilarity).
     // (Attempt 1 of the penalty-0 retune failed cleanly; code path kept.)
     // Rev-3 scale (N1b shrank dissimilarity ~100x, measured mean 0.095):
-    // 180deg -> +0.094 straight � same blocking ratio as the old +9.4.
-    constexpr float TurnPenaltyWeight = 0.03f;
-    constexpr float TurnPenaltyYawScale = 4.0f;
+    // 180deg -> +0.094 straight — same blocking ratio as the old +9.4.
 
     // Straightness prior, SINGLE definition shared by the hot loop, the
     // bit-exact verifier and the test gate below. Always >= 0 (fabs), so
     // block pruning stays valid with no extra headroom anywhere it is used.
-    float TurnPenalty(float clipAngle, float queryYawRate)
+    // P2: weight/scale ride the per-query settings (Game tuning, trace-
+    // recorded); callers pass settings fields verbatim, never literals.
+    float TurnPenalty(float clipAngle, float queryYawRate, float weight, float yawScale)
     {
         const float a = clipAngle >= 0.0f ? clipAngle : -clipAngle;
-        return a * TurnPenaltyWeight / (1.0f + Math::Max(queryYawRate, 0.0f) * TurnPenaltyYawScale);
+        const float w = weight >= 0.0f ? weight : 0.0f;
+        const float s = yawScale >= 0.0f ? yawScale : 0.0f;
+        return a * w / (1.0f + Math::Max(queryYawRate, 0.0f) * s);
     }
 
     // Foot-lock prior (Wave feet): a firmly pinned foot must not trade for
@@ -574,8 +574,9 @@ namespace
         float continuityCost = ContinuityTerm(
             continuityApplies, clipIndex != currentClipIndex, isContinuation,
             continuityWeight, bias);
-        if (applyTurnPenalty && TurnPenaltyWeight > 0.0f)
-            continuityCost += TurnPenalty(database.GetClipTurnAngle(clipIndex), settings.QueryYawRate);
+        if (applyTurnPenalty && settings.TurnPenaltyWeight > 0.0f)
+            continuityCost += TurnPenalty(database.GetClipTurnAngle(clipIndex), settings.QueryYawRate,
+                settings.TurnPenaltyWeight, settings.TurnPenaltyYawScale);
         continuityCost += FootLockCost(database, bakedPose, poseFeatureSize, settings);
         const float loopCost = LoopPreferenceTerm(database.GetClipLoop(clipIndex), loopPreference);
         return poseCost + trajectoryCost + continuityCost + loopCost;
@@ -960,8 +961,9 @@ namespace
             float continuityCost = ContinuityTerm(
                 continuityApplies, clipIndex != currentClipIndex, isContinuation,
                 continuityWeight, bias);
-            if (TurnPenaltyWeight > 0.0f)
-                continuityCost += TurnPenalty(cachedTurnAngle, settings.QueryYawRate);
+            if (settings.TurnPenaltyWeight > 0.0f)
+                continuityCost += TurnPenalty(cachedTurnAngle, settings.QueryYawRate,
+                    settings.TurnPenaltyWeight, settings.TurnPenaltyYawScale);
             continuityCost += FootLockCost(database, bakedPose, poseFeatureSize, settings);
             // Rest-loop bonus lives in its own telemetry block (a loop clip at
             // rest outranks one-shot end stances structurally, not via continuity).
@@ -970,7 +972,7 @@ namespace
 
             // Class COUNTS only: how many members of each class survived
             // pruning to full scoring. The best-per-class VALUES come from
-            // ComputeClassBests (unpruned full scan below) � a pruned member's
+            // ComputeClassBests (unpruned full scan below) — a pruned member's
             // true cost is unknowable here, so this loop must not report minima.
             if (cachedLoopFlag)
                 loopScoredCount++;
@@ -1386,8 +1388,9 @@ namespace
             float continuityCost = ContinuityTerm(
                 continuityApplies, clipIndex != currentClipIndex, isContinuation,
                 continuityWeight, bias);
-            if (TurnPenaltyWeight > 0.0f)
-                continuityCost += TurnPenalty(cachedTurnAngle, settings.QueryYawRate);
+            if (settings.TurnPenaltyWeight > 0.0f)
+                continuityCost += TurnPenalty(cachedTurnAngle, settings.QueryYawRate,
+                    settings.TurnPenaltyWeight, settings.TurnPenaltyYawScale);
             continuityCost += FootLockCost(database, bakedPose, poseFeatureSize, settings);
             const float loopCost = LoopPreferenceTerm(cachedLoopFlag, loopPreference);
             const float cost = poseCost + trajectoryCost + continuityCost + loopCost;
@@ -1651,8 +1654,9 @@ void MotionMatchingSearch::FindTopCandidates(
         float continuityCost = ContinuityTerm(
             continuityApplies, clipIndex != currentClipIndex, isContinuation,
             continuityWeight, bias);
-        if (TurnPenaltyWeight > 0.0f)
-            continuityCost += TurnPenalty(cachedTurnAngle, settings.QueryYawRate);
+        if (settings.TurnPenaltyWeight > 0.0f)
+            continuityCost += TurnPenalty(cachedTurnAngle, settings.QueryYawRate,
+                settings.TurnPenaltyWeight, settings.TurnPenaltyYawScale);
         continuityCost += FootLockCost(*database, bakedPose, poseFeatureSize, settings);
         const float loopCost = LoopPreferenceTerm(cachedLoopFlag, loopPreference);
         const float cost = poseCost + trajectoryCost + continuityCost + loopCost;
@@ -1891,6 +1895,8 @@ bool MotionMatchingSearch::SampleCost(
     float trajectoryWeight,
     float queryYawRate,
     bool applyTurnPenalty,
+    float turnPenaltyWeight,
+    float turnPenaltyYawScale,
     float& cost,
     String& error)
 {
@@ -1937,10 +1943,13 @@ bool MotionMatchingSearch::SampleCost(
     // S1 term parity: the fast-path estimate uses the same FullSampleCost term
     // definitions as the hot pass, with no playback context (continuity/loop/
     // foot disabled exactly as before: raw pose + trajectory + straightness).
+    // P2: turn prior weights ride explicit params (trace-recorded tuning).
     MotionMatchingSearchSettings costSettings;
     costSettings.PoseWeight = poseWeight;
     costSettings.TrajectoryWeight = trajectoryWeight;
     costSettings.QueryYawRate = queryYawRate;
+    costSettings.TurnPenaltyWeight = turnPenaltyWeight;
+    costSettings.TurnPenaltyYawScale = turnPenaltyYawScale;
     costSettings.ContinuityWeight = 0.0f;
     costSettings.CurrentTime = -1.0f;
     costSettings.ExpectedTime = -1.0f;
@@ -2049,7 +2058,8 @@ bool MotionMatchingSearch::RunSelfTest(
     {
         tested++;
         const int32 sourceClip = (source >= 0 && source < sampleClipIndices.Count()) ? sampleClipIndices[source] : -1;
-        const float sourcePenalty = TurnPenalty(database->GetClipTurnAngle(sourceClip), settings.QueryYawRate);
+        const float sourcePenalty = TurnPenalty(database->GetClipTurnAngle(sourceClip), settings.QueryYawRate,
+            settings.TurnPenaltyWeight, settings.TurnPenaltyYawScale);
         if (!error.IsEmpty() || !result.IsValid || result.Cost > sourcePenalty + SelfTestMaxCost)
         {
             log += String::Format(

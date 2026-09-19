@@ -16,21 +16,17 @@ class AnimatedModel;
 class MotionMatchingDatabase;
 
 /// <summary>
-/// Per-tick movement snapshot for the policy (plain data, supplied by the
-/// C# input provider). Only the fields the policy reads are mirrored.
+/// Per-tick caller scope for the policy (plain data, supplied by the Game
+/// selection policy through the C# frame). P2: the core executes the caller
+/// filter verbatim — it never infers locomotion, gait, intent, rest, or
+/// airborne meaning. Movement/velocity/yaw/grounded/sprint fields died here:
+/// the Game computes the trajectory before the call and owns all gameplay
+/// interpretation. Only the tag scope crosses.
 /// </summary>
 API_STRUCT(Namespace="MotionMatching")
 struct MOTIONMATCHING_API MotionMatchingPlayerSnapshot
 {
     DECLARE_SCRIPTING_TYPE_MINIMAL(MotionMatchingPlayerSnapshot);
-
-    API_FIELD() Float3 CurrentVelocity = Float3::Zero;
-    API_FIELD() Float3 DesiredVelocity = Float3::Zero;
-    API_FIELD() Float3 AngularVelocity = Float3::Zero;
-    API_FIELD() float TargetYaw = 0.0f;
-    API_FIELD() float CurrentYaw = 0.0f;
-    API_FIELD() bool IsGrounded = false;
-    API_FIELD() bool IsSprinting = false;
 
     /// <summary>
     /// Provider-decided tag scope, '+'-joined (e.g. "run+turn_travel").
@@ -49,8 +45,13 @@ struct MOTIONMATCHING_API MotionMatchingPlayerSnapshot
 };
 
 /// <summary>
-/// Live tunables pushed by the C# controller every tick (plain data). Lets
-/// the C++ policy read scene tuning without referencing the C# controller.
+/// Live tunables pushed by the C# controller every tick (plain data). P2:
+/// neutral search/playback tuning only (weights, budgets, anti-flicker,
+/// straightness prior). Gameplay intent/settle/rest fields died here
+/// (FairFightAccum/Window, SettleToLoopDelay, RestLoopPreference): the Game
+/// selection policy owns onset/fair-fight/settle/rest and passes only the
+/// resulting LoopFilter/CandidateBand per tick (Tick params, never inferred).
+/// Values preserved; only the owner moved.
 /// </summary>
 API_STRUCT(Namespace="MotionMatching")
 struct MOTIONMATCHING_API MotionMatchingPolicyTuning
@@ -60,16 +61,12 @@ struct MOTIONMATCHING_API MotionMatchingPolicyTuning
     API_FIELD() float PoseWeight = 1.0f;
     API_FIELD() float TrajectoryWeight = 2.0f;
     API_FIELD() float SampleRate = 30.0f;
-    API_FIELD() float FairFightAccum = 40.0f;
-    API_FIELD() float FairFightWindow = 0.25f;
-    API_FIELD() float SettleToLoopDelay = 0.3f;
     API_FIELD() float MinSwitchTime = 0.12f;
     API_FIELD() float SameClipExclusion = 0.25f;
     API_FIELD() float SameClipSeekThreshold = 0.25f;
     API_FIELD() float ContinuingBias = 0.012f;
     API_FIELD() float ContinuingWindow = 0.15f;
     API_FIELD() float SwitchMargin = 0.008f;
-    API_FIELD() float RestLoopPreference = 0.02f;
     API_FIELD() int32 FrameSearchBudget = 12000;
     API_FIELD() bool SearchEveryFrame = true;
     API_FIELD() float QueryInterval = 0.1f;
@@ -80,6 +77,8 @@ struct MOTIONMATCHING_API MotionMatchingPolicyTuning
     API_FIELD() bool EffectiveTelemetry = false;
     API_FIELD() float ContinuityWeight = 0.0025f;
     API_FIELD() float CostFuseThreshold = 2.0f;
+    API_FIELD() float TurnPenaltyWeight = 0.03f;
+    API_FIELD() float TurnPenaltyYawScale = 4.0f;
 
 };
 
@@ -164,19 +163,29 @@ public:
         const Array<TrajectoryPoint>& trajectoryPoints,
         const Matrix& actorWorld,
         const Array<float>& trajectorySampleTimes,
-        const MotionMatchingPolicyTuning& tuning);
+        const MotionMatchingPolicyTuning& tuning,
+        int32 callerLoopFilter,
+        int32 callerCandidateBand,
+        float callerYawRate);
     API_FUNCTION() MotionMatchingPlayback* GetPlayback();
     API_FUNCTION() MotionMatchingTraceLog* GetTrace();
     API_FUNCTION() MotionMatchingTraceEntry GetLastEntry() const;
+    /// <summary>
+    /// P2 single authoritative force-clip path (the only hatch besides the
+    /// search-winner Plays inside RunQuery). Synchronizes playback clip/time,
+    /// policy current clip/time, continuity baseline, fast-path invalidation,
+    /// inertial state (via Play), telemetry reason and trace command entry.
+    /// Search resumes immediately on the next tick with the caller filter.
+    /// </summary>
+    API_FUNCTION() void ForcePlayClip(int32 clipIndex, float startTime, const String& reason);
 
 private:
     struct FastPathSignature
     {
-        int32 Speed = 0;
-        int32 IntentX = 0;
-        int32 IntentZ = 0;
-        int32 YawRate = 0;
-        int32 Contacts = 0;
+        int32 AllowedHash = 0;
+        int32 ExcludedHash = 0;
+        int32 LoopFilter = 0;
+        int32 CandidateBand = 0;
         int32 Clip = -1;
         int32 ClipTime = 0;
         int32 DatabaseId = 0;
@@ -214,15 +223,10 @@ private:
     Array<int32> _clipSampleStarts;
     bool _hasSampleStarts = false;
 
-    bool _tickOneshotWindow = false;
-    bool _tickFairFight = false;
-    float _intentAccum = 0.0f;
-    float _fairFightUntil = -99.0f;
     float _queryTimer = 0.0f;
     float _timeSinceSwitch = 999.0f;
     float _timeSinceInit = 0.0f;
     int32 _currentClip = -1;
-    bool _wasAirborne = false;
     bool _hasLastActorPos = false;
     Float3 _lastActorPos = Float3::Zero;
     bool _warnedOnce = false;
@@ -230,15 +234,18 @@ private:
 
     bool _chooserReseed = false;
 
+    // P2 caller filter (Game selection policy output, Tick params): the ONLY
+    // LoopFilter/CandidateBand/YawRate the core uses. Never inferred.
+    int32 _callerLoopFilter = 0;
+    int32 _callerCandidateBand = 0;
+    float _callerYawRate = 0.0f;
+
     Array<float> _clipTravel;
     Array<float> _clipTurnAngle;
     Array<float> _clipNet;
     Array<Array<String>> _clipTags;
 
     float _lastSpikeWarn = -99.0f;
-    Float3 _prevDesVel = Float3::Zero;
-    float _prevDesSpeed = 0.0f;
-    float _oneshotUntil = -99.0f;
     int32 _reselectClip = -1;
     float _reselectSampleTime = 0.0f;
     float _reselectStartTime = -99.0f;
@@ -263,13 +270,12 @@ private:
     void CheckSchemaBinding();
     static bool AxesNear(const Float3& a, const Float3& b);
     static bool TimesEqual(const Array<float>& a, const Array<float>& b);
-    void UpdateIntentSignals();
-    int32 BandFromSpeed(float speed) const;
     void RecordPolicyEvent(const char* kind, int32 clipIndex, const String& reason);
     void RunQuery(const Array<TrajectoryPoint>& trajectoryPoints, const Matrix& actorWorld, float frameDt);
     bool TryFastPath(float frameDt);
     bool MissFastPath(const char* reason);
     static int32 Quantize(float value, float step);
+    static int32 HashTagSet(const String& tagSet);
     FastPathSignature CaptureFastPathSignature() const;
     static bool FastPathSignaturesDiffer(const FastPathSignature& a, const FastPathSignature& b);
     void NotifySearch();

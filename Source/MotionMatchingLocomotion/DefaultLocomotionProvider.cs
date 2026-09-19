@@ -131,23 +131,22 @@ public class DefaultLocomotionProvider : Script, IMotionMatchingInputProvider
         ValidateInventory(ctx.DatabaseTags);
         string scope = ComputeTagScope(ctx);
 
-        frame.Velocity = _snap.CurrentVelocity;
-        frame.DesiredVelocity = _snap.DesiredVelocity;
-        frame.Acceleration = _snap.Acceleration;
-        frame.AngularVelocity = _snap.AngularVelocity;
-        frame.TargetYaw = _snap.TargetYaw;
-        frame.CurrentYaw = _snap.CurrentYaw;
-        frame.IsGrounded = _snap.IsGrounded;
-        frame.IsSprinting = _snap.IsSprinting;
         frame.Points = _points;
-        // P2: scope only. Roles/speeds/thresholds/drivers/overlay inputs
-        // died with the core machines: the provider keeps them as game-side
-        // config for its own scope decision above, but nothing crosses into
-        // the core anymore besides movement + trajectory + scope.
+        // P2: scope + caller yaw only. Roles/speeds/thresholds/drivers/overlay
+        // inputs died with the core machines: the provider keeps them as
+        // game-side config for its own scope decision above, but nothing
+        // crosses into the core anymore besides trajectory + scope + caller
+        // filter. LoopFilter/CandidateBand default Any (the Game selection
+        // policy overwrites them per tick in the facade); QueryYawRate rides
+        // the snapshot yaw verbatim for the turn prior (Game owns the meaning).
         frame.AllowedTagSet = scope ?? string.Empty;
         frame.ExcludedTagSet = string.IsNullOrWhiteSpace(GameplayExclude)
             ? string.Empty
             : GameplayExclude.Trim().ToLowerInvariant();
+        frame.LoopFilter = 0;
+        frame.CandidateBand = 0;
+        float yaw = _snap.AngularVelocity.Y;
+        frame.QueryYawRate = yaw >= 0.0f ? yaw : -yaw;
         return frame;
     }
 
@@ -170,8 +169,10 @@ public class DefaultLocomotionProvider : Script, IMotionMatchingInputProvider
     private MotionMatchingFrameInput BuildIdleFrame(MotionMatchingInputContext ctx)
     {
         var frame = new MotionMatchingFrameInput();
-        frame.IsGrounded = true;
         frame.Points = Array.Empty<TrajectoryPoint>();
+        frame.LoopFilter = 0;
+        frame.CandidateBand = 0;
+        frame.QueryYawRate = 0.0f;
         string rest = RestBandTag();
         if (string.IsNullOrEmpty(rest))
         {

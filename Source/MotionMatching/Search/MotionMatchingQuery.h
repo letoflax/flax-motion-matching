@@ -149,11 +149,21 @@ struct MOTIONMATCHING_API MotionMatchingSearchSettings
     API_FIELD() bool ExcludeNonLoopTail = true;
 
     /// <summary>
-    /// Body yaw rate (rad/s) at query time. Drives the straightness prior:
-    /// turning clips pay by measured angle unless the body really rotates.
-    /// Reconstructed from trace yaw on replay, so determinism is preserved.
+    /// Body yaw rate (rad/s) at query time. Caller-provided (Game owns yaw
+    /// meaning): drives the straightness prior below. Reconstructed from
+    /// trace yaw on replay, so determinism is preserved.
     /// </summary>
     API_FIELD() float QueryYawRate = 0.0f;
+
+    /// <summary>
+    /// P2 straightness prior (was hardcoded 0.03/4.0 in MotionMatchingSearch):
+    /// penalty = |clipTurnAngle| * TurnPenaltyWeight /
+    /// (1 + QueryYawRate * TurnPenaltyYawScale). Game-owned tuning (values
+    /// preserved from the hardcoded calibration); recorded in the trace so
+    /// brute-force, indexed and replay share one formula.
+    /// </summary>
+    API_FIELD() float TurnPenaltyWeight = 0.03f;
+    API_FIELD() float TurnPenaltyYawScale = 4.0f;
 
     /// <summary>
     /// Foot-lock prior weights (0..1, playback pin weights): a firmly locked

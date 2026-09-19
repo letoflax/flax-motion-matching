@@ -15,7 +15,8 @@ class MotionMatchingDatabase;
 // GenerateCpp). The nine boolean request flags below therefore travel as
 // ONE int32 bitmask; the JSON exporter still expands them to named keys so
 // tools never see the packing. Keep the TOTAL instance field count of
-// MotionMatchingTraceEntry at or below 64 (currently 61).
+// MotionMatchingTraceEntry at or below 64 (currently 63: 61 + 2 P2 turn-prior
+// tuning fields).
 constexpr int32 TraceFlag_ForcedEdge = 1 << 0;
 constexpr int32 TraceFlag_Reseeded = 1 << 1;
 constexpr int32 TraceFlag_FairFight = 1 << 2;
@@ -131,6 +132,11 @@ struct MOTIONMATCHING_API MotionMatchingTraceEntry
     // Command/reset entries: requested clip/time (structural check).
     API_FIELD() int32 CommandClip = -1;
     API_FIELD() float CommandTime = 0.0f;
+    // P2 straightness prior tuning actually applied (Game-owned values,
+    // preserved from the 0.03/4.0 calibration). Recorded so brute-force,
+    // indexed and replay share one formula.
+    API_FIELD() float TurnPenaltyWeight = 0.03f;
+    API_FIELD() float TurnPenaltyYawScale = 4.0f;
 };
 
 /// <summary>

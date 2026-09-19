@@ -30,9 +30,10 @@ public class MMContractTestProvider : IMotionMatchingInputProvider
 /// Runtime-contract tests (P2 boundary locks, P3 re-anchored): explicit-empty
 /// no-match, provider scope respected, reset-then-soak stays usable, per-frame
 /// source swap takes effect, input free of gameplay fields (compile-level),
-/// pose-out equals the internal search locals, force-hatch effect, and pure
-/// search with no machine direct-plays. E1/E2 driver locks are deleted with
-/// the native machines.
+/// pose-out equals the internal search locals, force-hatch effect, pure
+/// search with no machine direct-plays, and P2 filter-change-mid-clip
+/// fast-path invalidation (+ LoopFilter flip). E1/E2 driver locks are deleted
+/// with the native machines.
 ///
 /// P3: all checks run through the plain runtime object (Update with canned
 /// frames + an identity world transform), never through provider slots or
@@ -45,10 +46,12 @@ public static class MMContractTest
     private const float Dt = 1.0f / 60.0f;
 
     // Field names that must NOT exist on the P2 frame (gameplay lives
-    // game-side; the core takes movement + trajectory + scope only).
+    // game-side; the core takes trajectory + scope + caller filter only).
     private static readonly string[] DeadFrameFields = new string[]
     {
         "HasScope",
+        "Velocity", "DesiredVelocity", "Acceleration", "AngularVelocity",
+        "TargetYaw", "CurrentYaw", "IsGrounded", "IsSprinting",
         "JumpTag", "TurnInPlaceTag", "TurnTravelTag", "RestTag",
         "RestSpeedMax", "JumpWalkSpeedMax", "JumpRunSpeedMax",
         "YawRateThreshold", "TagConfirmRepeats",
@@ -231,6 +234,32 @@ public static class MMContractTest
                 "reason='" + reason + "' chooser='" + controller.ChooserStatus + "'");
         }
 
+        // 9: P2 filter-change-mid-clip invalidates the fast-path: soak idle
+        // until the continuation holds, then change the scope to walk at
+        // constant input. The core must NOT hold the stale idle clip — the
+        // chooser must adopt the new filter within the soak window.
+        {
+            var idle = NewCanned("idle", string.Empty);
+            var walk = NewCanned("walk", string.Empty);
+            controller.ResetPlayback();
+            TickProvider(controller, idle, 120);
+            string before = controller.ActiveTag ?? string.Empty;
+            TickProvider(controller, walk, 120);
+            string after = controller.ActiveTag ?? string.Empty;
+            bool ok = before == "idle" && after == "walk";
+            Check("filter-change-invalidates-fastpath", ok,
+                "before='" + before + "' after='" + after + "'");
+            // Same-scope LoopFilter flip must also take effect (Any -> LoopOnly
+            // on the idle scope keeps idle loops; the recorded filter rides
+            // the trace for replay).
+            var idleLoopOnly = NewCannedFiltered("idle", string.Empty, 1, 0);
+            TickProvider(controller, idleLoopOnly, 60);
+            bool loopOk = (controller.ActiveTag ?? string.Empty) == "idle";
+            Check("loopfilter-change-takes-effect", loopOk,
+                "tag='" + controller.ActiveTag + "' chooser='" + controller.ChooserStatus + "'");
+            controller.ResetPlayback();
+        }
+
         controller.ResetPlayback();
 
         string verdict = passed == total ? "CONTRACT PASS" : "CONTRACT FAIL";
@@ -239,7 +268,12 @@ public static class MMContractTest
 
     private static MMContractTestProvider NewCanned(string allowed, string excluded)
     {
-        return new MMContractTestProvider { FrameToReturn = CannedFrame(allowed, excluded) };
+        return new MMContractTestProvider { FrameToReturn = CannedFrame(allowed, excluded, 0, 0) };
+    }
+
+    private static MMContractTestProvider NewCannedFiltered(string allowed, string excluded, int loop, int band)
+    {
+        return new MMContractTestProvider { FrameToReturn = CannedFrame(allowed, excluded, loop, band) };
     }
 
     private static void TickProvider(MotionMatchingController controller, MMContractTestProvider prov, int n)
@@ -259,22 +293,17 @@ public static class MMContractTest
         }
     }
 
-    private static MotionMatchingFrameInput CannedFrame(string allowed, string excluded)
+    private static MotionMatchingFrameInput CannedFrame(string allowed, string excluded, int loop, int band)
     {
-        // P2 slim frame: movement + trajectory + scope only.
+        // P2 slim frame: trajectory + scope + caller filter only.
         return new MotionMatchingFrameInput
         {
-            Velocity = Float3.Zero,
-            DesiredVelocity = Float3.Zero,
-            Acceleration = Float3.Zero,
-            AngularVelocity = Float3.Zero,
-            TargetYaw = 0.0f,
-            CurrentYaw = 0.0f,
-            IsGrounded = true,
-            IsSprinting = false,
             Points = new TrajectoryPoint[6],
             AllowedTagSet = allowed ?? string.Empty,
             ExcludedTagSet = excluded ?? string.Empty,
+            LoopFilter = loop,
+            CandidateBand = band,
+            QueryYawRate = 0.0f,
         };
     }
 }
