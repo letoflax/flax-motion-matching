@@ -90,28 +90,10 @@ public struct MotionMatchingFrameInput
     public string ExcludedTagSet;
 }
 
-// P0 additive-only DTOs for future game drivers (never read by Tick yet).
-// Neutral Layer-style naming: no gait/jump/turn/camera vocabulary.
-
-/// <summary>
-/// P0: neutral query filter for a future game driver. Plain data only;
-/// not consumed by the runtime yet (no Tick change).
-/// </summary>
-public struct MotionMatchingQueryFilter
-{
-    public TrajectoryPoint[] Points;
-    public string AllowedTags;
-    public string ExcludedTags;
-}
-
-/// <summary>
-/// P0: neutral search tuning for a future game driver. Plain data only;
-/// not consumed by the runtime yet (no Tick change).
-/// </summary>
-public struct MotionMatchingSearchTuning
-{
-    public float PoseWeight;
-    public float TrajectoryWeight;
-    public float InertializationDuration;
-    public int FrameSearchBudget;
-}
+// P1: the P0 additive-only DTOs (MotionMatchingQueryFilter,
+// MotionMatchingSearchTuning) were never read by Tick and are deleted. The
+// live Game-side request is LocomotionSelectionRequest
+// (Source/Game/Player/LocomotionSelectionPolicy.cs): scope crosses into the
+// core through MotionMatchingFrameInput above (direct path), intent/loop/
+// band mirrors stay Game-side until P2. No native struct field is added
+// (MotionMatchingTraceEntry stays 61/64 for the Flax 1.12 bindings cap).
