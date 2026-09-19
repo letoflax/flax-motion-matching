@@ -109,6 +109,11 @@ void MotionMatchingPlayback::Setup(
     Stop();
     _database = database;
     _fallbackModel = fallbackModel;
+    _hierarchyModel = nullptr;
+    _parents.Clear();
+    _referenceLocals.Clear();
+    _referenceRootLocal = Matrix::Identity;
+    _hasReferenceRoot = false;
     (void)controllerUpAxis;
     _rootNodeIndex = -1;
     _clips.Clear();

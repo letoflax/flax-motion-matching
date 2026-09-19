@@ -7,7 +7,7 @@ using FlaxEngine;
 namespace MotionMatching;
 
 /// <summary>
-/// One-click full database rebuild: registers every animation under
+/// Optional flax-test sample setup: registers every animation under
 /// Content/Animations/Humanoid with auto-inferred tags, then bakes.
 /// Tag rule (lowercase, deterministic, whole-token matching):
 /// - filename containing the token "turn" overrides to "turn";

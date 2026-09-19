@@ -10,8 +10,7 @@ namespace MotionMatching;
 /// Single management UI for the motion-matching database. Replaces the old
 /// row of panel buttons: register / clear / import / export / bake pipeline
 /// / tuning live here. Import REPLACES the whole registry (no merge);
-/// the shipped Content/MotionMatching/DefaultClips.json restores the full
-/// set (it supersedes the old Rebuild All button).
+/// a host-selected registry can restore any authored clip set.
 /// </summary>
 public class ManageMotionMatchingWindow : CustomEditorWindow
 {
@@ -83,8 +82,7 @@ public class ManageMotionMatchingWindow : CustomEditorWindow
     {
         if (_controller == null)
             return;
-        string path = Path.Combine(
-            Globals.ProjectContentFolder, "MotionMatching", "RegistryExport.json");
+        string path = MotionMatchingEditorService.DefaultRegistryPath();
         SetStatus(MotionMatchingEditorService.ExportClipRegistry(_controller, path));
     }
 

@@ -5,9 +5,9 @@ namespace MotionMatching;
 // Plugin-owned input contract (docs/PLUGIN_CONTRACT.md).
 //
 // Ownership: everything in this file belongs to the motion-matching side.
-// Game code implements IMotionMatchingInputProvider; the shell
-// (MotionMatchingController) only ever calls through the interface and
-// never references game types (PlayerState, coordinators, automation).
+// The host owns and calls IMotionMatchingInputProvider, then passes the frame
+// to MotionMatchingController.Update. The controller has no provider slot and
+// never calls BuildInput or Reset on the host's behalf.
 //
 // Managed DTOs only: MotionMatchingInputContext never crosses the native
 // boundary (C# -> C#), so managed arrays are fine here. Only the plain
@@ -28,8 +28,8 @@ public interface IMotionMatchingInputProvider
     MotionMatchingFrameInput BuildInput(MotionMatchingInputContext ctx);
 
     /// <summary>
-    /// Snap scope hysteresis and reseed the predictor. Called by the shell
-    /// from ResetPlayback (teleport/respawn). Must not require a transform:
+    /// Snap scope hysteresis and reseed the predictor. The host calls this
+    /// alongside controller.ResetPlayback (teleport/respawn). Must not require a transform:
     /// predictor reseed is lazy on the next BuildInput.
     /// </summary>
     void Reset();
@@ -60,9 +60,11 @@ public struct MotionMatchingInputContext
 /// P2: trajectory + scope + caller filter only. All gameplay decisions (gait
 /// roles, speed ceilings, yaw/direction thresholds, driver flags, overlay
 /// angles/gates, velocities, grounded/sprint) live game-side in the provider/
-/// selection policy and never cross into the core. The core executes
-/// Allowed/Excluded/LoopFilter/CandidateBand/QueryYawRate verbatim.
-/// Empty AllowedTagSet = explicit no-match.
+/// selection policy and never cross into the core. Includes use tag overlap;
+/// exclusions veto any overlap. Empty AllowedTagSet = explicit no-match.
+/// Normal queries use the caller filter. Structural reseed/end-recovery
+/// searches override LoopFilter to LoopOnly within the same tag scope and
+/// exclusions, even for OneShotOnly callers (docs/PLUGIN_CONTRACT.md).
 /// </summary>
 public struct MotionMatchingFrameInput
 {

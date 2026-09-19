@@ -9,16 +9,16 @@ using FlaxEngine.Json;
 namespace MotionMatching;
 
 /// <summary>
-/// One registry entry in the portable clips JSON
-/// (Content/MotionMatching/DefaultClips.json). Paths are Content-relative
-/// (e.g. "Animations/Humanoid/Run_Turn_L_090_Lfoot.flax"). Missing tags/loop
-/// fall back to InferTags/InferLoop at import.
+/// One registry entry in the portable clips JSON. Paths are normally
+/// Content-relative, but absolute paths are also accepted by the importer.
+/// Tags and loop are authored data; optional host callbacks can supply
+/// inference for registries that intentionally omit either field.
 /// </summary>
 public class RegistryClipEntry
 {
     public string path;
     public string[] tags;
-    public bool loop;
+    public bool? loop;
 }
 
 /// <summary>
@@ -28,6 +28,18 @@ public class ClipRegistryFile
 {
     public int version = 1;
     public RegistryClipEntry[] clips = Array.Empty<RegistryClipEntry>();
+}
+
+/// <summary>
+/// Host-provided behavior for importing a registry. The editor module has no
+/// built-in filename, folder, skeleton, or humanoid convention. A host may
+/// opt into its own inference and asset path resolver explicitly.
+/// </summary>
+public sealed class ClipRegistryImportOptions
+{
+    public Func<string, string[]> InferTags;
+    public Func<string, bool> InferLoop;
+    public Func<string, string, string> ResolvePath;
 }
 
 /// <summary>
@@ -76,12 +88,12 @@ public static class MotionMatchingEditorService
     }
 
     /// <summary>
-    /// Default shipped registry (replaces the Rebuild All button): import
-    /// this to restore the full clip set, then bake.
+    /// Neutral default registry location for editor export. Hosts can pass
+    /// any path to export/import and are not required to use this location.
     /// </summary>
     public static string DefaultRegistryPath()
     {
-        return Path.Combine(Globals.ProjectContentFolder, "MotionMatching", "DefaultClips.json");
+        return Path.Combine(Globals.ProjectContentFolder, "MotionMatchingRegistry.json");
     }
 
     private static string ToContentRelative(string path)
@@ -98,15 +110,29 @@ public static class MotionMatchingEditorService
             .Replace(Path.DirectorySeparatorChar, '/');
     }
 
-    private static string FromContentRelative(string path)
+    private static string ResolveRegistryPath(string assetPath, string registryPath, ClipRegistryImportOptions options)
     {
-        if (string.IsNullOrEmpty(path))
-            return path;
-        string rel = path.Replace('/', Path.DirectorySeparatorChar)
-            .TrimStart(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
-        if (Path.IsPathRooted(rel))
-            return rel;
-        return Path.Combine(Globals.ProjectContentFolder, rel);
+        if (string.IsNullOrEmpty(assetPath))
+            return assetPath;
+        if (options?.ResolvePath != null)
+            return options.ResolvePath(assetPath, registryPath);
+
+        string rawPath = assetPath.Replace('/', Path.DirectorySeparatorChar);
+        if (Path.IsPathRooted(rawPath))
+            return rawPath;
+        string normalized = rawPath.TrimStart(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+
+        string contentCandidate = Path.Combine(Globals.ProjectContentFolder, normalized);
+        if (File.Exists(contentCandidate))
+            return contentCandidate;
+        string registryFolder = Path.GetDirectoryName(registryPath);
+        if (!string.IsNullOrEmpty(registryFolder))
+        {
+            string registryCandidate = Path.GetFullPath(Path.Combine(registryFolder, normalized));
+            if (File.Exists(registryCandidate))
+                return registryCandidate;
+        }
+        return contentCandidate;
     }
 
     /// <summary>
@@ -145,9 +171,20 @@ public static class MotionMatchingEditorService
     /// <summary>
     /// Imports a registry JSON, REPLACING the whole registry (clear first —
     /// replace-all has fewer failure modes than merge). Entries missing tags
-    /// or loop fall back to InferTags/InferLoop. Returns a summary or error.
+    /// or loop are skipped/defaulted unless the caller explicitly supplies
+    /// inference callbacks in <see cref="ClipRegistryImportOptions"/>.
     /// </summary>
     public static string ImportClipRegistry(MotionMatchingController controller, string path)
+    {
+        return ImportClipRegistry(controller, path, null);
+    }
+
+    /// <summary>
+    /// Imports a registry using only generic behavior by default. Sample or
+    /// host conventions must be passed explicitly through <paramref name="options"/>.
+    /// </summary>
+    public static string ImportClipRegistry(MotionMatchingController controller, string path,
+        ClipRegistryImportOptions options)
     {
         try
         {
@@ -170,26 +207,27 @@ public static class MotionMatchingEditorService
                     skipped++;
                     continue;
                 }
-                string full = FromContentRelative(entry.path.Trim());
+                string full = ResolveRegistryPath(entry.path.Trim(), path, options);
                 if (!File.Exists(full))
                 {
                     skipped++;
                     continue;
                 }
-                string[] tags = (entry.tags == null || entry.tags.Length == 0)
-                    ? MotionMatchingAutoSetup.InferTags(full)
-                    : entry.tags;
+                string[] tags = entry.tags;
+                if ((tags == null || tags.Length == 0) && options?.InferTags != null)
+                    tags = options.InferTags(full);
                 var clean = new List<string>();
-                foreach (string tag in tags)
+                foreach (string tag in tags ?? Array.Empty<string>())
                 {
                     if (!string.IsNullOrWhiteSpace(tag))
                         clean.Add(tag.Trim().ToLowerInvariant());
                 }
                 if (clean.Count == 0)
-                    clean.AddRange(MotionMatchingAutoSetup.InferTags(full));
-                bool loop = entry.loop;
-                // InferLoop fallback only when the entry carries no loop info:
-                // JSON false is a real value, so trust it as authored.
+                {
+                    skipped++;
+                    continue;
+                }
+                bool loop = entry.loop ?? options?.InferLoop?.Invoke(full) ?? false;
                 string key = string.Join("+", clean.OrderBy(t => t, StringComparer.Ordinal)) +
                     "|" + (loop ? "loop" : "once");
                 if (!groups.TryGetValue(key, out var list))

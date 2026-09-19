@@ -238,6 +238,25 @@ void MotionMatchingRuntimePolicy::Shutdown()
     _samplingReady = false;
     _database = nullptr;
     _body = nullptr;
+    _liveSchema = PoseSearchSchema();
+    _cacheFolder = String::Empty;
+    _nodes = NodeIndices();
+    _prevPositions.Clear();
+    _packedTrajectory.Clear();
+    _latestPose.Clear();
+    _tickTrajectory.Clear();
+    _poseScratch.Clear();
+    _prevScratch.Clear();
+    _tickTrajScratch.Clear();
+    _hasPrevPositions = false;
+    _usedSearchSnapshot = false;
+    _searchSnapshotLength = 0;
+    _poseValid = false;
+    _hasLastActorPos = false;
+    _hasSampleStarts = false;
+    _hasLastScanSignature = false;
+    _fastPathReseed = true;
+    _chooserReseed = false;
     if (_playback != nullptr)
     {
         Delete(_playback);
@@ -252,6 +271,16 @@ void MotionMatchingRuntimePolicy::Shutdown()
     _telemetryHead = 0;
     _telemetryCount = 0;
     _telemetryDropped = 0;
+    _queryTagsKey = String::Empty;
+    _queryTagsCache.Clear();
+    _queryExcludedKey = String::Empty;
+    _queryExcludedCache.Clear();
+    _queryExcludedJoin = String::Empty;
+    _fastAllowedKey = String::Empty;
+    _fastAllowedCache.Clear();
+    _fastExcludedKey = String::Empty;
+    _fastExcludedCache.Clear();
+    _fastExcludedJoin = String::Empty;
     PolicyState = String(TEXT("Disabled"));
 }
 

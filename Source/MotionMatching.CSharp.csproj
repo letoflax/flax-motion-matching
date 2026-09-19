@@ -171,28 +171,22 @@
   <ItemGroup Condition=" '$(Configuration)|$(Platform)' == 'Editor.Windows.Debug|x64' " >
     <Compile Visible="false" Include="D:\Code\flax\flax-test\Plugins\MotionMatching\Cache\Intermediate\MotionMatchingEditorTarget\Windows\x64\Debug\MotionMatching\MotionMatching.Bindings.Gen.cs" />
     <Compile Visible="false" Include="D:\Code\flax\flax-test\Plugins\MotionMatching\Cache\Intermediate\MotionMatchingEditorTarget\Windows\x64\Debug\MotionMatchingEditor\MotionMatchingEditor.Bindings.Gen.cs" />
-    <Compile Visible="false" Include="D:\Code\flax\flax-test\Plugins\MotionMatching\Cache\Intermediate\MotionMatchingEditorTarget\Windows\x64\Debug\MotionMatchingLocomotion\MotionMatchingLocomotion.Bindings.Gen.cs" />
   </ItemGroup>
   <ItemGroup Condition=" '$(Configuration)|$(Platform)' == 'Editor.Windows.Development|x64' " >
     <Compile Visible="false" Include="D:\Code\flax\flax-test\Plugins\MotionMatching\Cache\Intermediate\MotionMatchingEditorTarget\Windows\x64\Development\MotionMatching\MotionMatching.Bindings.Gen.cs" />
     <Compile Visible="false" Include="D:\Code\flax\flax-test\Plugins\MotionMatching\Cache\Intermediate\MotionMatchingEditorTarget\Windows\x64\Development\MotionMatchingEditor\MotionMatchingEditor.Bindings.Gen.cs" />
-    <Compile Visible="false" Include="D:\Code\flax\flax-test\Plugins\MotionMatching\Cache\Intermediate\MotionMatchingEditorTarget\Windows\x64\Development\MotionMatchingLocomotion\MotionMatchingLocomotion.Bindings.Gen.cs" />
   </ItemGroup>
   <ItemGroup Condition=" '$(Configuration)|$(Platform)' == 'Editor.Windows.Release|x64' " >
     <Compile Visible="false" Include="D:\Code\flax\flax-test\Plugins\MotionMatching\Cache\Intermediate\MotionMatchingEditorTarget\Windows\x64\Release\MotionMatching\MotionMatching.Bindings.Gen.cs" />
     <Compile Visible="false" Include="D:\Code\flax\flax-test\Plugins\MotionMatching\Cache\Intermediate\MotionMatchingEditorTarget\Windows\x64\Release\MotionMatchingEditor\MotionMatchingEditor.Bindings.Gen.cs" />
-    <Compile Visible="false" Include="D:\Code\flax\flax-test\Plugins\MotionMatching\Cache\Intermediate\MotionMatchingEditorTarget\Windows\x64\Release\MotionMatchingLocomotion\MotionMatchingLocomotion.Bindings.Gen.cs" />
   </ItemGroup>
   <ItemGroup Condition=" '$(Configuration)|$(Platform)' == 'Game.Windows.Debug|x64' " >
     <Compile Visible="false" Include="D:\Code\flax\flax-test\Plugins\MotionMatching\Cache\Intermediate\MotionMatchingTarget\Windows\x64\Debug\MotionMatching\MotionMatching.Bindings.Gen.cs" />
-    <Compile Visible="false" Include="D:\Code\flax\flax-test\Plugins\MotionMatching\Cache\Intermediate\MotionMatchingTarget\Windows\x64\Debug\MotionMatchingLocomotion\MotionMatchingLocomotion.Bindings.Gen.cs" />
   </ItemGroup>
   <ItemGroup Condition=" '$(Configuration)|$(Platform)' == 'Game.Windows.Development|x64' " >
     <Compile Visible="false" Include="D:\Code\flax\flax-test\Plugins\MotionMatching\Cache\Intermediate\MotionMatchingTarget\Windows\x64\Development\MotionMatching\MotionMatching.Bindings.Gen.cs" />
-    <Compile Visible="false" Include="D:\Code\flax\flax-test\Plugins\MotionMatching\Cache\Intermediate\MotionMatchingTarget\Windows\x64\Development\MotionMatchingLocomotion\MotionMatchingLocomotion.Bindings.Gen.cs" />
   </ItemGroup>
   <ItemGroup Condition=" '$(Configuration)|$(Platform)' == 'Game.Windows.Release|x64' " >
     <Compile Visible="false" Include="D:\Code\flax\flax-test\Plugins\MotionMatching\Cache\Intermediate\MotionMatchingTarget\Windows\x64\Release\MotionMatching\MotionMatching.Bindings.Gen.cs" />
-    <Compile Visible="false" Include="D:\Code\flax\flax-test\Plugins\MotionMatching\Cache\Intermediate\MotionMatchingTarget\Windows\x64\Release\MotionMatchingLocomotion\MotionMatchingLocomotion.Bindings.Gen.cs" />
   </ItemGroup>
 </Project>

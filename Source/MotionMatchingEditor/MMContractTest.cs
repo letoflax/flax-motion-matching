@@ -314,6 +314,30 @@ public static class MMContractTest
 
         test.ResetPlayback();
 
+        // 10: changing the structural schema binding releases the native
+        // session before the next host tick, so no playback/trace handle from
+        // the old rig can survive a host rebind.
+        {
+            PoseSearchSchema original = test.Schema;
+            PoseSearchSchema rebound = original;
+            rebound.SampleRate = original.SampleRate + 1;
+            test.Schema = rebound;
+            bool released = !test.IsReady && test.Playback == null && test.Trace == null;
+            Check("schema-rebind-releases-session", released,
+                "ready=" + test.IsReady + " playback=" + (test.Playback != null)
+                + " trace=" + (test.Trace != null));
+            test.Schema = original;
+            test.Update(Dt, TestWorld, CannedFrame("idle", string.Empty, 0, 0));
+        }
+
+        // 11: host cleanup is public and idempotent; borrowed native handles
+        // are gone immediately after the first call and remain gone after the
+        // second call.
+        test.Shutdown();
+        test.Shutdown();
+        Check("shutdown-idempotent", !test.IsReady && test.Playback == null && test.Trace == null,
+            "ready=" + test.IsReady);
+
         string verdict = passed == total ? "CONTRACT PASS" : "CONTRACT FAIL";
         return verdict + ": " + passed + "/" + total + " checks\n" + string.Join("\n", lines);
     }

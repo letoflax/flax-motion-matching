@@ -7,9 +7,10 @@ public class MotionMatchingTarget : GameProjectTarget
     {
         base.Init();
 
-        // Reference the modules for game: core runtime + sample integration.
-        // The editor module is editor-only (see MotionMatchingEditorTarget).
+        // Reference the modules for game: core runtime only.
+        // Locomotion policy lives in the host (Game); the plugin keeps
+        // no sample integration module. The editor module is editor-only
+        // (see MotionMatchingEditorTarget).
         Modules.Add("MotionMatching");
-        Modules.Add("MotionMatchingLocomotion");
     }
 }

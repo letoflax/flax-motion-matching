@@ -16,7 +16,7 @@ namespace MotionMatching;
 /// arrives through the frame argument. This file must never reference game
 /// types (PlayerState, coordinators, automation, overlays).
 /// </summary>
-public class MotionMatchingController
+public class MotionMatchingController : IDisposable
 {
     /// <summary>
     /// Bake contract authored by the host. A snapshot is stored inside the database on bake;
@@ -209,11 +209,17 @@ public class MotionMatchingController
 
     private MotionMatchingRuntimePolicy _policy;
     private bool _telemetryWarned;
+    private MotionMatchingDatabase _boundDatabase;
+    private AnimatedModel _boundBody;
+    private SkinnedModel _boundModel;
+    private PoseSearchSchema _boundSchema;
+    private string _loadedDatabaseFile = string.Empty;
 
     public float[] TrajectorySampleTimes
     {
         get
         {
+            ReleaseStaleBinding();
             // P5: the Database getter is a native binding that allocates a
             // managed float[] per call; the baked times never change under a
             // loaded database in play, so cache the array and refresh only
@@ -221,8 +227,8 @@ public class MotionMatchingController
             // Update, 2x per tick) share the instance; nobody mutates it.
             // The null-database fallback (unbaked: the policy never ticks)
             // reads live with no caching.
-            if (Database == null)
-                return Schema.TrajectorySampleTimes;
+            if (!Database)
+                return Schema.TrajectorySampleTimes ?? Array.Empty<float>();
             if (!ReferenceEquals(Database, _sampleTimesDb))
             {
                 _sampleTimesDb = Database;
@@ -235,13 +241,21 @@ public class MotionMatchingController
     private MotionMatchingDatabase _sampleTimesDb;
     private float[] _sampleTimesCache = Array.Empty<float>();
 
-    public bool IsReady => _policy != null && _policy.IsReady;
+    public bool IsReady
+    {
+        get
+        {
+            ReleaseStaleBinding();
+            return _policy && _policy.IsReady;
+        }
+    }
 
     /// <summary>
     /// Live playback handle for game-side integrations (e.g. pose overlays
     /// attach here). Null until the first update initializes the policy.
+    /// Borrowed handle: reacquire after every rebind/shutdown; never destroy it.
     /// </summary>
-    public MotionMatchingPlayback Playback => _policy != null ? _policy.GetPlayback() : null;
+    public MotionMatchingPlayback Playback => IsReady ? _policy.GetPlayback() : null;
 
     /// <summary>
     /// P0 additive-only: publish the existing search-pose path without
@@ -253,7 +267,7 @@ public class MotionMatchingController
         locals = System.Array.Empty<Matrix>();
         winnerClip = -1;
         winnerCost = float.MaxValue;
-        if (_policy == null || !_policy.IsReady)
+        if (!IsReady)
             return false;
         var playback = _policy.GetPlayback();
         if (playback == null)
@@ -280,7 +294,7 @@ public class MotionMatchingController
     {
         winnerClip = -1;
         winnerCost = float.MaxValue;
-        if (_policy == null || !_policy.IsReady || buffer == null)
+        if (!IsReady || buffer == null)
             return false;
         var playback = _policy.GetPlayback();
         if (playback == null)
@@ -313,7 +327,7 @@ public class MotionMatchingController
         string safeReason = reason ?? string.Empty;
         Debug.Log("MotionMatchingController.ForcePlayClip: clip=" + clipIndex
             + " startTime=" + startTime + " reason=" + safeReason);
-        if (_policy == null || !_policy.IsReady)
+        if (!IsReady)
             return;
         try
         {
@@ -336,7 +350,7 @@ public class MotionMatchingController
     public bool FlushTelemetry(out string error)
     {
         error = string.Empty;
-        if (_policy == null || !_policy.IsReady)
+        if (!IsReady)
         {
             error = "Telemetry flush stopped: policy is not ready.";
             return false;
@@ -359,6 +373,7 @@ public class MotionMatchingController
     /// </summary>
     public void ClearTelemetry()
     {
+        ReleaseStaleBinding();
         if (_policy == null)
             return;
         try
@@ -405,12 +420,90 @@ public class MotionMatchingController
     /// </summary>
     public void Initialize()
     {
-        _telemetryWarned = false;
+        ReleaseStaleBinding();
 
         // Unified load path (no editor partial): Content.Load works in both
         // editor and game builds; the editor service refreshes explicitly
         // after bake/registry edits.
         EnsureDatabaseLoadedForGame();
+    }
+
+    /// <summary>
+    /// Releases the owned native policy, playback and trace immediately, then
+    /// schedules destruction of the policy object. Idempotent; call on the
+    /// Flax main thread on host disable/destroy. Export traces/telemetry first.
+    /// Configuration and host-owned assets are retained for editor tooling and
+    /// reuse: a subsequent Update starts a fresh session without requiring Initialize.
+    /// Previously borrowed Playback/Trace handles are invalid after this call.
+    /// </summary>
+    public void Shutdown()
+    {
+        var policy = _policy;
+        _policy = null;
+        _boundDatabase = null;
+        _boundBody = null;
+        _boundModel = null;
+        _boundSchema = default;
+        _sampleTimesDb = null;
+        _sampleTimesCache = Array.Empty<float>();
+        _telemetryWarned = false;
+        ResetRuntimeStatus();
+        if (policy)
+        {
+            try
+            {
+                policy.Shutdown();
+            }
+            finally
+            {
+                FlaxEngine.Object.Destroy(policy);
+            }
+        }
+    }
+
+    /// <summary>Equivalent to Shutdown; the configured controller remains reusable.</summary>
+    public void Dispose() => Shutdown();
+
+    private void ReleaseStaleBinding()
+    {
+        // Keep public fields (including nested struct edits) compatible with
+        // existing hosts/tools. Validate before any native read or command.
+        if (ReferenceEquals(_policy, null))
+            return;
+        if (!_policy || !Database || !CharacterBody ||
+            !ReferenceEquals(Database, _boundDatabase) ||
+            !ReferenceEquals(CharacterBody, _boundBody) ||
+            !ReferenceEquals(CharacterBody.SkinnedModel, _boundModel) ||
+            (!string.IsNullOrEmpty(_loadedDatabaseFile) &&
+             !string.Equals(DatabaseFile, _loadedDatabaseFile, StringComparison.OrdinalIgnoreCase)) ||
+            !SchemaBindingEquals(Schema, _boundSchema) || !_policy.IsReady)
+            Shutdown();
+    }
+
+    private static bool SchemaBindingEquals(in PoseSearchSchema a, in PoseSearchSchema b)
+    {
+        // Weights are query-time tuning, not binding identity.
+        var identity = a;
+        identity.PoseWeight = b.PoseWeight;
+        identity.TrajectoryWeight = b.TrajectoryWeight;
+        return SchemaEquals(identity, b);
+    }
+
+    private void ResetRuntimeStatus()
+    {
+        PolicyState = "Disabled";
+        WinnerSample = WinnerClip = -1;
+        WinnerClipName = ActiveTag = BestLoopClipName = BestOneShotClipName = string.Empty;
+        LastSwitchReason = ChooserStatus = string.Empty;
+        WinnerCost = SecondBestCost = WinnerPoseCost = WinnerTrajectoryCost = float.MaxValue;
+        BestLoopCost = BestOneShotCost = float.MaxValue;
+        WinnerContinuityCost = WinnerLoopCost = LoopPreferenceApplied = 0.0f;
+        WinnerIsLoop = false;
+        SwitchCount = SeekCount = LoopScoredCount = OneShotScoredCount = 0;
+        LoopTotalCount = OneShotTotalCount = TraceEntries = FastPathHits = 0;
+        LastQueryMs = LastTickMs = LastFastPathMs = LastTelemetryMs = 0.0f;
+        TickCount = FullSearchCount = TelemetryCount = TelemetryDropped = 0;
+        TotalTickMs = TotalFullSearchMs = TotalFastPathMs = TotalTelemetryMs = 0.0f;
     }
 
     // P3: the P2 rebuild-compat reflection shim for the legacy native scope
@@ -423,6 +516,7 @@ public class MotionMatchingController
     /// </summary>
     public void ResetPlayback()
     {
+        ReleaseStaleBinding();
         _policy?.ResetOnTeleport();
     }
 
@@ -434,14 +528,16 @@ public class MotionMatchingController
     /// </summary>
     public void Update(float deltaTime, Transform actorWorld, MotionMatchingFrameInput input)
     {
-        if (CharacterBody == null)
+        ReleaseStaleBinding();
+        if (!CharacterBody)
             return;
 
         if (_policy == null)
-            _policy = new MotionMatchingRuntimePolicy();
-        if (!_policy.IsReady)
         {
             EnsureDatabaseLoadedForGame();
+            if (!Database || !Database.IsBaked || !CharacterBody.SkinnedModel)
+                return;
+            _policy = new MotionMatchingRuntimePolicy();
             // P4: no file deletion in init/update (gate: no del-file in core
             // path). The native Initialize clears the bounded telemetry ring
             // to the disabled state; FlushTelemetry (explicit, session end)
@@ -449,8 +545,18 @@ public class MotionMatchingController
             // left behind — init never touches MMTelemetry.jsonl.
             _policy.Initialize(Database, CharacterBody, Schema,
                 CacheFolder ?? string.Empty, InertializationDuration);
-            if (_policy.GetPlayback() != null)
-                _policy.GetPlayback().InertializationDuration = InertializationDuration;
+            if (!_policy.IsReady)
+            {
+                Shutdown();
+                return;
+            }
+            _boundDatabase = Database;
+            _boundBody = CharacterBody;
+            _boundModel = CharacterBody.SkinnedModel;
+            _boundSchema = Schema;
+            // Snapshot array contents too: hosts can edit sample times in place.
+            _boundSchema.TrajectorySampleTimes = Schema.TrajectorySampleTimes != null
+                ? (float[])Schema.TrajectorySampleTimes.Clone() : Array.Empty<float>();
         }
         if (!_policy.IsReady)
             return;
@@ -556,14 +662,23 @@ public class MotionMatchingController
 
     // M6: the policy's query trace (null until the first play tick). The
     // tuning window reads it for top-N, export, and replay.
-    public MotionMatchingTraceLog Trace => _policy != null ? _policy.GetTrace() : null;
-    public MotionMatchingTraceEntry LastTraceEntry => _policy != null ? _policy.GetLastEntry() : new MotionMatchingTraceEntry();
+    // Borrowed handle, with the same lifetime as Playback.
+    public MotionMatchingTraceLog Trace => IsReady ? _policy.GetTrace() : null;
+    public MotionMatchingTraceEntry LastTraceEntry => IsReady ? _policy.GetLastEntry() : new MotionMatchingTraceEntry();
 
     private void EnsureDatabaseLoadedForGame()
     {
-        if (Database)
+        string databaseFile = DatabaseFile;
+        // A host may inject an already-loaded database (editor tooling and
+        // isolated contract controllers do this). Once that reference is
+        // adopted, the normal binding checks below own rebind detection.
+        if (Database && (string.IsNullOrEmpty(_loadedDatabaseFile) ||
+            string.Equals(_loadedDatabaseFile, databaseFile, StringComparison.OrdinalIgnoreCase)))
             return;
-        Database = Content.Load<MotionMatchingDatabase>(DatabaseFile);
+        if (_policy)
+            Shutdown();
+        Database = Content.Load<MotionMatchingDatabase>(databaseFile);
+        _loadedDatabaseFile = Database ? databaseFile : string.Empty;
         RefreshDatabaseStatus();
     }
 
@@ -632,6 +747,9 @@ public class MotionMatchingController
 
     public void RefreshDatabaseStatus()
     {
+        // Explicit editor reload/bake notification, including same-asset reloads.
+        Shutdown();
+        _loadedDatabaseFile = Database ? DatabaseFile : string.Empty;
         // Non-blocking check: WaitForLoaded defaults to a 30s main-thread
         // block, and Content.Load above already waited for the settled state.
         if (!Database || Database.WaitForLoaded(0))
@@ -651,6 +769,8 @@ public class MotionMatchingController
 
     public void ClearDatabaseStatus()
     {
+        Shutdown();
+        _loadedDatabaseFile = string.Empty;
         Database = null;
         AnimationClipsCount = 0;
         SampleCount = 0;

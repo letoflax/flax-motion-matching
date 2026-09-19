@@ -55,11 +55,11 @@ public class RegisterClipsWindow : CustomEditorWindow
         layout.Label("Register Imported Animations", TextAlignment.Center);
         layout.Space(4);
         _source = layout.AddPropertyItem("Source", "Folder (scanned recursively), .flax file, or ';'-separated paths.").TextBox();
-        _source.TextBox.Text = "Animations/Humanoid";
-        _tag = layout.AddPropertyItem("Tags", "Motion groups, '+'-separated (idle, walk+turn_travel).").TextBox();
-        _tag.TextBox.Text = "idle";
+        _source.TextBox.Text = string.Empty;
+        _tag = layout.AddPropertyItem("Tags", "Motion groups, '+'-separated. Tags are supplied by the host.").TextBox();
+        _tag.TextBox.Text = string.Empty;
         _loop = layout.Checkbox("Loop Clips", "Wrap samples at clip boundaries.");
-        _loop.CheckBox.Checked = true;
+        _loop.CheckBox.Checked = false;
         var buttons = layout.HorizontalPanel();
         var browseFolder = buttons.Button("Browse Folder").Button;
         browseFolder.Clicked += BrowseFolder;
