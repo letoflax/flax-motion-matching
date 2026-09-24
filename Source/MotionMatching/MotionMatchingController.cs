@@ -79,8 +79,9 @@ public class MotionMatchingController : IDisposable
     public bool VerifyIndexedSearch = false;
 
     // P2: foot-IK solver deleted with the plugin lock machine (field died
-    // with it). Game-side FootIKController owns all foot solving; search
-    // contact features (bake + query) are untouched.
+    // with it). Game-side FootIKEngine (no separate script) owns all foot
+    // solving via the facade single-publish pipeline; search contact
+    // features (bake + query) are untouched.
 
     // NOTE: layer decisions (procedural angle, bone gate) live
     // game-side now (P2 post-pass in the game facade): the provider

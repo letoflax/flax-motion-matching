@@ -452,6 +452,32 @@ namespace
         return useTimeTerms && clipIndex == currentClipIndex && biasWindow > 0.0f &&
             TimeDistance(database, clipIndex, settings.ExpectedTime, sampleTime) <= biasWindow;
     }
+    // One-shot progression guard (sprint->run fix): admissibility predicate
+    // for the CURRENT non-loop clip. Returns true (candidate stays ranked)
+    // for other clips, loop clips, and pure searches without playback
+    // context (CurrentTime < 0 or ExpectedTime < 0). For the current
+    // one-shot, only samples within ContinuingWindow of ExpectedTime are
+    // admissible. ContinuingBias is deliberately NOT consulted: bias=0 must
+    // still hold progression. No SampleRate fallback: a zero window admits
+    // only the expected sample itself.
+    bool IsNonLoopContinuation(
+        const MotionMatchingDatabase& database,
+        const MotionMatchingSearchSettings& settings,
+        int32 currentClipIndex,
+        int32 clipIndex,
+        float sampleTime)
+    {
+        if (clipIndex != currentClipIndex)
+            return true;
+        if (currentClipIndex < 0)
+            return true;
+        if (database.GetClipLoop(clipIndex))
+            return true;
+        if (settings.CurrentTime < 0.0f || settings.ExpectedTime < 0.0f)
+            return true;
+        const float window = Math::Max(settings.ContinuingWindow, 0.0f);
+        return Math::Abs(sampleTime - settings.ExpectedTime) <= window;
+    }
 
     // S1 �18.6: furthest future trajectory target from the schema. A non-loop
     // sample whose future stencil reaches past the clip end baked a clamped
@@ -876,6 +902,13 @@ namespace
                 if (TimeDistance(database, clipIndex, settings.CurrentTime, sampleTimes[sampleIndex]) <= exclusionWindow)
                     continue;
             }
+            // One-shot progression: far same-clip one-shot samples are not
+            // admissible (only the natural continuation is). Loops, other
+            // clips and pure searches pass through (see IsNonLoopContinuation).
+            if (!IsNonLoopContinuation(
+                    database, settings, currentClipIndex, clipIndex,
+                    sampleTimes[sampleIndex]))
+                continue;
 
             // Query is pre-normalized once by the caller: baked features are
             // already z-scored, so this is a plain squared distance. Prune
@@ -1323,6 +1356,12 @@ namespace
                 if (TimeDistance(database, clipIndex, settings.CurrentTime, sampleTimes[sampleIndex]) <= exclusionWindow)
                     continue;
             }
+            // One-shot progression (same guard as SearchPass): the indexed
+            // rerank must rank what brute force ranks.
+            if (!IsNonLoopContinuation(
+                    database, settings, currentClipIndex, clipIndex,
+                    sampleTimes[sampleIndex]))
+                continue;
 
             const float pruneLimit = secondBestCost +
                 (isContinuation ? (bias > 0.0f ? bias : 0.0f) + switchMargin : 0.0f) +
@@ -1593,6 +1632,12 @@ void MotionMatchingSearch::FindTopCandidates(
         }
         if (useTimeTerms && twinBan > 0.0f && clipIndex == currentClipIndex && !isContinuation &&
             TimeDistance(*database, clipIndex, settings.ExpectedTime, sampleTimes[sampleIndex]) <= biasWindow + twinBan)
+            continue;
+        // One-shot progression (same guard as the hot pass): top-N must
+        // rank what runtime could actually play.
+        if (!IsNonLoopContinuation(
+                *database, settings, currentClipIndex, clipIndex,
+                sampleTimes[sampleIndex]))
             continue;
 
         // Exact scan: no pruning here (tooling path, ~1ms for 68k samples),

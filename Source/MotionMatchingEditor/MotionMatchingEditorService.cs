@@ -445,6 +445,10 @@ public static class MotionMatchingEditorService
 #if FLAX_EDITOR
         bool passed = MotionMatchingSearch.RunSelfTest(controller.Database, out string log);
         Debug.Log($"Motion matching search self-test {(passed ? "PASSED" : "FAILED")}:\n{log}");
+        bool pbPassed = MotionMatchingPlayback.RunPlaybackSelfTest(controller.Database, controller.CharacterBody, out string pbLog);
+        Debug.Log($"Motion matching playback self-test {(pbPassed ? "PASSED" : "FAILED")}:\n{pbLog}");
+        if (!pbPassed)
+            passed = false;
 #else
         Debug.LogWarning("Motion matching self-test stopped: editor-only test is not available in game builds.");
 #endif

@@ -311,6 +311,56 @@ public static class MMContractTest
                 "tag='" + test.ActiveTag + "' chooser='" + test.ChooserStatus + "'");
             test.ResetPlayback();
         }
+        // 12: one-shot progression hold — force a long (>1s) non-loop clip at mid-length under its own tag scope; while the clip identity is unchanged, CurrentTime must never decrease and SeekCount must not grow (far self-seeks barred). A clip change at any tick is a legal exit and passes.
+        {
+            test.ResetPlayback();
+            TickProvider(test, NewCanned("idle", string.Empty), 10);
+            var playback = test.Playback;
+            var db = test.Database;
+            bool ok = false;
+            string detail = "no playback/database";
+            if (playback != null && db != null)
+            {
+                int target = -1;
+                float targetLen = 0f;
+                int clips = db.ClipCount;
+                for (int c = 0; c < clips; c++)
+                {
+                    bool isLoop = false;
+                    try { isLoop = db.GetClipLoop(c); } catch { continue; }
+                    if (isLoop) continue;
+                    float len = 0f;
+                    try { var lens = db.ClipLengths; if (lens != null && c < lens.Length) len = lens[c]; } catch { len = 0f; }
+                    if (len > 1.0f) { target = c; targetLen = len; break; }
+                }
+                if (target >= 0)
+                {
+                    string tag = "idle";
+                    try { string t = db.GetClipTag(target); if (!string.IsNullOrEmpty(t)) tag = t; } catch { }
+                    var prov = NewCanned(tag, string.Empty);
+                    test.ForcePlayClip(target, targetLen * 0.5f, "contract:oneshot-progression");
+                    int seeksBefore = test.SeekCount;
+                    float lastTime = playback.CurrentTime;
+                    bool regressed = false;
+                    bool changed = false;
+                    detail = "held";
+                    for (int i = 0; i < 30; i++)
+                    {
+                        TickProvider(test, prov, 1);
+                        if (playback.CurrentClip != target) { changed = true; break; }
+                        float now = playback.CurrentTime;
+                        if (now < lastTime - 0.0001f) { regressed = true; detail = "time regressed " + lastTime + " -> " + now; break; }
+                        lastTime = now;
+                    }
+                    if (changed) { ok = true; detail = "clip changed (legal exit) target=" + target; }
+                    else if (!regressed && test.SeekCount == seeksBefore) { ok = true; detail = "held progression target=" + target + " len=" + targetLen; }
+                    else if (!regressed) { detail = "seeks grew " + seeksBefore + " -> " + test.SeekCount; }
+                }
+                else { detail = "no non-loop clip > 1s (fixture missing)"; }
+            }
+            Check("oneshot-progression-hold", ok, detail);
+        }
+
 
         test.ResetPlayback();
 

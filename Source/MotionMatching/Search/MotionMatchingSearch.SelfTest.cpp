@@ -2011,6 +2011,515 @@ bool MotionMatchingSearch::RunSelfTest(
         }
     }
     log += String::Format(TEXT("Phase Q (replay determinism): {}/{} passed.\n"), phaseQPass, phaseQTest);
+    // Phase R: one-shot progression (sprint->run fix). The current non-loop
+    // clip may only continue near ExpectedTime; exact-pose queries pointing
+    // far away must not return that far sample. The same predicate gates
+    // brute-force (FindBest), indexed (UseIndexedSearch) and tooling
+    // (FindTopCandidates). Metadata-driven: probes are located from the
+    // baked registry (loop flag, clip lengths, sample times, tags); any
+    // missing fixture class fails loudly, never passes on zero probes.
+    int32 phaseRTest = 0;
+    int32 phaseRPass = 0;
+    {
+        const Array<float>& sampleTimesArr = database->GetSampleTimes();
+        // Probe qualification (metadata-driven, Phase G style): one long
+        // straight non-loop clip and one straight loop clip whose exact
+        // mid/tail queries already win by themselves in a pure search, so
+        // the progression asserts below cannot false-alarm on turn-penalty
+        // steals or bit-identical twins. No qualifying clip = loud fixture
+        // fail, never a zero-probe pass.
+        int32 oneShotClip = -1;
+        int32 loopClip = -1;
+        int32 oneShotFirst = -1;
+        int32 loopFirst = -1;
+        int32 oneShotAnchor = -1;
+        int32 loopSource = -1;
+        {
+            MotionMatchingSearchSettings pre = settings;
+            pre.CurrentTime = -1.0f;
+            pre.ExpectedTime = -1.0f;
+            pre.SameClipExclusionWindow = 0.0f;
+            pre.ContinuingBias = 0.0f;
+            pre.ContinuingWindow = 0.2f;
+            pre.SwitchMargin = 0.0f;
+            pre.TwinBanWindow = 0.0f;
+            pre.LoopTailExclusion = 0.0f;
+            pre.ExcludeNonLoopTail = false;
+            int32 scan = 0;
+            for (int32 c = 0; c < clipCount; c++)
+            {
+                const int32 n = (c >= 0 && c < clipSampleCounts.Count()) ? clipSampleCounts[c] : 0;
+                const bool isLoop = database->GetClipLoop(c);
+                const int32 first = scan;
+                scan += n;
+                if (n < 30)
+                    continue;
+                if (Math::Abs(database->GetClipTurnAngle(c)) >= 0.05f)
+                    continue;
+                const float span = sampleTimesArr[first + n - 1] - sampleTimesArr[first];
+                if (isLoop)
+                {
+                    // Mid, not tail: a well-baked loop closes the cycle, so
+                    // an exact tail query ties toward the head index under
+                    // strictly-less comparison. The mid sample carries a
+                    // unique pose while still sitting far from the start
+                    // expectation used in R5 below (span/2 > window).
+                    if (loopClip >= 0 || span <= 0.8f)
+                        continue;
+                    const int32 mid = first + n / 2;
+                    buildExactQuery(mid, queryPose, queryTrajectory);
+                    MotionMatchingResult pr;
+                    String pe;
+                    FindBest(database, queryPose, queryTrajectory, pre, -1, MAX_float, noTags, pr, pe);
+                    if (pe.IsEmpty() && pr.IsValid && pr.SampleIndex == mid)
+                    {
+                        loopClip = c;
+                        loopFirst = first;
+                        loopSource = mid;
+                    }
+                }
+                else
+                {
+                    if (oneShotClip >= 0 || span <= 0.8f)
+                        continue;
+                    const int32 mid = first + n / 2;
+                    buildExactQuery(mid, queryPose, queryTrajectory);
+                    MotionMatchingResult pr;
+                    String pe;
+                    FindBest(database, queryPose, queryTrajectory, pre, -1, MAX_float, noTags, pr, pe);
+                    if (pe.IsEmpty() && pr.IsValid && pr.SampleIndex == mid)
+                    {
+                        oneShotClip = c;
+                        oneShotFirst = first;
+                        oneShotAnchor = mid;
+                    }
+                }
+                if (oneShotClip >= 0 && loopClip >= 0)
+                    break;
+            }
+        }
+        // R1: current non-loop exact-pose query pointing far-past/far-future
+        // must NOT return that far sample (brute force).
+        if (oneShotClip < 0 || oneShotFirst < 0)
+        {
+            log += String(TEXT("Oneshot-progression FAIL: no straight non-loop clip (>= 30 samples, span > 0.8s) whose exact mid query wins by itself (fixture missing).\n"));
+            // Fixture gap must fail the run, never pass on zero probes.
+            phaseRTest += 2;
+            tested += 2;
+        }
+        else
+        {
+            const float win = 0.15f;
+            const int32 n = (oneShotClip >= 0 && oneShotClip < clipSampleCounts.Count())
+                ? clipSampleCounts[oneShotClip] : 0;
+            const int32 anchor = oneShotAnchor;
+            const bool rangeValid = oneShotClip >= 0 && oneShotFirst >= 0 && n > 0 &&
+                anchor >= oneShotFirst && anchor < oneShotFirst + n &&
+                anchor >= 0 && anchor < sampleCount &&
+                oneShotFirst + n - 1 >= 0 && oneShotFirst + n - 1 < sampleCount;
+            const float anchorTime = rangeValid ? sampleTimesArr[anchor] : 0.0f;
+            const int32 farPast = oneShotFirst;
+            const int32 farFuture = oneShotFirst + n - 1;
+            const bool pastFar = rangeValid &&
+                Math::Abs(sampleTimesArr[farPast] - anchorTime) > win + 0.2f;
+            const bool futureFar = rangeValid &&
+                Math::Abs(sampleTimesArr[farFuture] - anchorTime) > win + 0.2f;
+            if (!pastFar || !futureFar)
+            {
+                log += String::Format(
+                    TEXT("Oneshot-progression FAIL: fixture clip {} span too short for far offsets (need > {:.2f}s each side).\n"),
+                    oneShotClip,
+                    win + 0.2f);
+                // Span gap must fail the run, never pass on zero probes.
+                phaseRTest += 2;
+                tested += 2;
+            }
+            else
+            {
+                const int32 farSamples[2] = { farPast, farFuture };
+                for (int32 fi = 0; fi < 2; fi++)
+                {
+                    const int32 source = farSamples[fi];
+                    buildExactQuery(source, queryPose, queryTrajectory);
+                    MotionMatchingSearchSettings g = settings;
+                    g.CurrentTime = anchorTime;
+                    g.ExpectedTime = anchorTime;
+                    g.SameClipExclusionWindow = 0.0f;
+                    g.ContinuingBias = 0.0f;
+                    g.ContinuingWindow = win;
+                    g.SwitchMargin = 0.0f;
+                    g.TwinBanWindow = 0.0f;
+                    g.LoopTailExclusion = 0.0f;
+                    g.ExcludeNonLoopTail = false;
+                    MotionMatchingResult result;
+                    String error;
+                    FindBest(database, queryPose, queryTrajectory, g, oneShotClip, 999.0f, noTags, result, error);
+                    phaseRTest++;
+                    tested++;
+                    const bool farReturned = error.IsEmpty() && result.IsValid &&
+                        result.ClipIndex == oneShotClip && result.SampleIndex == source;
+                    if (!farReturned && error.IsEmpty() && result.IsValid)
+                    {
+                        phaseRPass++;
+                        passed++;
+                    }
+                    else
+                    {
+                        log += String::Format(
+                            TEXT("Oneshot-far FAIL: clip {} anchor {:.3f} far sample {} (winner={} clip={} time={:.3f} err='{}').\n"),
+                            oneShotClip,
+                            anchorTime,
+                            source,
+                            result.SampleIndex,
+                            result.ClipIndex,
+                            result.SampleTime,
+                            error);
+                    }
+                }
+                // R2: continuation within half a baked frame stays
+                // admissible with ContinuingBias=0 (no false self-bar).
+                {
+                    const float dt = sampleTimesArr[oneShotFirst + 1] - sampleTimesArr[oneShotFirst];
+                    const float half = (dt > 0.0f ? dt : 1.0f / 30.0f) * 0.5f;
+                    const int32 source = anchor;
+                    buildExactQuery(source, queryPose, queryTrajectory);
+                    MotionMatchingSearchSettings g = settings;
+                    g.CurrentTime = anchorTime - half;
+                    g.ExpectedTime = anchorTime;
+                    g.SameClipExclusionWindow = 0.0f;
+                    g.ContinuingBias = 0.0f;
+                    g.ContinuingWindow = half + 0.001f;
+                    g.SwitchMargin = 0.0f;
+                    g.TwinBanWindow = 0.0f;
+                    g.LoopTailExclusion = 0.0f;
+                    g.ExcludeNonLoopTail = false;
+                    MotionMatchingResult result;
+                    String error;
+                    FindBest(database, queryPose, queryTrajectory, g, oneShotClip, 999.0f, noTags, result, error);
+                    phaseRTest++;
+                    tested++;
+                    bool ok = error.IsEmpty() && result.IsValid &&
+                        result.ClipIndex == oneShotClip && result.SampleIndex == source;
+                    if (ok)
+                    {
+                        phaseRPass++;
+                        passed++;
+                    }
+                    else
+                    {
+                        log += String::Format(
+                            TEXT("Oneshot-continue FAIL: clip {} sample {} half-frame {:.4f} (winner={} clip={} err='{}').\n"),
+                            oneShotClip,
+                            source,
+                            half,
+                            result.SampleIndex,
+                            result.ClipIndex,
+                            error);
+                    }
+                }
+                // R3: same far-past probe through the indexed path
+                // (UseIndexedSearch without verify) must agree: no far win.
+                {
+                    const int32 source = farPast;
+                    buildExactQuery(source, queryPose, queryTrajectory);
+                    MotionMatchingSearchSettings g = settings;
+                    g.CurrentTime = anchorTime;
+                    g.ExpectedTime = anchorTime;
+                    g.SameClipExclusionWindow = 0.0f;
+                    g.ContinuingBias = 0.0f;
+                    g.ContinuingWindow = win;
+                    g.SwitchMargin = 0.0f;
+                    g.TwinBanWindow = 0.0f;
+                    g.LoopTailExclusion = 0.0f;
+                    g.ExcludeNonLoopTail = false;
+                    g.UseIndexedSearch = true;
+                    g.VerifyIndexedSearch = false;
+                    MotionMatchingResult result;
+                    String error;
+                    FindBest(database, queryPose, queryTrajectory, g, oneShotClip, 999.0f, noTags, result, error);
+                    phaseRTest++;
+                    tested++;
+                    const bool farReturned = error.IsEmpty() && result.IsValid &&
+                        result.ClipIndex == oneShotClip && result.SampleIndex == source;
+                    if (!farReturned && error.IsEmpty() && result.IsValid)
+                    {
+                        phaseRPass++;
+                        passed++;
+                    }
+                    else
+                    {
+                        log += String::Format(
+                            TEXT("Oneshot-indexed FAIL: clip {} far sample {} (winner={} clip={} err='{}').\n"),
+                            oneShotClip,
+                            source,
+                            result.SampleIndex,
+                            result.ClipIndex,
+                            error);
+                    }
+                }
+                // R4: same far-past probe through FindTopCandidates: the far
+                // sample must not rank in the returned list.
+                {
+                    const int32 source = farPast;
+                    buildExactQuery(source, queryPose, queryTrajectory);
+                    MotionMatchingSearchSettings g = settings;
+                    g.CurrentTime = anchorTime;
+                    g.ExpectedTime = anchorTime;
+                    g.SameClipExclusionWindow = 0.0f;
+                    g.ContinuingBias = 0.0f;
+                    g.ContinuingWindow = win;
+                    g.SwitchMargin = 0.0f;
+                    g.TwinBanWindow = 0.0f;
+                    g.LoopTailExclusion = 0.0f;
+                    g.ExcludeNonLoopTail = false;
+                    Array<float> packed;
+                    String error;
+                    FindTopCandidates(database, queryPose, queryTrajectory, g, oneShotClip, noTags, 32, packed, error);
+                    phaseRTest++;
+                    tested++;
+                    bool ranked = false;
+                    constexpr int32 CandidateStride = 10;
+                    const int32 rows = packed.Count() / CandidateStride;
+                    for (int32 r = 0; r < rows; r++)
+                    {
+                        if ((int32)packed[r * CandidateStride + 0] == source)
+                        {
+                            ranked = true;
+                            break;
+                        }
+                    }
+                    if (!ranked && error.IsEmpty() && packed.Count() > 0)
+                    {
+                        phaseRPass++;
+                        passed++;
+                    }
+                    else
+                    {
+                        log += String::Format(
+                            TEXT("Oneshot-topN FAIL: clip {} far sample {} ranked={} rows={} err='{}'.\n"),
+                            oneShotClip,
+                            source,
+                            ranked ? 1 : 0,
+                            rows,
+                            error);
+                    }
+                }
+            }
+        }
+        // R5: current loop may still pick a far phase (guard is
+        // one-shot-only). Exact far query on the loop clip must return it.
+        if (loopClip < 0 || loopFirst < 0 || loopSource < 0 || loopSource >= sampleCount)
+        {
+            log += String(TEXT("Loop-far FAIL: no straight loop clip (>= 30 samples, span > 0.8s) whose exact mid query wins by itself (fixture missing).\n"));
+            // Fixture gap must fail the run, never pass on zero probes.
+            phaseRTest++;
+            tested++;
+        }
+        else
+        {
+            const int32 source = loopSource;
+            buildExactQuery(source, queryPose, queryTrajectory);
+            MotionMatchingSearchSettings g = settings;
+            g.CurrentTime = sampleTimesArr[loopFirst];
+            g.ExpectedTime = sampleTimesArr[loopFirst];
+            g.SameClipExclusionWindow = 0.0f;
+            g.ContinuingBias = 0.0f;
+            g.ContinuingWindow = 0.15f;
+            g.SwitchMargin = 0.0f;
+            g.TwinBanWindow = 0.0f;
+            g.LoopTailExclusion = 0.0f;
+            g.ExcludeNonLoopTail = false;
+            MotionMatchingResult result;
+            String error;
+            FindBest(database, queryPose, queryTrajectory, g, loopClip, 999.0f, noTags, result, error);
+            phaseRTest++;
+            tested++;
+            bool ok = error.IsEmpty() && result.IsValid &&
+                result.ClipIndex == loopClip && result.SampleIndex == source;
+            if (ok)
+            {
+                phaseRPass++;
+                passed++;
+            }
+            else
+            {
+                log += String::Format(
+                    TEXT("Loop-far FAIL: clip {} far sample {} (winner={} clip={} err='{}').\n"),
+                    loopClip,
+                    source,
+                    result.SampleIndex,
+                    result.ClipIndex,
+                    error);
+            }
+        }
+        // R6: pure search (CurrentTime=-1, ExpectedTime=-1) is uncut: reuse
+        // the qualified one-shot anchor (exact mid already wins by itself
+        // above), queried with no playback context and current = own clip.
+        if (oneShotClip < 0 || oneShotAnchor < 0 || oneShotAnchor >= sampleCount)
+        {
+            log += String(TEXT("Pure-search FAIL: qualified one-shot anchor missing (fixture missing).\n"));
+            // Fixture gap must fail the run, never pass on zero probes.
+            phaseRTest++;
+            tested++;
+        }
+        else
+        {
+            buildExactQuery(oneShotAnchor, queryPose, queryTrajectory);
+            MotionMatchingSearchSettings g = settings;
+            g.CurrentTime = -1.0f;
+            g.ExpectedTime = -1.0f;
+            g.SameClipExclusionWindow = 0.0f;
+            g.ContinuingBias = 0.0f;
+            g.ContinuingWindow = 0.15f;
+            g.SwitchMargin = 0.0f;
+            g.TwinBanWindow = 0.0f;
+            g.LoopTailExclusion = 0.0f;
+            g.ExcludeNonLoopTail = false;
+            MotionMatchingResult result;
+            String error;
+            FindBest(database, queryPose, queryTrajectory, g, oneShotClip, 999.0f, noTags, result, error);
+            // checkExact owns the tested++/passed++ count here (ties
+            // allowed but ordered): proves the pure search is uncut.
+            const bool pureOk = checkExact(oneShotAnchor, result, error, TEXT("Pure-search"));
+            phaseRTest++;
+            if (pureOk)
+                phaseRPass++;
+        }
+        // R7: run include + back exclude returns no back-tagged clip;
+        // empty intersection (run include + exclude-everything) stays
+        // invalid and never widens.
+        {
+            const String runTag(TEXT("run"));
+            const String backTag(TEXT("back"));
+            bool haveRun = false;
+            bool haveBack = false;
+            bool haveRunNonBack = false;
+            for (int32 ti = 0; ti < tagNames.Count(); ti++)
+            {
+                if (tagNames[ti] == runTag)
+                    haveRun = true;
+                if (tagNames[ti] == backTag)
+                    haveBack = true;
+            }
+            for (int32 c = 0; c < clipCount && !haveRunNonBack; c++)
+            {
+                const Array<String>& set = database->GetClipTags(c);
+                if (c < clipSampleCounts.Count() && clipSampleCounts[c] > 0 &&
+                    set.Contains(runTag) && !set.Contains(backTag))
+                    haveRunNonBack = true;
+            }
+            if (!haveRun || !haveBack || !haveRunNonBack)
+            {
+                log += String::Format(
+                    TEXT("Run-exclude FAIL: fixture tags missing (run={} back={} run-non-back={}).\n"),
+                    haveRun ? 1 : 0,
+                    haveBack ? 1 : 0,
+                    haveRunNonBack ? 1 : 0);
+                // Fixture gap must fail the run, never pass on zero probes.
+                phaseRTest += 2;
+                tested += 2;
+            }
+            else
+            {
+                // Source probe: middle sample of the first clip carrying
+                // both run and back (falls back to any run clip).
+                int32 source = -1;
+                int32 scanCursor = 0;
+                for (int32 c = 0; c < clipCount && source < 0; c++)
+                {
+                    const int32 n = (c >= 0 && c < clipSampleCounts.Count()) ? clipSampleCounts[c] : 0;
+                    const Array<String>& set = database->GetClipTags(c);
+                    if (n > 0 && set.Contains(runTag) && set.Contains(backTag))
+                        source = scanCursor + n / 2;
+                    scanCursor += n;
+                }
+                if (source < 0)
+                {
+                    scanCursor = 0;
+                    for (int32 c = 0; c < clipCount && source < 0; c++)
+                    {
+                        const int32 n = (c >= 0 && c < clipSampleCounts.Count()) ? clipSampleCounts[c] : 0;
+                        const Array<String>& set = database->GetClipTags(c);
+                        if (n > 0 && set.Contains(runTag))
+                            source = scanCursor + n / 2;
+                        scanCursor += n;
+                    }
+                }
+                if (source < 0)
+                {
+                    log += String(TEXT("Run-exclude FAIL: no run-tagged clip with samples (fixture missing).\n"));
+                    // Fixture gap must fail the run, never pass on zero probes.
+                    phaseRTest += 2;
+                    tested += 2;
+                }
+                else
+                {
+                    buildExactQuery(source, queryPose, queryTrajectory);
+                    Array<String> runOnly;
+                    runOnly.Add(runTag);
+                    MotionMatchingSearchSettings g = settings;
+                    g.CurrentTime = -1.0f;
+                    g.ExpectedTime = -1.0f;
+                    g.SameClipExclusionWindow = 0.0f;
+                    g.ContinuingBias = 0.0f;
+                    g.SwitchMargin = 0.0f;
+                    Array<String> noBack;
+                    noBack.Add(backTag);
+                    g.ExcludeTags = noBack;
+                    MotionMatchingResult result;
+                    String error;
+                    FindBest(database, queryPose, queryTrajectory, g, -1, MAX_float, runOnly, result, error);
+                    phaseRTest++;
+                    tested++;
+                    bool disjoint = error.IsEmpty() && result.IsValid &&
+                        !database->GetClipTags(result.ClipIndex).Contains(backTag);
+                    if (disjoint)
+                    {
+                        phaseRPass++;
+                        passed++;
+                    }
+                    else
+                    {
+                        log += String::Format(
+                            TEXT("Run-exclude FAIL: source {} (winner={} clip={} tags='{}' err='{}').\n"),
+                            source,
+                            result.SampleIndex,
+                            result.ClipIndex,
+                            MotionMatchingDatabase::JoinTags(database->GetClipTags(result.ClipIndex)),
+                            error);
+                    }
+                    // R8: conflicting pool (run include, exclude every tag
+                    // in the inventory) must stay invalid, never widen.
+                    // Same scope/excludes shape as the R7 probe: the R7
+                    // settings (run include + back exclude) plus full
+                    // inventory exclusion; scope/excludes then conflict on
+                    // every run clip.
+                    MotionMatchingSearchSettings w = g;
+                    w.ExcludeTags.Clear();
+                    for (int32 ti = 0; ti < tagNames.Count(); ti++)
+                        w.ExcludeTags.Add(tagNames[ti]);
+                    MotionMatchingResult wResult;
+                    String wError;
+                    FindBest(database, queryPose, queryTrajectory, w, -1, MAX_float, runOnly, wResult, wError);
+                    phaseRTest++;
+                    tested++;
+                    if (!wResult.IsValid)
+                    {
+                        phaseRPass++;
+                        passed++;
+                    }
+                    else
+                    {
+                        log += String::Format(
+                            TEXT("No-widen FAIL: conflicting pool returned winner={} clip={} (must hold invalid).\n"),
+                            wResult.SampleIndex,
+                            wResult.ClipIndex);
+                    }
+                }
+            }
+        }
+    }
+    log += String::Format(TEXT("Phase R (one-shot progression/back-exclude): {}/{} passed.\n"), phaseRPass, phaseRTest);
 
     const auto endTime = std::chrono::high_resolution_clock::now();
     const double milliseconds = std::chrono::duration<double, std::milli>(endTime - startTime).count();

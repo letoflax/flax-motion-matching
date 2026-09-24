@@ -1373,20 +1373,35 @@ void MotionMatchingRuntimePolicy::RunQuery(const Array<TrajectoryPoint>& traject
     else
     {
         // Same-clip winner: continuation is the default (keep playing).
-        // Exclusion in the search already removed nearby frames, so any
-        // same-clip winner here is a far phase jump worth seeking Ã¢â‚¬â€ but it
-        // still obeys MinSwitchTime hysteresis to avoid reseeking every
-        // query, and end recovery always seeks.
+        // Only LOOP clips may seek a far phase: a finished one-shot must
+        // never self-restart via seek:end-recovery, and a mid-play one-shot
+        // must never jump phases via seek:same-clip-far (the search guard
+        // already bars far same-clip one-shot wins; this is the playback
+        // backstop for stale winners). A finished one-shot holds its end
+        // pose here; the next tick's same-scope search (or its loop-only
+        // end-recovery retry) selects the exit clip. Explicit ForcePlayClip
+        // stays the only seek path for one-shots.
+        const bool winnerIsLoop = _database != nullptr && result.ClipIndex >= 0 &&
+            result.ClipIndex < _database->GetClipCount() &&
+            _database->GetClipLoop(result.ClipIndex);
         const bool atEnd = _playback->IsAtEnd;
         const float jump = AbsF(result.SampleTime - _playback->CurrentTime);
-        if (atEnd)
+        if (atEnd && winnerIsLoop)
         {
             _timeSinceSwitch = 0.0f;
             SeekCount++;
             _playback->Play(result.ClipIndex, result.SampleTime, true);
             LastSwitchReason = String(TEXT("seek:end-recovery"));
         }
-        else if (jump > _tuning.SameClipSeekThreshold && _timeSinceSwitch >= minSwitch)
+        else if (atEnd)
+        {
+            // Finished one-shot: no self-restart. Hold the end pose; the
+            // next tick's same-scope search (or its loop-only end-recovery
+            // retry) selects the exit clip.
+            LastSwitchReason = _timeSinceSwitch < _tuning.MinSwitchTime
+                ? String(TEXT("held:continuity-lock")) : String(TEXT("continued"));
+        }
+        else if (winnerIsLoop && jump > _tuning.SameClipSeekThreshold && _timeSinceSwitch >= minSwitch)
         {
             _timeSinceSwitch = 0.0f;
             SeekCount++;

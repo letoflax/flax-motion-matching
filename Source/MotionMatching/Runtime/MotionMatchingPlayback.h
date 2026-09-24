@@ -59,10 +59,15 @@ public:
     // True while a decay offset is active (telemetry only).
     API_PROPERTY() bool GetInertialActive() const;
 
+    // Turn-in-place visual yaw (4a): per-tick root yaw delta in radians,
+    // measured AFTER sample-time update and BEFORE inertial/strip/pose-snapshot.
+    // C# binds as read-only property RootYawDelta (same pattern as PlayRate).
+    API_PROPERTY() float GetRootYawDelta() const { return _rootYawDelta; }
+
 
     // P2: foot-IK solver + lock machine deleted (was here). Game-side
-    // FootIKController owns all foot solving; search contact features
-    // (bake + query) are untouched.
+    // FootIKEngine (no separate script) owns all foot solving via the facade
+    // single-publish pipeline; search contact features (bake + query) are untouched.
 
 
 
@@ -110,6 +115,10 @@ public:
     const Array<Matrix>& GetSearchLocalsRef() const { return _searchLocals; }
     API_FUNCTION() void Tick(float deltaTime, AnimatedModel* body, bool grounded);
 
+#if USE_EDITOR
+    API_FUNCTION() static bool RunPlaybackSelfTest(MotionMatchingDatabase* database, AnimatedModel* body, API_PARAM(Out) String& log);
+#endif
+
 private:
     MotionMatchingDatabase* _database = nullptr;
     SkinnedModel* _fallbackModel = nullptr;
@@ -126,6 +135,17 @@ private:
 
     float _playRate = 1.0f;
     float _playRateBefore = 1.0f;
+    // Turn-in-place root yaw delta state (4a, radians, once per tick).
+    float _rootYawDelta = 0.0f;
+    Quaternion _prevRootSampleRotation = Quaternion(0.0f, 0.0f, 0.0f, 1.0f);
+    bool _hasPrevRootSample = false;
+    Float3 _rootUpAxis = Float3::Zero;
+    bool _hasRootUpAxis = false;
+    // Lazy Play->first-tick baseline (no sampling in Play): Play stores its
+    // target time here; the next Tick samples the baseline pose (same clip)
+    // and reports the full Play->tick interval without skipping the frame.
+    float _rootYawPlayStartTime = 0.0f;
+    bool _hasRootYawPlayStart = false;
 
     Array<Matrix> _searchLocals;
     Array<Matrix> _prevSearchLocals;
@@ -173,4 +193,9 @@ private:
     static bool TryDecompose(const Matrix& value, Float3& scl, Quaternion& rot, Float3& pos);
     void EnsureHierarchy(SkinnedModel* model);
     void WarnOnce(const String& message);
+    void ResetRootYawState();
+    static bool IsValidUpAxis(const Float3& value);
+    bool TryGetRootSampleRotation(const Array<Matrix>& locals, Quaternion& outRotation) const;
+    float ClampRootYawDelta(float delta, float deltaTime) const;
+    void ApplyRootYawSample(bool currentValid, const Quaternion& currentRotation, float deltaTime, bool wasAtEnd, bool wrapped, bool hasBaseline, const Quaternion& baselineRotation);
 };
