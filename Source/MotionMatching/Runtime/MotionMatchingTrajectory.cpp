@@ -40,6 +40,16 @@ namespace
         const float invLen = 1.0f / Math::Sqrt(blenSq);
         return Float3(bx * invLen * curSpeed, 0.0f, bz * invLen * curSpeed);
     }
+    // Steady-yaw curve: rotate a planar velocity by a yaw delta so a constant
+    // turn predicts an arc, not a straight line. Left-handed Y-up Flax
+    // convention: yaw θ maps Forward(0,0,1)->(sinθ,0,cosθ), hence
+    // x' = x*cosΔ + z*sinΔ, z' = -x*sinΔ + z*cosΔ. Magnitude-preserving.
+    Float3 RotateY(const Float3& v, float angleRad)
+    {
+        const float c = Math::Cos(angleRad);
+        const float s = Math::Sin(angleRad);
+        return Float3(v.X * c + v.Z * s, v.Y, -v.X * s + v.Z * c);
+    }
 }
 
 void MotionMatchingTrajectory::AddHistory(const Float3& position, const Float3& facing, float time)
@@ -181,13 +191,23 @@ const Array<TrajectoryPoint>& MotionMatchingTrajectory::CalculateTrajectory(
         }
         else
         {
+            // Steady-yaw curve: rotate the spring target by yawRate * t so a
+            // constant turn predicts an arc. Angle scaled 0.5x (measured:
+            // full angle over-bends — clips cut corners early, readable as
+            // unfinished turns). Straight runs and idle skip
+            // (BendMinSpeedSq rest-noise floor, 1e-4 rad/s yaw floor).
+            const float desSq = desiredVelocity.X * desiredVelocity.X + desiredVelocity.Z * desiredVelocity.Z;
+            Float3 curvedDesired = desiredVelocity;
+            const float yawRate = currentAngularVelocity.Y;
+            if (desSq > BendMinSpeedSq && (yawRate >= 1e-4f || yawRate <= -1e-4f))
+                curvedDesired = RotateY(desiredVelocity, yawRate * offset * 0.5f);
             // Future: analytic 2nd-order spring in O(1). Planar only, Y untouched.
             Float3 predictedVel;
             SpringDamper::SpringPlanarCharacterPredict(
                 currentPos,
                 bentVelocity,
                 currentAcceleration,
-                desiredVelocity,
+                curvedDesired,
                 positionHalflife,
                 offset,
                 worldPos,

@@ -84,10 +84,13 @@ public struct MotionMatchingFrameInput
     // LoopFilter mirrors MotionLoopFilter (0 Any, 1 LoopOnly, 2 OneShotOnly);
     // CandidateBand mirrors BakedClipSpeedBand DB ids (0 Any, 1 Walk, 2 Run,
     // 3 Sprint); QueryYawRate (rad/s, >= 0) scales the straightness prior.
+    // CallerPlanarSpeed (u/s, >= 0) is the Game-side character planar speed
+    // for play-rate only (clip time bends to world speed, clamped 0.85-1.15).
     // The core never infers these from movement.
     public int LoopFilter;
     public int CandidateBand;
     public float QueryYawRate;
+    public float CallerPlanarSpeed;
 }
 
 // P1: the P0 additive-only DTOs (MotionMatchingQueryFilter,

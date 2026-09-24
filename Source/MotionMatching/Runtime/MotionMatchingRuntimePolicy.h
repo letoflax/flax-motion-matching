@@ -173,7 +173,8 @@ public:
         const MotionMatchingPolicyTuning& tuning,
         int32 callerLoopFilter,
         int32 callerCandidateBand,
-        float callerYawRate);
+        float callerYawRate,
+        float callerPlanarSpeed);
     API_FUNCTION() MotionMatchingPlayback* GetPlayback();
     API_FUNCTION() MotionMatchingTraceLog* GetTrace();
     API_FUNCTION() MotionMatchingTraceEntry GetLastEntry() const;
@@ -263,6 +264,11 @@ private:
     int32 _currentClip = -1;
     bool _hasLastActorPos = false;
     Float3 _lastActorPos = Float3::Zero;
+    // Play-rate clip-speed cache (planar travel / length per clip, 0 when
+    // unmeasurable). Built once per database, not per tick. Reuses the
+    // audit path (baked root positions + clip lengths, no new bake).
+    Array<float> _clipSpeeds;
+    int32 _clipSpeedsDbId = 0;
     bool _warnedOnce = false;
     bool _bindingWarned = false;
 
@@ -273,6 +279,8 @@ private:
     int32 _callerLoopFilter = 0;
     int32 _callerCandidateBand = 0;
     float _callerYawRate = 0.0f;
+    // Play-rate character speed (Game-side planar u/s, explicit Tick param).
+    float _callerPlanarSpeed = 0.0f;
 
     // P3: init-time tag cache only (no motion scan, no audit file).
     Array<Array<String>> _clipTags;
@@ -331,7 +339,8 @@ private:
     static float AbsF(float value);
     static int32 MaxI(int32 a, int32 b);
 
-    float SelectPlayRate();
+    float SelectPlayRate(float characterPlanarSpeed);
+    void EnsureClipSpeedCache();
     // P3: init caches tag SETS only (EnsureClipTagCache) — the motion scan
     // and accel log live inside the explicit static ExportClipAudit command,
     // never in Initialize/Tick.

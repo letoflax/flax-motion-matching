@@ -65,8 +65,8 @@ void MotionMatchingPlayback::SetPlayRate(float value)
         // pose-space (oldPose - newPose decaying over wall time), so a
         // retime neither invalidates nor mixes time bases. Wiping here
         // used to kill the blend on every normal speed change. Real
-        // discontinuities still reset via Play/Stop/teleport, and
-        // BuildInertialOffsets keeps its cross-rate guard.
+        // discontinuities still reset via Play/Stop/teleport (ArmInertial
+        // and BuildInertialOffsets arm/build unconditionally).
     }
 }
 
@@ -216,10 +216,10 @@ void MotionMatchingPlayback::Play(int32 clipIndex, float startTime, bool forceSe
 void MotionMatchingPlayback::ArmInertial()
 {
     ClearInertial();
-    // PLAN §18.10: Rate change invalidates active inertial offsets; never
-    // mix a retimed clip with an offset computed at another rate.
-    if (AbsF(_playRate - _playRateBefore) > PlayRateEpsilon)
-        return;
+    // Offsets are pose-space (oldPose - newPose decaying over wall time):
+    // a retime changes only the sampling rate, not the pose delta, so the
+    // blend stays valid across play-rate changes. Wiping here used to kill
+    // every switch blend whenever SelectPlayRate returned != 1.0.
     if (_searchLocals.Count() > 0)
         _inertialPending = true;
 }
@@ -442,10 +442,8 @@ void MotionMatchingPlayback::ApplyInertialization(Array<Matrix>& baseLocals, Ski
 void MotionMatchingPlayback::BuildInertialOffsets(Array<Matrix>& newBase, SkinnedModel* model, float dt)
 {
     ClearInertial();
-    // PLAN §18.10: Never mix a retimed clip with an offset computed at another rate.
-    // If rate changed across the transition, continuity/inertial offsets must be reset.
-    if (AbsF(_playRate - _playRateBefore) > PlayRateEpsilon)
-        return;
+    // Same basis as ArmInertial: offsets are pose-space deltas, so a rate
+    // change across the transition must not wipe them (see above).
     if (_searchLocals.Count() != newBase.Count() || newBase.Count() == 0)
         return;
     const int32 n = newBase.Count();

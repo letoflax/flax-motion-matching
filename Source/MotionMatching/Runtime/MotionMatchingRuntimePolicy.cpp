@@ -23,11 +23,11 @@ namespace
     constexpr float TravelingDistance = 50.0f;
     constexpr float MaxFastPathAge = 0.5f;
     constexpr int32 MaxFastPathFrames = 5;
-    constexpr float ReselectHistoryDuration = 0.3f;
-    constexpr float ReselectSampleWindow = 0.25f;
+    constexpr float ReselectHistoryDuration = 0.6f;
+    constexpr float ReselectSampleWindow = 0.35f;
     constexpr bool EnableReselectBan = true;
     constexpr bool EnableLoopTailExclusion = false;
-    constexpr float SameSegmentTwinBan = 0.12f;
+    constexpr float SameSegmentTwinBan = 0.25f;
     constexpr float NonLoopTailExclusion = 0.3f;
     constexpr float PiF = 3.14159265358979323846f;
 
@@ -142,8 +142,8 @@ void MotionMatchingRuntimePolicy::Initialize(
     _body = body;
     _liveSchema = schema;
     _cacheFolder = cacheFolder;
-    (void)defaultInertial;
     _playback = New<MotionMatchingPlayback>();
+    _playback->InertializationDuration = defaultInertial > 0.01f ? defaultInertial : 0.25f;
     _trace = New<MotionMatchingTraceLog>();
     SkinnedModel* fallbackModel = nullptr;
     Float3 controllerUp(0.0f, 0.0f, -1.0f);
@@ -268,6 +268,8 @@ void MotionMatchingRuntimePolicy::Shutdown()
         _trace = nullptr;
     }
     _clipTags.Clear();
+    _clipSpeeds.Clear();
+    _clipSpeedsDbId = 0;
     _telemetryHead = 0;
     _telemetryCount = 0;
     _telemetryDropped = 0;
@@ -657,9 +659,75 @@ void MotionMatchingRuntimePolicy::WarnOnce(const String& message)
     LOG(Warning, "{}", message);
 }
 
-float MotionMatchingRuntimePolicy::SelectPlayRate()
+float MotionMatchingRuntimePolicy::SelectPlayRate(float characterPlanarSpeed)
 {
-    return 1.0f;
+    // Bend clip time to match world speed: characterPlanar / clipRootSpeed,
+    // clamped to the playback [0.85, 1.15] window (SetPlayRate clamps again).
+    // Clip speed reuses the audit path (planar travel / length from baked
+    // root positions + clip lengths), cached once per database in
+    // EnsureClipSpeedCache — never a per-tick DB scan. Character speed is
+    // the Game-side planar speed (explicit Tick param, teleport-clean).
+    // Missing metadata for a clip returns 1.0 for that tick.
+    if (_database == nullptr || !_database->IsBaked() || _currentClip < 0)
+        return 1.0f;
+    if (characterPlanarSpeed <= 10.0f)
+        return 1.0f;
+    EnsureClipSpeedCache();
+    if (_currentClip >= _clipSpeeds.Count())
+        return 1.0f;
+    const float clipSpeed = _clipSpeeds[_currentClip];
+    if (clipSpeed <= 1.0f)
+        return 1.0f;
+    const float rate = characterPlanarSpeed / clipSpeed;
+    if (rate < 0.85f)
+        return 0.85f;
+    if (rate > 1.15f)
+        return 1.15f;
+    return rate;
+}
+
+void MotionMatchingRuntimePolicy::EnsureClipSpeedCache()
+{
+    int32 dbId = 0;
+    MotionMatchingDatabase* db = _database;
+    int32 clipCount = 0;
+    if (db != nullptr)
+    {
+        clipCount = db->GetClipCount();
+        dbId = (int32)(((uintptr_t)db) & 0xFFFFFFFF) ^ (clipCount * 397) ^ (db->GetSampleCount() * 13);
+    }
+    if (dbId != 0 && dbId == _clipSpeedsDbId && _clipSpeeds.Count() == clipCount)
+        return;
+    _clipSpeeds.Clear();
+    _clipSpeedsDbId = 0;
+    if (db == nullptr || !db->IsBaked() || clipCount <= 0)
+        return;
+    const Array<float>& lengths = db->GetClipLengths();
+    const Array<Float3>& positions = db->GetRootPositions();
+    const Array<int32>& counts = db->GetClipSampleCounts();
+    if (counts.Count() != clipCount || positions.Count() == 0)
+        return;
+    _clipSpeeds.Resize(clipCount);
+    int32 cursor = 0;
+    for (int32 c = 0; c < clipCount; c++)
+    {
+        float speed = 0.0f;
+        const int32 n = c < counts.Count() ? counts[c] : 0;
+        const float len = c < lengths.Count() ? lengths[c] : 0.0f;
+        if (n > 1 && cursor + n <= positions.Count() && len > 0.01f)
+        {
+            float path = 0.0f;
+            for (int32 i = 1; i < n; i++)
+            {
+                const Float3 dp = positions[cursor + i] - positions[cursor + i - 1];
+                path += Math::Sqrt(dp.X * dp.X + dp.Z * dp.Z);
+            }
+            speed = path / len;
+        }
+        _clipSpeeds[c] = speed;
+        cursor += n;
+    }
+    _clipSpeedsDbId = dbId;
 }
 
 void MotionMatchingRuntimePolicy::Tick(
@@ -671,7 +739,8 @@ void MotionMatchingRuntimePolicy::Tick(
     const MotionMatchingPolicyTuning& tuning,
     int32 callerLoopFilter,
     int32 callerCandidateBand,
-    float callerYawRate)
+    float callerYawRate,
+    float callerPlanarSpeed)
 {
     if (!_samplingReady || _database == nullptr || _body == nullptr || _playback == nullptr || _trace == nullptr)
         return;
@@ -690,10 +759,10 @@ void MotionMatchingRuntimePolicy::Tick(
     _tuning = tuning;
     // P2 caller filter (Game selection policy output): the ONLY LoopFilter /
     // CandidateBand / YawRate the core uses. Clamped to the valid range;
-    // never inferred from movement. 0 = Any for both filters.
     _callerLoopFilter = callerLoopFilter >= 0 && callerLoopFilter <= 2 ? callerLoopFilter : 0;
     _callerCandidateBand = callerCandidateBand >= 0 && callerCandidateBand <= 3 ? callerCandidateBand : 0;
     _callerYawRate = callerYawRate >= 0.0f && callerYawRate < 1e29f ? callerYawRate : 0.0f;
+    _callerPlanarSpeed = callerPlanarSpeed >= 0.0f && callerPlanarSpeed < 1e29f ? callerPlanarSpeed : 0.0f;
     // P5: _trajectoryPoints/_sampleTimes dead copies deleted (were written
     // every tick but never read; RunQuery uses its params + _tickTrajectory).
 
@@ -844,8 +913,13 @@ void MotionMatchingRuntimePolicy::Tick(
         TryFastPath(frameDt);
     }
 
-
-    _playback->SetPlayRate(SelectPlayRate());
+    // Play-rate applies to the NEXT tick's advance: it is computed from this
+    // tick's winning clip (_currentClip just decided above) against the
+    // Game-side planar speed, so a start one-shot never slow-plays its first
+    // frames on the stale rate of the previous clip (observed: idle rate
+    // 1.0 -> start plays slow while char outruns it = start slide; the clip
+    // then fast-forwards to catch up once its own speed is known).
+    _playback->SetPlayRate(SelectPlayRate(_callerPlanarSpeed));
     // §18.9: stamp this tick's search decision on playback before it
     // asserts intra-tick ordering (sample <= search <= save < layer < IK).
     NotifySearch();
@@ -945,11 +1019,12 @@ void MotionMatchingRuntimePolicy::RunQuery(const Array<TrajectoryPoint>& traject
     // otherwise a planted one-shot (pivot) wins the poisoned query and the
     // playing pose then looks like itself forever. No gait read.
     const bool reseeded = _chooserReseed;
-    // P2: provider-decided scope only (native legacy chooser deleted). The
-    // provider owns hysteresis/bands/roles game-side; empty allowed is an
-    // explicit no-match: hold current, never fall back to any pool.
-    _chooserReseed = false;
-    // P5: reuse the last split while the joined scope is unchanged (exact
+    // Keep the reseed LoopOnly guard armed until the Game-side planar speed
+    // settles (teleport frames report ~0 while the spring spins up; the
+    // first query after teleport otherwise plants a one-shot on a
+    // zero-velocity poisoned pose and continuity holds it all phase).
+    // _chooserReseed clears on the first settled scan below, not here.
+    bool keepReseedArmed = _chooserReseed && _callerPlanarSpeed <= 5.0f;
     // match, no Split per query in steady-state). Bound: <=8 tags; rebuilt
     // only on scope change. Semantics unchanged: same tags array as Split.
     // P5 twins: this RunQuery pair (_queryTagsKey/_queryTagsCache) is
@@ -1111,7 +1186,7 @@ void MotionMatchingRuntimePolicy::RunQuery(const Array<TrajectoryPoint>& traject
     // (neutral structural rule, no gait read); otherwise the caller filter
     // rides verbatim. The core never derives LoopFilter/OneShotBand from
     // movement, grounded, sprint or yaw.
-    settings.LoopFilter = reseeded ? MotionLoopFilter::LoopOnly :
+    settings.LoopFilter = (reseeded || keepReseedArmed) ? MotionLoopFilter::LoopOnly :
         (MotionLoopFilter)_callerLoopFilter;
     settings.OneShotBand = _callerCandidateBand;
     // Controller-decided exclusions ride the snapshot (plain-String
@@ -1183,13 +1258,17 @@ void MotionMatchingRuntimePolicy::RunQuery(const Array<TrajectoryPoint>& traject
     // end-recovery retry above survives.
 
     // Ã‚Â§18.8: a completed full scan re-anchors the fast-path baseline and
-    // clears reseed. An invalid result invalidates the cost baseline so
+    // clears reseed once planar settles (see keepReseedArmed above: clearing
+    // on the poisoned zero-velocity query plants a one-shot all phase).
+    // An invalid result invalidates the cost baseline so
     // the next continuation check misses instead of holding stale data.
     _lastFullScanTime = Time::GetGameTime();
     _lastFullScanFrame = _policyFrame;
     _fastPathFrames = 0;
     _consecutiveContinuationMisses = 0;
     _fastPathReseed = false;
+    if (!keepReseedArmed)
+        _chooserReseed = false;
     _lastScanSignature = scanSignature;
     _hasLastScanSignature = true;
     _lastScanTotal = result.IsValid ? result.Cost : MAX_float;
@@ -1353,9 +1432,11 @@ bool MotionMatchingRuntimePolicy::TryFastPath(float frameDt)
     // caught by the signature check below on the same tick.
     // Reseed/teleport: the incumbent was measured against the old
     // baseline; the first continuation check after a reset must scan.
-    if (_fastPathReseed)
+    // Also miss while the reseed LoopOnly guard is armed (keepReseedArmed):
+    // holding a pre-teleport loop continuation through the poisoned window
+    // re-plants the cascade just as a one-shot win would.
+    if (_fastPathReseed || (_chooserReseed && _callerPlanarSpeed <= 5.0f))
         return MissFastPath("forced:reseed");
-    // No baseline yet (init/teleport/force reset _lastScanTotal to MaxValue):
     // MaxValue as threshold would hold ANYTHING, freezing the pre-reset
     // clip forever (observed: whole phases stuck in idle). Force a scan.
     if (_lastScanTotal >= 1e29f)

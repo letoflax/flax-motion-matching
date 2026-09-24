@@ -93,10 +93,18 @@ public static class MotionMatchingAutoSetup
     {
         var set = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         string[] tokens = Tokenize(filePath);
+        // Crouch wins outright: a crouching skeleton must never contest
+        // stand/walk/run queries (observed: crouch idle break winning rest
+        // with zero yaw). Rebake picks this up; registry edit below covers
+        // the live DB path without a rebake.
+        if (tokens.Contains("crouch", StringComparer.OrdinalIgnoreCase))
+        {
+            set.Add("crouch");
+            return set.ToArray();
+        }
         bool jump = tokens.Contains("jump", StringComparer.OrdinalIgnoreCase);
         bool hasGait = tokens.Any(t => GaitTokens.Contains(t)) && !jump;
         string gait = tokens.FirstOrDefault(t => GaitTokens.Contains(t))?.ToLowerInvariant();
-
         if (tokens.Contains("turn", StringComparer.OrdinalIgnoreCase))
         {
             if (tokens.Contains("walk", StringComparer.OrdinalIgnoreCase) ||

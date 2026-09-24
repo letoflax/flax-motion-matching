@@ -613,10 +613,11 @@ public class MotionMatchingController : IDisposable
         int callerLoop = input.LoopFilter >= 0 && input.LoopFilter <= 2 ? input.LoopFilter : 0;
         int callerBand = input.CandidateBand >= 0 && input.CandidateBand <= 3 ? input.CandidateBand : 0;
         float callerYaw = input.QueryYawRate >= 0.0f && input.QueryYawRate < 1e29f ? input.QueryYawRate : 0.0f;
+        float callerPlanar = input.CallerPlanarSpeed >= 0.0f && input.CallerPlanarSpeed < 1e29f ? input.CallerPlanarSpeed : 0.0f;
         _policy.Tick(deltaTime, snapshot,
             input.Points ?? Array.Empty<TrajectoryPoint>(),
             actorWorld.GetWorld(), TrajectorySampleTimes, tuning,
-            callerLoop, callerBand, callerYaw);
+            callerLoop, callerBand, callerYaw, callerPlanar);
 
         PolicyState = _policy.PolicyState;
         WinnerSample = _policy.WinnerSample;
