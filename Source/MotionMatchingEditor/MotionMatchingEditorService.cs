@@ -195,6 +195,10 @@ public static class MotionMatchingEditorService
             var root = JsonSerializer.Deserialize<ClipRegistryFile>(File.ReadAllText(path));
             if (root == null || root.clips == null || root.clips.Length == 0)
                 return $"Import failed: no clips in '{path}'.";
+            // An import replaces the whole registry, so a database that does
+            // not exist yet (new DatabasePath) is created empty first.
+            if (!File.Exists(controller.DatabaseFile))
+                ClearAllAnimationClips(controller);
             if (!EnsureDatabaseLoaded(controller) || !controller.Database)
                 return "Import failed: database is not loaded.";
 

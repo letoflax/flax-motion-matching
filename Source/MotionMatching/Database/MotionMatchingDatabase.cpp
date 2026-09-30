@@ -196,27 +196,51 @@ namespace
     /// Registers the asset factory safely when the Game module is hot-reloaded.
     /// Flax can keep the previous factory entry alive until the old module is
     /// released, so replacing the key is required before adding the new one.
+    ///
+    /// Two keys: the frozen serialized TypeName (what database files carry
+    /// in their header) and the scripting type name. Content::CreateVirtualAsset
+    /// finds the factory by the scripting type name, so without the second
+    /// key a database that does not exist yet could not be created.
     /// </summary>
     class MotionMatchingDatabaseFactory : public BinaryAssetFactory<MotionMatchingDatabase>
     {
     public:
         MotionMatchingDatabaseFactory()
         {
-            auto& factories = IAssetFactory::Get();
-            factories.Remove(MotionMatchingDatabase::TypeName);
-            factories.Add(MotionMatchingDatabase::TypeName, this);
+            Register(MotionMatchingDatabase::TypeName);
+            Register(ScriptingTypeName());
         }
 
         ~MotionMatchingDatabaseFactory()
         {
+            Unregister(MotionMatchingDatabase::TypeName);
+            Unregister(ScriptingTypeName());
+        }
+
+    private:
+        // The registry keys are string views: the text must outlive the entry.
+        static const StringView& ScriptingTypeName()
+        {
+            static const StringView name(TEXT("MotionMatching.MotionMatchingDatabase"));
+            return name;
+        }
+
+        void Register(const StringView& key)
+        {
+            auto& factories = IAssetFactory::Get();
+            factories.Remove(key);
+            factories.Add(key, this);
+        }
+
+        void Unregister(const StringView& key)
+        {
             auto& factories = IAssetFactory::Get();
             IAssetFactory* current = nullptr;
-            if (factories.TryGet(MotionMatchingDatabase::TypeName, current) &&
-                current == this)
-            {
-                factories.Remove(MotionMatchingDatabase::TypeName);
-            }
+            if (factories.TryGet(key, current) && current == this)
+                factories.Remove(key);
         }
+
+    public:
 
         bool SupportsVirtualAssets() const override
         {

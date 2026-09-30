@@ -199,6 +199,9 @@ bool MotionMatchingDatabase::Save(const StringView& path)
     FlaxChunk* chunk;
     if (IsVirtual())
     {
+        // A virtual asset is created under the scripting type name; the file
+        // must carry the frozen serialized TypeName like every other database.
+        _header.TypeName = TypeName;
         _header.Chunks[0] = chunk = New<FlaxChunk>();
     }
     else
