@@ -67,27 +67,36 @@ public static class MotionMatchingEditorService
             ReloadDatabase(controller, true, onEdited);
     }
 
-    public static void AddClipFiles(MotionMatchingController controller, string[] tags, string[] paths, bool loop = true, int group = 0, Action onEdited = null)
+    /// <summary>
+    /// Registers clip files under one (tags, loop, group). Returns how many
+    /// clips the database really added (0 when nothing was registered).
+    /// </summary>
+    public static int AddClipFiles(MotionMatchingController controller, string[] tags, string[] paths, bool loop = true, int group = 0, Action onEdited = null)
     {
         if (controller == null)
-            return;
+            return 0;
         if (tags == null || tags.Length == 0 || paths == null || paths.Length == 0)
-            return;
+            return 0;
 
         if (MotionMatchingDatabase.AddClipFiles(
                 controller.DatabaseFile, tags, paths, loop, Math.Max(0, group), out int addedCount))
         {
             Debug.Log($"Registered {addedCount} motion matching clips for '{string.Join("+", tags)}' (group {group}).");
             ReloadDatabase(controller, true, onEdited);
+            return Math.Max(0, addedCount);
         }
+        return 0;
     }
 
-    public static void ClearAllAnimationClips(MotionMatchingController controller, Action onEdited = null)
+    /// <summary>Clears the clip registry. Returns false when the database could not be cleared.</summary>
+    public static bool ClearAllAnimationClips(MotionMatchingController controller, Action onEdited = null)
     {
         if (controller == null)
-            return;
-        if (MotionMatchingDatabase.ClearClips(controller.DatabaseFile))
-            ReloadDatabase(controller, true, onEdited);
+            return false;
+        if (!MotionMatchingDatabase.ClearClips(controller.DatabaseFile))
+            return false;
+        ReloadDatabase(controller, true, onEdited);
+        return true;
     }
 
     /// <summary>
@@ -206,7 +215,9 @@ public static class MotionMatchingEditorService
             if (!EnsureDatabaseLoaded(controller) || !controller.Database)
                 return "Import failed: database is not loaded.";
 
-            var groups = new Dictionary<string, List<string>>();
+            // Batches are keyed by value (tags, loop, group); the joined string
+            // is only the sort key, never parsed back, so any tag text is safe.
+            var groups = new Dictionary<(string Tags, bool Loop, int Group), List<string>>();
             int skipped = 0;
             foreach (var entry in root.clips)
             {
@@ -237,8 +248,7 @@ public static class MotionMatchingEditorService
                 }
                 bool loop = entry.loop ?? options?.InferLoop?.Invoke(full) ?? false;
                 int group = Math.Max(0, entry.group ?? options?.InferGroup?.Invoke(full) ?? 0);
-                string key = string.Join("+", clean.OrderBy(t => t, StringComparer.Ordinal)) +
-                    "|" + (loop ? "loop" : "once") + "|" + group.ToString(System.Globalization.CultureInfo.InvariantCulture);
+                var key = (string.Join("+", clean.OrderBy(t => t, StringComparer.Ordinal)), loop, group);
                 if (!groups.TryGetValue(key, out var list))
                 {
                     list = new List<string>();
@@ -246,24 +256,35 @@ public static class MotionMatchingEditorService
                 }
                 list.Add(full);
             }
+            if (groups.Count == 0)
+                return $"Import failed: no usable clips in '{path}' (skipped {skipped}); the registry was not changed.";
 
-            ClearAllAnimationClips(controller);
+            // The input parsed completely; only now replace the registry.
+            if (!ClearAllAnimationClips(controller))
+                return "Import failed: the clip registry could not be cleared.";
             int added = 0;
-            foreach (var pair in groups.OrderBy(p => p.Key, StringComparer.Ordinal))
+            int requested = 0;
+            foreach (var pair in groups.OrderBy(p => SortKey(p.Key), StringComparer.Ordinal))
             {
-                string[] parts = pair.Key.Split('|');
                 string[] files = pair.Value.ToArray();
-                int group = int.Parse(parts[2], System.Globalization.CultureInfo.InvariantCulture);
+                requested += files.Length;
                 // AddClipFiles resolves content-relative or absolute paths.
-                AddClipFiles(controller, parts[0].Split('+'), files, parts[1] == "loop", group);
-                added += files.Length;
+                added += AddClipFiles(controller, pair.Key.Tags.Split('+'), files, pair.Key.Loop, pair.Key.Group);
             }
-            return $"Imported {added} clips in {groups.Count} groups from '{path}' (skipped {skipped}). Bake required.";
+            string notAdded = added < requested ? $", {requested - added} not added" : string.Empty;
+            return $"Imported {added} clips in {groups.Count} groups from '{path}' (skipped {skipped}{notAdded}). Bake required.";
         }
         catch (Exception ex)
         {
             return "Import failed: " + ex.Message;
         }
+    }
+
+    // Same registration order as the historical "tags|loop|group" string key.
+    private static string SortKey((string Tags, bool Loop, int Group) key)
+    {
+        return key.Tags + "|" + (key.Loop ? "loop" : "once") + "|" +
+            key.Group.ToString(System.Globalization.CultureInfo.InvariantCulture);
     }
 
     /// <summary>

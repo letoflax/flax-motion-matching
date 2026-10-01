@@ -35,10 +35,14 @@ What `Upgrade_4_To_5` does:
   (`Hand`), RightHand (`Hand`), skipping empty names; `ContactBones` = the two
   feet. This is exactly the v4 fixed layout: same bone order, same
   normalization groups, same contact offsets.
-- Copies everything after the schema unchanged (registry, groups, baked
-  arrays, fingerprint).
-- `SchemaContractRevision` is now 4 and `BakeToolBuildId` 3, so the baked
-  arrays load as stale and are dropped (registry kept, REBAKE REQUIRED).
+- Keeps the clip registry (source animations, tag sets, loop flags and the
+  per-source groups).
+- Writes the baked arrays, provenance and skeleton fingerprint empty, like
+  the v3 -> v4 upgrade (the baked v4 features belong to schema contract
+  revision 3; v5 is revision 4 with `BakeToolBuildId` 3). The database is
+  registry-only until it is rebaked (REBAKE REQUIRED), and the converted
+  declaration stays in `Database.Schema` so the host can read it to migrate
+  its own schema.
 
 After the rebake, a database of the converted declaration has the same
 `featuresHash` as before the upgrade: the features are bit-identical. The
@@ -79,7 +83,7 @@ change for the same clips and schema values (`featuresHash` stays equal);
 `clipMetadataHash` changes because it now covers the clip groups instead of
 the file-name turn-like flag.
 
-The upgrade only runs in the editor. A cooked game needs a v4 asset, so open
+The upgrade only runs in the editor. A cooked game needs a v5 asset, so open
 and rebake (or save) every database in the editor before cooking.
 
 ## Clip groups replace file-name bands

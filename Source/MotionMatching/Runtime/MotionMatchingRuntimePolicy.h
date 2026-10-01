@@ -236,6 +236,9 @@ private:
     int32 _searchSnapshotLength = 0;
     Array<float> _latestPose;
     Array<float> _packedTrajectory;
+    // One-time log when the database's trajectory point count no longer
+    // matches the scratch sized at Initialize (database rebaked while bound).
+    bool _packedTrajectoryMismatchLogged = false;
     Matrix _latestRootWorld = Matrix::Identity;
     bool _poseValid = false;
     Array<float> _tickTrajectory;

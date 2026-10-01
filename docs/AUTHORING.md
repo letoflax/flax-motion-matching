@@ -147,10 +147,13 @@ and `SuggestBoneAliases`, or the "Suggest Bone Aliases" button of the register
 clips window.
 
 The bake also stores a skeleton fingerprint: the driven nodes and their
-ancestors with their parents and local offsets, taken from the clips where
-they are constant and from the bake model otherwise. When the controller
+ancestors with their parents and local offsets. A node's offset is taken from
+the clips when every position key of every clip stays within 5% of the first
+key; when any key moves further (inside one clip or between clips, for
+example root motion or a crouch offset) the offset is animated, the bake model's
+bind offset is stored and that node is not compared. When the controller
 binds, the body's model must have every fingerprint node with the same parent
-and offsets within 5% (nodes whose offset is animated are not compared). The
+and offsets within 5% (animated nodes are not compared). The
 bake logs a warning when the clips' own offsets already differ from the bake
 model by more than 5%.
 

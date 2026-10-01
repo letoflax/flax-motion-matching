@@ -133,6 +133,9 @@ namespace
         Array<String> UndrivenNodes;     // model nodes no clip channel drives
         Array<String> MissingRequired;   // required roles no clip drives at all (bake fails)
         Array<String> PartialRequired;   // required roles some clips do not drive (bind pose; report only)
+        Array<String> InvalidAliases;    // aliases whose Node is not a model node (typo; bake fails)
+        Array<String> UnusedAliases;     // aliases whose Channel is in no clip (report only)
+        Array<String> Collisions;        // two channels of one clip driving one node (report only)
         Array<BoneAlias> Suggestions;
     };
 
@@ -211,6 +214,10 @@ namespace
         }
 
         Array<int32> nodeToChannel;
+        Array<MotionMatchingChannelMap::TargetCollision> clipCollisions;
+        Array<String> collisionKeys;
+        Array<int32> collisionClips;
+        Array<String> collisionFirstClip;
         for (Animation* clip : clips)
         {
             if (clip == nullptr || clip->WaitForLoaded())
@@ -221,6 +228,23 @@ namespace
             {
                 if (!out.ChannelNames.Contains(channel.NodeName))
                     out.ChannelNames.Add(channel.NodeName);
+            }
+            MotionMatchingChannelMap::FindTargetCollisions(channels, schema.BoneAliases, clipCollisions);
+            for (const auto& collision : clipCollisions)
+            {
+                if (!nodeNames.Contains(collision.Node))
+                    continue;
+                const String key = String::Format(TEXT("node '{}' is driven by channel '{}'; channel '{}' also resolves to it and is ignored"),
+                    collision.Node, collision.Winner, collision.Shadowed);
+                const int32 k = collisionKeys.Find(key);
+                if (k >= 0)
+                {
+                    collisionClips[k]++;
+                    continue;
+                }
+                collisionKeys.Add(key);
+                collisionClips.Add(1);
+                collisionFirstClip.Add(StringUtils::GetFileNameWithoutExtension(clip->GetPath()));
             }
             MotionMatchingChannelMap::Build(nodes, channels, schema.BoneAliases, nodeToChannel);
             for (int32 n = 0; n < nodes.Count(); n++)
@@ -260,6 +284,24 @@ namespace
                 TEXT("{} '{}' has no channel in {} of {} clips (first: {})"),
                 roleNames[r], roleNodes[r], roleMissing[r], out.ClipCount, roleFirstClip[r]));
         }
+        for (int32 k = 0; k < collisionKeys.Count(); k++)
+        {
+            out.Collisions.Add(String::Format(TEXT("{} in {} of {} clips (first: {})"),
+                collisionKeys[k], collisionClips[k], out.ClipCount, collisionFirstClip[k]));
+        }
+        for (const BoneAlias& alias : schema.BoneAliases)
+        {
+            if (!nodeNames.Contains(alias.Node))
+            {
+                out.InvalidAliases.Add(String::Format(TEXT("alias '{}' -> '{}': the model has no node '{}'"),
+                    alias.Channel, alias.Node, alias.Node));
+            }
+            if (!out.ChannelNames.Contains(alias.Channel))
+            {
+                out.UnusedAliases.Add(String::Format(TEXT("alias '{}' -> '{}': no clip has a channel '{}'"),
+                    alias.Channel, alias.Node, alias.Channel));
+            }
+        }
         MotionMatchingChannelMap::SuggestAliases(out.ChannelNames, nodeNames, schema.BoneAliases, out.Suggestions);
     }
 
@@ -279,6 +321,12 @@ namespace
             text += String(TEXT("\n  suggested Schema.BoneAliases (channel -> node, by normalized name): ")) + JoinAliases(coverage.Suggestions, 24);
         for (const String& line : coverage.PartialRequired)
             text += String(TEXT("\n  NOTE (bind pose is used in those clips): ")) + line;
+        for (const String& line : coverage.UnusedAliases)
+            text += String(TEXT("\n  NOTE (unused alias): ")) + line;
+        for (const String& line : coverage.Collisions)
+            text += String(TEXT("\n  NOTE (channel collision, the first channel wins): ")) + line;
+        for (const String& line : coverage.InvalidAliases)
+            text += String(TEXT("\n  ALIAS ERROR: ")) + line;
         for (const String& line : coverage.MissingRequired)
             text += String(TEXT("\n  REQUIRED: ")) + line;
         return text;
@@ -589,6 +637,13 @@ bool MotionMatchingBaker::Bake(
         ChannelCoverage coverage;
         AnalyzeCoverage(model, animations, bakedSchema, coverage);
         const String coverageText = DescribeCoverage(coverage);
+        if (coverage.InvalidAliases.HasItems())
+        {
+            LOG(Error, "{}", coverageText);
+            LOG(Error, "Motion matching bake failed: Schema.BoneAliases names model nodes that do not exist (see ALIAS ERROR above). "
+                "Fix the Node names of those aliases and bake again.");
+            return false;
+        }
         if (coverage.MissingRequired.HasItems())
         {
             LOG(Error, "{}", coverageText);

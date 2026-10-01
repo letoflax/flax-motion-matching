@@ -67,6 +67,48 @@ namespace MotionMatchingChannelMap
     }
 
     /// <summary>
+    /// Two channels of one clip that resolve to the same target (an alias
+    /// target that is also a raw channel name, or two raw duplicates). Build
+    /// keeps the first channel; the later one is ignored.
+    /// </summary>
+    struct TargetCollision
+    {
+        String Node;
+        String Winner;
+        String Shadowed;
+    };
+
+    /// <summary>
+    /// Lists every channel whose target an earlier channel of the same clip
+    /// already drives (same first-wins rule as Build). Reporting only.
+    /// </summary>
+    inline void FindTargetCollisions(
+        const Array<NodeAnimationData>& channels,
+        const Array<BoneAlias>& aliases,
+        Array<TargetCollision>& outCollisions)
+    {
+        outCollisions.Clear();
+        Dictionary<String, int32> firstChannelByTarget;
+        for (int32 c = 0; c < channels.Count(); c++)
+        {
+            const String& target = ResolveTarget(channels[c].NodeName, aliases);
+            int32 winner = -1;
+            if (firstChannelByTarget.TryGet(target, winner))
+            {
+                TargetCollision collision;
+                collision.Node = target;
+                collision.Winner = channels[winner].NodeName;
+                collision.Shadowed = channels[c].NodeName;
+                outCollisions.Add(collision);
+            }
+            else
+            {
+                firstChannelByTarget.Add(target, c);
+            }
+        }
+    }
+
+    /// <summary>
     /// Local transform of one node at a frame: the bind local transform with
     /// the channel's non-empty sub-tracks evaluated on top (sub-tracks removed
     /// by import or keyframe optimization keep their bind values).

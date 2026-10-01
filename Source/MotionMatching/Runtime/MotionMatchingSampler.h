@@ -76,6 +76,11 @@ public:
     /// <summary>
     /// Samples one clip at the given time and writes per-node actor-space
     /// transforms. Time is clamped into the clip range by the caller.
+    /// Limitation: channels drive the model node with the SAME name only;
+    /// Schema.BoneAliases are NOT applied, so an aliased channel leaves its
+    /// node at the bind pose. For aliased clips, build the table in C++ with
+    /// MotionMatchingChannelMap::Build(nodes, channels, schema.BoneAliases, table)
+    /// and call SampleClipLocalPoseMapped (what playback does).
     /// </summary>
     API_FUNCTION()
     static bool SampleClipPose(
@@ -111,8 +116,10 @@ public:
     /// mutate it in place while the saved search snapshot stays intact
     /// (PLAN §16). Row-vector convention: ComposeModelPose builds
     /// childLocal * parentWorld (parent on the RIGHT).
-    /// Builds the channel map per call without aliases; playback uses
-    /// SampleClipLocalPoseMapped with a cached map instead.
+    /// Limitation: builds the channel map per call WITHOUT Schema.BoneAliases
+    /// (exact channel-to-node names only; an aliased channel leaves its node
+    /// at the bind pose). Playback uses SampleClipLocalPoseMapped with a cached
+    /// map that has the database aliases applied; do the same for aliased clips.
     /// </summary>
     API_FUNCTION()
     static bool SampleClipLocalPose(

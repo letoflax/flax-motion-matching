@@ -84,12 +84,54 @@ void MotionMatchingSkeletonFingerprint::Serialize(WriteStream& stream) const
     stream.Write(NodeFlags);
 }
 
-void MotionMatchingSkeletonFingerprint::Deserialize(ReadStream& stream)
+namespace
 {
-    stream.Read(NodeNames);
-    stream.Read(ParentIndices);
-    stream.Read(Translations);
-    stream.Read(NodeFlags);
+    // Same byte layout as ReadStream::Read(Array<T>) (int32 count, then the
+    // items), but a count outside [0, limit] or past the end of the stream
+    // fails the read instead of allocating it.
+    bool ReadBoundedInts(ReadStream& stream, Array<int32>& out, int32 limit)
+    {
+        out.Clear();
+        int32 count = 0;
+        stream.ReadInt32(&count);
+        if (stream.HasError() || count < 0 || count > limit)
+            return false;
+        const uint32 bytes = static_cast<uint32>(count) * sizeof(int32);
+        if (stream.GetLength() - stream.GetPosition() < bytes)
+            return false;
+        out.Resize(count, false);
+        if (count > 0)
+            stream.ReadBytes(out.Get(), bytes);
+        return !stream.HasError();
+    }
+
+    bool ReadBoundedStrings(ReadStream& stream, Array<String>& out, int32 limit)
+    {
+        out.Clear();
+        int32 count = 0;
+        stream.ReadInt32(&count);
+        if (stream.HasError() || count < 0 || count > limit)
+            return false;
+        // Every string costs at least its 4-byte length prefix.
+        if ((stream.GetLength() - stream.GetPosition()) / 4u < static_cast<uint32>(count))
+            return false;
+        out.Resize(count);
+        for (int32 i = 0; i < count && !stream.HasError(); i++)
+            stream.Read(out[i]);
+        return !stream.HasError();
+    }
+}
+
+bool MotionMatchingSkeletonFingerprint::Deserialize(ReadStream& stream)
+{
+    const bool ok =
+        ReadBoundedStrings(stream, NodeNames, MaxFingerprintNodes) &&
+        ReadBoundedInts(stream, ParentIndices, MaxFingerprintNodes) &&
+        ReadBoundedInts(stream, Translations, MaxFingerprintNodes * 3) &&
+        ReadBoundedInts(stream, NodeFlags, MaxFingerprintNodes);
+    if (!ok)
+        Clear();
+    return ok;
 }
 
 int64 MotionMatchingSkeletonFingerprint::ComputeHash() const
@@ -269,19 +311,25 @@ bool MotionMatchingSkeletonFingerprint::Build(
             if (c < 0)
                 continue;
             flags[n] |= Driven;
+            // Spread over every position key of every clip: a translation that
+            // moves inside one clip (root motion, a crouch offset) is animated
+            // even when all clips start from the same value.
             const auto& keys = channels[c].Position.GetKeyframes();
             if (keys.IsEmpty())
                 continue;
-            const Float3 value = keys[0].Value;
             if (!hasTranslation[n])
             {
-                firstTranslation[n] = value;
+                firstTranslation[n] = keys[0].Value;
                 hasTranslation[n] = true;
             }
-            else
+            const Float3 reference = firstTranslation[n];
+            float nodeSpread = spread[n];
+            for (int32 k = 0; k < keys.Count(); k++)
             {
-                spread[n] = Math::Max(spread[n], (value - firstTranslation[n]).Length());
+                const Float3 value = keys[k].Value;
+                nodeSpread = Math::Max(nodeSpread, (value - reference).Length());
             }
+            spread[n] = nodeSpread;
         }
     }
 

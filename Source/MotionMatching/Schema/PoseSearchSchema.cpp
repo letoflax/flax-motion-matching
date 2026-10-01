@@ -70,6 +70,12 @@ bool PoseSearchSchema::TryValidate(String &error) const
                 error = String::Format(TEXT("BoneAliases maps channel '{}' twice."), alias.Channel);
                 return false;
             }
+            if (BoneAliases[j].Node == alias.Node)
+            {
+                error = String::Format(TEXT("BoneAliases maps channels '{}' and '{}' onto the same node '{}'."),
+                    BoneAliases[j].Channel, alias.Channel, alias.Node);
+                return false;
+            }
         }
     }
 
@@ -422,15 +428,16 @@ bool PoseSearchSchema::operator==(const PoseSearchSchema &other) const
 
 namespace
 {
-    // Bounded: a corrupt count must not allocate unbounded memory; the
-    // stream error flag fails the load.
-    int32 ReadBoundedCount(ReadStream& stream, int32 limit)
+    // Bounded: a corrupt count must not allocate unbounded memory. A count
+    // outside [0, limit] clears ok; the caller stops reading and reports the
+    // failure (Deserialize returns false, which fails the load or upgrade).
+    int32 ReadBoundedCount(ReadStream& stream, int32 limit, bool& ok)
     {
         int32 count = 0;
         stream.ReadInt32(&count);
-        if (count < 0 || count > limit)
+        if (stream.HasError() || count < 0 || count > limit)
         {
-            stream.SetPosition(stream.GetLength());
+            ok = false;
             return 0;
         }
         return count;
@@ -446,10 +453,11 @@ namespace
         }
     }
 
-    void ReadAliases(ReadStream& stream, Array<BoneAlias>& aliases)
+    bool ReadAliases(ReadStream& stream, Array<BoneAlias>& aliases)
     {
         aliases.Clear();
-        const int32 count = ReadBoundedCount(stream, 4096);
+        bool ok = true;
+        const int32 count = ReadBoundedCount(stream, 4096, ok);
         for (int32 i = 0; i < count && !stream.HasError(); i++)
         {
             BoneAlias alias;
@@ -457,6 +465,7 @@ namespace
             stream.Read(alias.Node);
             aliases.Add(alias);
         }
+        return ok && !stream.HasError();
     }
 
     void WriteLegacySkeleton(WriteStream& stream, const LegacySkeletonNames& legacy)
@@ -508,7 +517,7 @@ void PoseSearchSchema::Serialize(WriteStream &stream) const
         stream.Write(contact.Node);
 }
 
-void PoseSearchSchema::Deserialize(ReadStream &stream)
+bool PoseSearchSchema::Deserialize(ReadStream &stream)
 {
     stream.ReadInt32(&SampleRate);
     stream.Read(RootForwardAxis);
@@ -518,10 +527,15 @@ void PoseSearchSchema::Deserialize(ReadStream &stream)
     stream.Read(TrajectorySampleTimes);
     stream.ReadFloat(&ContactMaxSpeed);
     stream.ReadFloat(&ContactMaxHeight);
-    ReadAliases(stream, BoneAliases);
-    stream.Read(RootBone);
     PoseBones.Clear();
-    const int32 boneCount = ReadBoundedCount(stream, 4096);
+    ContactBones.Clear();
+    if (!ReadAliases(stream, BoneAliases))
+        return false;
+    stream.Read(RootBone);
+    bool ok = true;
+    const int32 boneCount = ReadBoundedCount(stream, 4096, ok);
+    if (!ok)
+        return false;
     for (int32 i = 0; i < boneCount && !stream.HasError(); i++)
     {
         PoseFeatureBone bone;
@@ -529,14 +543,16 @@ void PoseSearchSchema::Deserialize(ReadStream &stream)
         stream.Read(bone.Group);
         PoseBones.Add(bone);
     }
-    ContactBones.Clear();
-    const int32 contactCount = ReadBoundedCount(stream, 4096);
+    const int32 contactCount = ReadBoundedCount(stream, 4096, ok);
+    if (!ok)
+        return false;
     for (int32 i = 0; i < contactCount && !stream.HasError(); i++)
     {
         ContactFeatureBone contact;
         stream.Read(contact.Node);
         ContactBones.Add(contact);
     }
+    return !stream.HasError();
 }
 
 void PoseSearchSchema::SerializeV4(WriteStream &stream, const LegacySkeletonNames& legacy) const
@@ -548,12 +564,12 @@ void PoseSearchSchema::SerializeV4(WriteStream &stream, const LegacySkeletonName
     WriteAliases(stream, BoneAliases);
 }
 
-void PoseSearchSchema::DeserializeV4(ReadStream &stream, LegacySkeletonNames& legacy)
+bool PoseSearchSchema::DeserializeV4(ReadStream &stream, LegacySkeletonNames& legacy)
 {
     DeserializeV3(stream, legacy);
     stream.ReadFloat(&ContactMaxSpeed);
     stream.ReadFloat(&ContactMaxHeight);
-    ReadAliases(stream, BoneAliases);
+    return ReadAliases(stream, BoneAliases);
 }
 
 void PoseSearchSchema::SerializeV3(WriteStream &stream, const LegacySkeletonNames& legacy) const

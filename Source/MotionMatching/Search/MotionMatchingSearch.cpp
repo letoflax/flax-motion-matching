@@ -561,17 +561,17 @@ namespace
 
         // One scale pass per reference call: weight pipeline is O(dims) and
         // this path is used by the exact verifier/SampleCost only.
-        float stackPoseScale[FeatureLayout::ReferencePoseFeatureSize];
-        float stackTrajectoryScale[FeatureLayout::ReferenceTrajectoryFeatureSize];
+        float stackPoseScale[FeatureLayout::MaxPoseFeatureSize];
+        float stackTrajectoryScale[FeatureLayout::MaxTrajectoryFeatureSize];
         Array<float> heapPoseScale, heapTrajectoryScale;
         float* poseScale = stackPoseScale;
         float* trajectoryScale = stackTrajectoryScale;
-        if (poseFeatureSize > FeatureLayout::ReferencePoseFeatureSize)
+        if (poseFeatureSize > FeatureLayout::MaxPoseFeatureSize)
         {
             heapPoseScale.Resize(poseFeatureSize);
             poseScale = heapPoseScale.Get();
         }
-        if (trajectoryFeatureSize > FeatureLayout::ReferenceTrajectoryFeatureSize)
+        if (trajectoryFeatureSize > FeatureLayout::MaxTrajectoryFeatureSize)
         {
             heapTrajectoryScale.Resize(trajectoryFeatureSize);
             trajectoryScale = heapTrajectoryScale.Get();
@@ -1566,17 +1566,17 @@ void MotionMatchingSearch::FindTopCandidates(
     }
 
     // N1b: raw query + one per-dim scale pass (same pipeline as FindBest).
-    float stackPoseScale[FeatureLayout::ReferencePoseFeatureSize];
-    float stackTrajectoryScale[FeatureLayout::ReferenceTrajectoryFeatureSize];
+    float stackPoseScale[FeatureLayout::MaxPoseFeatureSize];
+    float stackTrajectoryScale[FeatureLayout::MaxTrajectoryFeatureSize];
     Array<float> heapPoseScale, heapTrajectoryScale;
     float* poseScale = stackPoseScale;
     float* trajectoryScale = stackTrajectoryScale;
-    if (poseFeatureSize > FeatureLayout::ReferencePoseFeatureSize)
+    if (poseFeatureSize > FeatureLayout::MaxPoseFeatureSize)
     {
         heapPoseScale.Resize(poseFeatureSize);
         poseScale = heapPoseScale.Get();
     }
-    if (trajectoryFeatureSize > FeatureLayout::ReferenceTrajectoryFeatureSize)
+    if (trajectoryFeatureSize > FeatureLayout::MaxTrajectoryFeatureSize)
     {
         heapTrajectoryScale.Resize(trajectoryFeatureSize);
         trajectoryScale = heapTrajectoryScale.Get();
@@ -1826,17 +1826,17 @@ void MotionMatchingSearch::FindBest(
     // scale*(raw query - raw baked). Fixed stack caps cover the v3 layout
     // (44 + 30); larger future schemas fall back to heap. Shared with the
     // top-N/tooling path.
-    float stackPoseScale[FeatureLayout::ReferencePoseFeatureSize];
-    float stackTrajectoryScale[FeatureLayout::ReferenceTrajectoryFeatureSize];
+    float stackPoseScale[FeatureLayout::MaxPoseFeatureSize];
+    float stackTrajectoryScale[FeatureLayout::MaxTrajectoryFeatureSize];
     Array<float> heapPoseScale, heapTrajectoryScale;
     float* poseScale = stackPoseScale;
     float* trajectoryScale = stackTrajectoryScale;
-    if (poseFeatureSize > FeatureLayout::ReferencePoseFeatureSize)
+    if (poseFeatureSize > FeatureLayout::MaxPoseFeatureSize)
     {
         heapPoseScale.Resize(poseFeatureSize);
         poseScale = heapPoseScale.Get();
     }
-    if (trajectoryFeatureSize > FeatureLayout::ReferenceTrajectoryFeatureSize)
+    if (trajectoryFeatureSize > FeatureLayout::MaxTrajectoryFeatureSize)
     {
         heapTrajectoryScale.Resize(trajectoryFeatureSize);
         trajectoryScale = heapTrajectoryScale.Get();

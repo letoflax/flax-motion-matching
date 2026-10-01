@@ -235,6 +235,7 @@ void MotionMatchingRuntimePolicy::Initialize(
     _packedTrajectory.Resize(packedCount);
     for (int32 i = 0; i < packedCount; i++)
         _packedTrajectory[i] = 0.0f;
+    _packedTrajectoryMismatchLogged = false;
     _hasPrevPositions = false;
     _usedSearchSnapshot = false;
     _searchSnapshotLength = 0;
@@ -900,7 +901,17 @@ void MotionMatchingRuntimePolicy::Tick(
     // to a changed caller filter via the signature check inside TryFastPath.
     _tickTrajectory.Clear();
     const int32 trajectoryPointCount = _database->GetTrajectoryPointCount();
-    if (_poseValid && trajectoryPointCount > 0 && trajectoryPoints.Count() == trajectoryPointCount)
+    // The packed scratch was sized at Initialize from the layout then bound;
+    // a database rebaked with another point count since then must not be
+    // written past that size: skip the trajectory (no query) until re-init.
+    const bool packedFits = _packedTrajectory.Count() == trajectoryPointCount * 6;
+    if (!packedFits && !_packedTrajectoryMismatchLogged)
+    {
+        _packedTrajectoryMismatchLogged = true;
+        LOG(Warning, "Motion matching trajectory skipped: the database has {} trajectory points but the controller was initialized for {}; re-initialize the controller.",
+            trajectoryPointCount, _packedTrajectory.Count() / 6);
+    }
+    if (_poseValid && packedFits && trajectoryPointCount > 0 && trajectoryPoints.Count() == trajectoryPointCount)
     {
         for (int32 i = 0; i < trajectoryPointCount; i++)
         {

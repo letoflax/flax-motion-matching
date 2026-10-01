@@ -15,10 +15,11 @@ class WriteStream;
 ///
 /// One entry per node of the bake model: name, parent index, a quantized local
 /// translation and flags. The translation is the one the clips really drive:
-/// the clips' constant channel translation when the node has position keys
-/// that agree across clips, otherwise the bake model's bind translation.
-/// Nodes whose translation is animated (root travel, pelvis bob) are flagged
-/// and skipped by the proportion check. Clips authored for another skeleton
+/// the clips' constant channel translation when every position key of every
+/// clip stays within ProportionTolerance of the first key, otherwise the bake
+/// model's bind translation. Nodes whose translation moves inside a clip or
+/// differs between clips (root travel, pelvis bob, a crouch offset) are flagged
+/// animated and skipped by the proportion check. Clips authored for another skeleton
 /// therefore leave their own proportions in the fingerprint even when aliases
 /// made every channel resolve, and the runtime check rejects the pair.
 ///
@@ -30,7 +31,7 @@ struct MOTIONMATCHING_API MotionMatchingSkeletonFingerprint
     enum NodeFlag : int32
     {
         Driven = 1,              // some clip channel drives the node
-        AnimatedTranslation = 2, // clip translations disagree: not a proportion
+        AnimatedTranslation = 2, // some position key (in or across clips) moves: not a proportion
         Relevant = 4,            // driven, or an ancestor of a driven node
         FromClips = 8,           // translation taken from the clips, not the bind pose
     };
@@ -59,7 +60,8 @@ struct MOTIONMATCHING_API MotionMatchingSkeletonFingerprint
     void Clear();
     bool IsConsistent() const;
     void Serialize(WriteStream& stream) const;
-    void Deserialize(ReadStream& stream);
+    /// <summary>False (fingerprint cleared) when a list count is out of range or the stream ends early.</summary>
+    bool Deserialize(ReadStream& stream);
 
     /// <summary>64-bit FNV-1a over names, parents, translations and flags (0 when empty).</summary>
     int64 ComputeHash() const;

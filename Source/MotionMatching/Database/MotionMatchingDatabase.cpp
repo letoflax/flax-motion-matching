@@ -336,10 +336,13 @@ namespace
         /// RootBone, PoseBones and ContactBones instead of eight named
         /// skeleton roles). The v4 roles convert to the equivalent
         /// declaration (PoseSearchSchema::ApplyLegacySkeleton: same bone
-        /// order, groups and contacts as the v4 fixed layout). Everything
-        /// after the schema is copied unchanged; the bumped schema contract
-        /// revision then drops the baked arrays on load (registry kept,
-        /// REBAKE REQUIRED).
+        /// order, groups and contacts as the v4 fixed layout). The registry
+        /// (sources, tags, loop flags, per-source groups) is kept; the baked
+        /// arrays, provenance and skeleton fingerprint are written empty like
+        /// Upgrade_3_To_4 does. An unbaked file keeps its schema on load, so
+        /// the converted declaration stays readable (Database.Schema) for
+        /// migrating the scene; a baked v4 file would instead be classified
+        /// stale and lose it. REBAKE REQUIRED.
         /// </summary>
         static bool Upgrade_4_To_5(AssetMigrationContext& context)
         {
@@ -353,20 +356,97 @@ namespace
             MemoryReadStream input(chunk->Get(), chunk->Size());
             PoseSearchSchema schema;
             LegacySkeletonNames legacy;
-            schema.DeserializeV4(input, legacy);
-            if (input.HasError())
+            if (!schema.DeserializeV4(input, legacy) || input.HasError())
             {
                 LOG(Warning, "Motion matching database upgrade failed: corrupted v4 schema.");
                 return true;
             }
             schema.ApplyLegacySkeleton(legacy);
-            const uint32 schemaEnd = input.GetPosition();
 
-            MemoryWriteStream output(4096 + chunk->Size());
+            Array<Guid> sourceAnimations;
+            Array<Array<String>> sourceTags;
+            Array<int32> sourceLooping;
+            Array<String> tagNames;
+            Array<int32> tagClipCounts;
+            input.Read(sourceAnimations);
+            input.Read(sourceTags);
+            input.Read(sourceLooping);
+            input.Read(tagNames);
+            input.Read(tagClipCounts);
+            if (input.HasError() ||
+                sourceAnimations.Count() != sourceTags.Count() ||
+                sourceAnimations.Count() != sourceLooping.Count())
+            {
+                LOG(Warning, "Motion matching database upgrade failed: corrupted v4 registry.");
+                return true;
+            }
+
+            // v4 baked block (same 16 arrays as v3), read only to reach the
+            // per-source groups in the v4 tail; the values are discarded.
+            {
+                Array<Guid> clipAnimations;
+                Array<Array<String>> clipTags;
+                Array<int32> ints;
+                Array<float> floats;
+                Array<Float3> vectors;
+                input.Read(clipAnimations);
+                input.Read(clipTags);
+                input.Read(ints);    // clip looping
+                input.Read(floats);  // clip lengths
+                input.Read(ints);    // clip sample counts
+                input.Read(ints);    // sample clip indices
+                input.Read(floats);  // sample times
+                input.Read(floats);  // pose features
+                input.Read(floats);  // trajectory features
+                input.Read(vectors); // root positions
+                input.Read(vectors); // root velocities
+                input.Read(vectors); // root forwards
+                input.Read(floats);  // legacy pose means
+                input.Read(floats);  // pose deviations
+                input.Read(floats);  // legacy trajectory means
+                input.Read(floats);  // trajectory deviations
+            }
+            // Tail: legacy turn-like slot, six provenance ints, per-clip
+            // groups, then the per-source groups (registry data, kept).
+            Array<int32> ignoredInts;
+            if (!input.HasError() && input.GetPosition() < input.GetLength())
+                input.Read(ignoredInts);
+            for (int32 i = 0; i < 6; i++)
+            {
+                int32 ignored = 0;
+                if (!input.HasError() && input.GetPosition() < input.GetLength())
+                    input.ReadInt32(&ignored);
+            }
+            if (!input.HasError() && input.GetPosition() < input.GetLength())
+                input.Read(ignoredInts);
+            Array<int32> sourceGroups;
+            if (!input.HasError() && input.GetPosition() < input.GetLength())
+                input.Read(sourceGroups);
+            if (input.HasError() || (sourceGroups.HasItems() && sourceGroups.Count() != sourceAnimations.Count()))
+            {
+                LOG(Warning, "Motion matching database upgrade failed: corrupted v4 data after the registry.");
+                return true;
+            }
+
+            MemoryWriteStream output(4096);
             schema.Serialize(output);
-            const uint32 restLength = chunk->Size() - schemaEnd;
-            if (restLength > 0)
-                output.WriteBytes(static_cast<const byte*>(chunk->Get()) + schemaEnd, restLength);
+            output.Write(sourceAnimations);
+            output.Write(sourceTags);
+            output.Write(sourceLooping);
+            output.Write(tagNames);
+            output.Write(tagClipCounts);
+            // Empty baked data (16 slots), empty legacy turn-like slot, six
+            // zero provenance ints, empty clip groups (same as Upgrade_3_To_4).
+            for (int32 i = 0; i < 16; i++)
+                output.WriteInt32(0);
+            output.WriteInt32(0);
+            for (int32 i = 0; i < 6; i++)
+                output.WriteInt32(0);
+            output.WriteInt32(0);
+            // Tail: per-source groups, then an empty skeleton fingerprint. No
+            // planar up axis (absent reads as +Y; the bake writes it).
+            output.Write(sourceGroups);
+            MotionMatchingSkeletonFingerprint().Serialize(output);
 
             if (context.AllocateChunk(0))
                 return true;
@@ -375,7 +455,8 @@ namespace
 
             LOG(
                 Info,
-                "Motion matching database upgraded to v5: schema layout declared from the v4 skeleton roles (root '{}', {} pose bones, {} contacts); baked data must be rebaked.",
+                "Motion matching database upgraded to v5: kept {} registered clips; schema layout declared from the v4 skeleton roles (root '{}', {} pose bones, {} contacts); baked data cleared (re-bake required).",
+                sourceAnimations.Count(),
                 schema.RootBone,
                 schema.PoseBones.Count(),
                 schema.ContactBones.Count());
@@ -390,7 +471,7 @@ namespace
     /// Flax can keep the previous factory entry alive until the old module is
     /// released, so replacing the key is required before adding the new one.
     ///
-    /// Two keys: TypeName (format v4 files and the scripting type name that
+    /// Two keys: TypeName (format v4 and v5 files and the scripting type name that
     /// Content::CreateVirtualAsset looks up) and LegacyTypeName, which v1-v3
     /// files carry in their header. The legacy key only exists so the
     /// upgrader can read old files; the upgrade rewrites the header.
@@ -474,7 +555,7 @@ namespace
 #endif
 }
 
-// Serialized asset type identity. Format v4 files carry TypeName (equal to
+// Serialized asset type identity. Format v4 and v5 files carry TypeName (equal to
 // the scripting type name); v1-v3 files carry LegacyTypeName and are
 // converted by Upgrade_3_To_4, which rewrites the header (docs/MIGRATION.md).
 // Both strings must be defined before the factory below registers them.
@@ -1538,7 +1619,12 @@ Asset::LoadResult MotionMatchingDatabase::load()
         return LoadResult::MissingDataChunk;
 
     MemoryReadStream stream(chunk->Get(), chunk->Size());
-    _schema.Deserialize(stream);
+    if (!_schema.Deserialize(stream))
+    {
+        LOG(Error, "Motion matching database '{}' is corrupt (schema data). Refusing to load.", GetPath());
+        unload(false);
+        return LoadResult::InvalidData;
+    }
     RebuildLayout();
     stream.Read(_sourceAnimations);
     stream.Read(_sourceTags);
@@ -1569,8 +1655,8 @@ Asset::LoadResult MotionMatchingDatabase::load()
     stream.Read(_poseFeatureDeviations);
     stream.Read(legacyTrajectoryMeans);
     stream.Read(_trajectoryFeatureDeviations);
-    // Format v4 load only (older files are converted by the upgrader before
-    // they get here). Tail fields stay conditional reads for robustness.
+    // Format v5 load only (older files are converted by the upgrader chain
+    // before they get here). Tail fields stay conditional reads for robustness.
     // Legacy turn-like slot: written empty since v4 (the flag was only ever
     // read by the clip audit), kept so the byte layout never reorders.
     Array<int32> legacyTurnLike;
@@ -1611,8 +1697,13 @@ Asset::LoadResult MotionMatchingDatabase::load()
     // v4 tail: per-source groups, then the skeleton fingerprint.
     if (!stream.HasError() && stream.GetPosition() < stream.GetLength())
         stream.Read(_sourceGroups);
-    if (!stream.HasError() && stream.GetPosition() < stream.GetLength())
-        _skeletonFingerprint.Deserialize(stream);
+    if (!stream.HasError() && stream.GetPosition() < stream.GetLength() &&
+        !_skeletonFingerprint.Deserialize(stream))
+    {
+        LOG(Error, "Motion matching database '{}' is corrupt (skeleton fingerprint). Refusing to load.", GetPath());
+        unload(false);
+        return LoadResult::InvalidData;
+    }
     // v5 tail: model-space planar up axis (absent = Y-up).
     _planarUpAxis = Float3(0.0f, 1.0f, 0.0f);
     if (!stream.HasError() && stream.GetPosition() < stream.GetLength())

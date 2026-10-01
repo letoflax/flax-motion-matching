@@ -191,10 +191,11 @@ struct MOTIONMATCHING_API PoseSearchSchema
     /// <summary>
     /// Database format v5 layout: SampleRate, axes, weights,
     /// TrajectorySampleTimes, contact gate, BoneAliases, RootBone, PoseBones,
-    /// ContactBones.
+    /// ContactBones. Deserialize returns false when the data is corrupt (a
+    /// list count out of range or a stream error); the caller must stop.
     /// </summary>
     void Serialize(WriteStream& stream) const;
-    void Deserialize(ReadStream& stream);
+    bool Deserialize(ReadStream& stream);
 
     /// <summary>
     /// Legacy layouts used only by the database upgraders. v2/v3: no contact
@@ -205,7 +206,7 @@ struct MOTIONMATCHING_API PoseSearchSchema
     void SerializeV3(WriteStream& stream, const LegacySkeletonNames& legacy) const;
     void DeserializeV3(ReadStream& stream, LegacySkeletonNames& legacy);
     void SerializeV4(WriteStream& stream, const LegacySkeletonNames& legacy) const;
-    void DeserializeV4(ReadStream& stream, LegacySkeletonNames& legacy);
+    bool DeserializeV4(ReadStream& stream, LegacySkeletonNames& legacy);
 
     /// <summary>
     /// The fixed v2-v4 layout as a declaration: Root; pose bones pelvis,
