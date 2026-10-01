@@ -140,6 +140,32 @@ public class MotionMatchingController : IDisposable
     public float TurnPenaltyWeight = 0.03f;
     public float TurnPenaltyYawScale = 4.0f;
 
+    // Speed matching: clip time bends toward FrameInput.TargetSpeed within
+    // [PlayRateMin, PlayRateMax]; off at or below PlayRateMinSpeed.
+    public float PlayRateMin = 0.85f;
+    public float PlayRateMax = 1.15f;
+    public float PlayRateMinSpeed = 10.0f;
+
+    // Structural limits of the search policy (world units follow the rig).
+    // Actor displacement per tick treated as a teleport and reseeded.
+    public float TeleportDistance = 2000.0f;
+    // Seconds after init or reseed before searches start.
+    public float WarmupTime = 0.5f;
+    // Continuation hold: seconds, and minimum frame cap (scaled for high fps).
+    public float FastPathMaxAge = 0.5f;
+    public int FastPathMaxFrames = 5;
+    // A just-left clip cannot win again for ReselectBanHistory seconds (0 =
+    // off); ReselectBanWindow is the clip-time half-width of the ban.
+    public float ReselectBanHistory = 0.6f;
+    public float ReselectBanWindow = 0.35f;
+    // Samples this close (seconds) to the playing pose of the same clip.
+    public float SameSegmentTwinBan = 0.25f;
+    // Seconds at the end of non-loop clips excluded from search (0 = off).
+    public float LoopTailExclusion = 0.0f;
+
+    // Largest skeleton (bone count) the zero-allocation pose read accepts.
+    public const int MaxPoseBones = 512;
+
     // Inertialization decay time (replaces linear-crossfade BlendDuration;
     // single path, no parallel blend modes).
     public float InertializationDuration = 0.25f;
@@ -301,7 +327,7 @@ public class MotionMatchingController : IDisposable
         if (playback == null)
             return false;
         int n = playback.GetSearchLocalsCount();
-        if (n <= 0 || n > 512 || buffer.Length != n)
+        if (n <= 0 || n > MaxPoseBones || buffer.Length != n)
             return false;
         for (int i = 0; i < n; i++)
         {
@@ -311,33 +337,6 @@ public class MotionMatchingController : IDisposable
         winnerClip = _policy.WinnerClip;
         winnerCost = _policy.WinnerCost;
         return true;
-    }
-
-    /// <summary>
-    /// P2 single authoritative force-clip hatch (the only hatch besides the
-    /// search-winner Plays inside the native RunQuery). Forwards to the
-    /// native policy ForcePlayClip, which synchronizes playback clip/time,
-    /// policy current clip/time, continuity baseline, fast-path
-    /// invalidation, inertial state, telemetry reason and the trace command
-    /// entry in one call. Search resumes immediately on the next tick with
-    /// the caller filter (no hold). Logs the reason on EVERY call.
-    /// No production callers yet (drivers use it when mm_drivers is set).
-    /// </summary>
-    public void ForcePlayClip(int clipIndex, float startTime, string reason)
-    {
-        string safeReason = reason ?? string.Empty;
-        Debug.Log("MotionMatchingController.ForcePlayClip: clip=" + clipIndex
-            + " startTime=" + startTime + " reason=" + safeReason);
-        if (!IsReady)
-            return;
-        try
-        {
-            _policy.ForcePlayClip(clipIndex, startTime, safeReason);
-        }
-        catch
-        {
-            // The force-clip command itself must never throw to drivers.
-        }
     }
 
     /// <summary>
@@ -610,15 +609,26 @@ public class MotionMatchingController : IDisposable
             CostFuseThreshold = CostFuseThreshold,
             TurnPenaltyWeight = TurnPenaltyWeight,
             TurnPenaltyYawScale = TurnPenaltyYawScale,
+            PlayRateMin = PlayRateMin,
+            PlayRateMax = PlayRateMax,
+            PlayRateMinSpeed = PlayRateMinSpeed,
+            TeleportDistance = TeleportDistance,
+            WarmupTime = WarmupTime,
+            FastPathMaxAge = FastPathMaxAge,
+            FastPathMaxFrames = FastPathMaxFrames,
+            ReselectBanHistory = ReselectBanHistory,
+            ReselectBanWindow = ReselectBanWindow,
+            SameSegmentTwinBan = SameSegmentTwinBan,
+            LoopTailExclusion = LoopTailExclusion,
         };
         int callerLoop = input.LoopFilter >= 0 && input.LoopFilter <= 2 ? input.LoopFilter : 0;
         int callerBand = input.CandidateBand >= 0 && input.CandidateBand <= 3 ? input.CandidateBand : 0;
         float callerYaw = input.QueryYawRate >= 0.0f && input.QueryYawRate < 1e29f ? input.QueryYawRate : 0.0f;
-        float callerPlanar = input.CallerPlanarSpeed >= 0.0f && input.CallerPlanarSpeed < 1e29f ? input.CallerPlanarSpeed : 0.0f;
+        float targetSpeed = input.TargetSpeed >= 0.0f && input.TargetSpeed < 1e29f ? input.TargetSpeed : 0.0f;
         _policy.Tick(deltaTime, snapshot,
             input.Points ?? Array.Empty<TrajectoryPoint>(),
             actorWorld.GetWorld(), TrajectorySampleTimes, tuning,
-            callerLoop, callerBand, callerYaw, callerPlanar);
+            callerLoop, callerBand, callerYaw, targetSpeed, input.HoldReseedFilter);
 
         PolicyState = _policy.PolicyState;
         WinnerSample = _policy.WinnerSample;

@@ -22,11 +22,11 @@ PUBLIC_REFERENCES = {
         "interface IMotionMatchingInputProvider", "struct MotionMatchingInputContext",
         "struct MotionMatchingFrameInput", "public int LoopFilter;",
         "public int CandidateBand;", "public float QueryYawRate;",
+        "public float TargetSpeed;", "public bool HoldReseedFilter;",
     ),
     "Source/MotionMatching/Runtime/MotionMatchingRuntimePolicy.h": (
         "API_FUNCTION() void Initialize(", "API_FUNCTION() void Shutdown()",
         "API_FUNCTION() void ResetOnTeleport()", "API_FUNCTION() void Tick(",
-        "API_FUNCTION() void ForcePlayClip(",
     ),
     "Source/MotionMatching/Runtime/MotionMatchingPlayback.h": (
         "API_FUNCTION() void Setup(", "API_FUNCTION() void Stop()",

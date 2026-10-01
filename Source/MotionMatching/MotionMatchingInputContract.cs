@@ -80,17 +80,25 @@ public struct MotionMatchingFrameInput
     public string AllowedTagSet;
     public string ExcludedTagSet;
 
-    // 3. P2 caller filter (Game LocomotionSelectionPolicy output):
+    // 3. Caller filter, taken verbatim (the core never infers any of it):
     // LoopFilter mirrors MotionLoopFilter (0 Any, 1 LoopOnly, 2 OneShotOnly);
-    // CandidateBand mirrors BakedClipSpeedBand DB ids (0 Any, 1 Walk, 2 Run,
-    // 3 Sprint); QueryYawRate (rad/s, >= 0) scales the straightness prior.
-    // CallerPlanarSpeed (u/s, >= 0) is the Game-side character planar speed
-    // for play-rate only (clip time bends to world speed, clamped 0.85-1.15).
-    // The core never infers these from movement.
+    // CandidateBand is the per-clip band id stored in the database (0 = any;
+    // the host defines what the ids mean); QueryYawRate (rad/s, >= 0) scales
+    // the straightness prior (weight 0 turns the prior off).
     public int LoopFilter;
     public int CandidateBand;
     public float QueryYawRate;
-    public float CallerPlanarSpeed;
+
+    // 4. Speed matching and reseed hold, both host decisions:
+    // TargetSpeed (world units/s, >= 0) is the speed the character really
+    // moves at; the clip time bends to match it within the play-rate range of
+    // the tuning (0 or below PlayRateMinSpeed = authored speed).
+    // HoldReseedFilter keeps the structural reseed recovery (LoopOnly within
+    // the same tag scope) armed while true; it is released by the first scan
+    // after the host clears it. Set it while the host's own motion state is
+    // still settling after ResetPlayback or a teleport.
+    public float TargetSpeed;
+    public bool HoldReseedFilter;
 }
 
 // P1: the P0 additive-only DTOs (MotionMatchingQueryFilter,

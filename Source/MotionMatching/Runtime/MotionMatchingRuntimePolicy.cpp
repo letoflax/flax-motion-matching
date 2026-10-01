@@ -18,17 +18,6 @@
 
 namespace
 {
-    constexpr float WarmupTime = 0.5f;
-    constexpr float TeleportDistance = 2000.0f;
-    constexpr float TravelingDistance = 50.0f;
-    constexpr float MaxFastPathAge = 0.5f;
-    constexpr int32 MaxFastPathFrames = 5;
-    constexpr float ReselectHistoryDuration = 0.6f;
-    constexpr float ReselectSampleWindow = 0.35f;
-    constexpr bool EnableReselectBan = true;
-    constexpr bool EnableLoopTailExclusion = false;
-    constexpr float SameSegmentTwinBan = 0.25f;
-    constexpr float NonLoopTailExclusion = 0.3f;
     constexpr float PiF = 3.14159265358979323846f;
 
     void FormatFloatText(float value, char* buffer, int32 capacity)
@@ -150,11 +139,11 @@ void MotionMatchingRuntimePolicy::Initialize(
     if (body != nullptr)
     {
         fallbackModel = body->SkinnedModel.Get();
-        _playback->Setup(database, fallbackModel, schema.Skeleton, schema.RootUpAxis);
+        _playback->Setup(database, fallbackModel, schema.Skeleton);
     }
     else
     {
-        _playback->Setup(database, nullptr, schema.Skeleton, schema.RootUpAxis);
+        _playback->Setup(database, nullptr, schema.Skeleton);
     }
     _queryTimer = 0.0f;
     _timeSinceSwitch = 999.0f;
@@ -223,7 +212,7 @@ void MotionMatchingRuntimePolicy::Initialize(
     // or touches MMClipAudit.txt.
     EnsureClipTagCache();
     _samplingReady = true;
-    PolicyState = String(TEXT("Locomotion"));
+    PolicyState = String(TEXT("Active"));
     _trace->Clear();
     _telemetryHead = 0;
     _telemetryCount = 0;
@@ -659,18 +648,17 @@ void MotionMatchingRuntimePolicy::WarnOnce(const String& message)
     LOG(Warning, "{}", message);
 }
 
-float MotionMatchingRuntimePolicy::SelectPlayRate(float characterPlanarSpeed)
+float MotionMatchingRuntimePolicy::SelectPlayRate(float targetSpeed)
 {
-    // Bend clip time to match world speed: characterPlanar / clipRootSpeed,
-    // clamped to the playback [0.85, 1.15] window (SetPlayRate clamps again).
-    // Clip speed reuses the audit path (planar travel / length from baked
-    // root positions + clip lengths), cached once per database in
-    // EnsureClipSpeedCache — never a per-tick DB scan. Character speed is
-    // the Game-side planar speed (explicit Tick param, teleport-clean).
-    // Missing metadata for a clip returns 1.0 for that tick.
+    // Bend clip time to match a host-supplied speed: targetSpeed / clipRootSpeed,
+    // clamped to [PlayRateMin, PlayRateMax] (playback clamps again).
+    // Clip speed is the planar travel / length from baked root positions,
+    // cached once per database in EnsureClipSpeedCache, never a per-tick DB
+    // scan. A target speed at or below PlayRateMinSpeed (0 = off) or missing
+    // metadata for a clip returns 1.0 for that tick.
     if (_database == nullptr || !_database->IsBaked() || _currentClip < 0)
         return 1.0f;
-    if (characterPlanarSpeed <= 10.0f)
+    if (targetSpeed <= _tuning.PlayRateMinSpeed)
         return 1.0f;
     EnsureClipSpeedCache();
     if (_currentClip >= _clipSpeeds.Count())
@@ -678,11 +666,11 @@ float MotionMatchingRuntimePolicy::SelectPlayRate(float characterPlanarSpeed)
     const float clipSpeed = _clipSpeeds[_currentClip];
     if (clipSpeed <= 1.0f)
         return 1.0f;
-    const float rate = characterPlanarSpeed / clipSpeed;
-    if (rate < 0.85f)
-        return 0.85f;
-    if (rate > 1.15f)
-        return 1.15f;
+    const float rate = targetSpeed / clipSpeed;
+    if (rate < _tuning.PlayRateMin)
+        return _tuning.PlayRateMin;
+    if (rate > _tuning.PlayRateMax)
+        return _tuning.PlayRateMax;
     return rate;
 }
 
@@ -740,7 +728,8 @@ void MotionMatchingRuntimePolicy::Tick(
     int32 callerLoopFilter,
     int32 callerCandidateBand,
     float callerYawRate,
-    float callerPlanarSpeed)
+    float callerTargetSpeed,
+    bool holdReseedFilter)
 {
     if (!_samplingReady || _database == nullptr || _body == nullptr || _playback == nullptr || _trace == nullptr)
         return;
@@ -762,7 +751,8 @@ void MotionMatchingRuntimePolicy::Tick(
     _callerLoopFilter = callerLoopFilter >= 0 && callerLoopFilter <= 2 ? callerLoopFilter : 0;
     _callerCandidateBand = callerCandidateBand >= 0 && callerCandidateBand <= 3 ? callerCandidateBand : 0;
     _callerYawRate = callerYawRate >= 0.0f && callerYawRate < 1e29f ? callerYawRate : 0.0f;
-    _callerPlanarSpeed = callerPlanarSpeed >= 0.0f && callerPlanarSpeed < 1e29f ? callerPlanarSpeed : 0.0f;
+    _callerTargetSpeed = callerTargetSpeed >= 0.0f && callerTargetSpeed < 1e29f ? callerTargetSpeed : 0.0f;
+    _holdReseedFilter = holdReseedFilter;
     // P5: _trajectoryPoints/_sampleTimes dead copies deleted (were written
     // every tick but never read; RunQuery uses its params + _tickTrajectory).
 
@@ -775,7 +765,7 @@ void MotionMatchingRuntimePolicy::Tick(
     // otherwise leave stale previous positions and a locked continuity
     // winner. Threshold is far above any legitimate per-frame travel.
     const Float3 actorPos(actorWorld.M41, actorWorld.M42, actorWorld.M43);
-    if (_hasLastActorPos && (actorPos - _lastActorPos).LengthSquared() > TeleportDistance * TeleportDistance)
+    if (_hasLastActorPos && (actorPos - _lastActorPos).LengthSquared() > _tuning.TeleportDistance * _tuning.TeleportDistance)
     {
         ResetOnTeleport();
         // Re-accumulate this frame after the reset so warmup restarts cleanly.
@@ -881,7 +871,7 @@ void MotionMatchingRuntimePolicy::Tick(
 
 
     _queryTimer += frameDt;
-    const bool warmed = !justSeeded && _timeSinceInit >= WarmupTime;
+    const bool warmed = !justSeeded && _timeSinceInit >= _tuning.WarmupTime;
     // Per-frame search: when enabled, every warmed tick may scan (the
     // budget/stride caps the cost, intent changes scan unstrided). The
     // cadence path below stays for SearchEveryFrame=false.
@@ -898,7 +888,7 @@ void MotionMatchingRuntimePolicy::Tick(
         if (!TryFastPath(frameDt))
             RunQuery(trajectoryPoints, actorWorld, frameDt);
     }
-    else if (queryDue && (_timeSinceInit < WarmupTime || justSeeded))
+    else if (queryDue && (_timeSinceInit < _tuning.WarmupTime || justSeeded))
     {
         // Warmup/seeding ticks consume the timer without searching so the
         // first real query sees settled pose velocity and trajectory past.
@@ -919,14 +909,12 @@ void MotionMatchingRuntimePolicy::Tick(
     // frames on the stale rate of the previous clip (observed: idle rate
     // 1.0 -> start plays slow while char outruns it = start slide; the clip
     // then fast-forwards to catch up once its own speed is known).
-    _playback->SetPlayRate(SelectPlayRate(_callerPlanarSpeed));
+    _playback->SetPlayRateRange(_tuning.PlayRateMin, _tuning.PlayRateMax);
+    _playback->SetPlayRate(SelectPlayRate(_callerTargetSpeed));
     // §18.9: stamp this tick's search decision on playback before it
     // asserts intra-tick ordering (sample <= search <= save < layer < IK).
     NotifySearch();
-    // P2: playback never steers on gameplay state (grounded param unused
-    // inside Tick); the Game owns airborne meaning and passes only the
-    // trajectory + filter. Neutral true keeps the signature stable.
-    _playback->Tick(frameDt, _body, true);
+    _playback->Tick(frameDt, _body);
     // Keep the search stamp mirror in lockstep with playback's tick
     // counter: it advances only on a successful playback Tick, so early
     // outs never desync the stamp.
@@ -1019,12 +1007,12 @@ void MotionMatchingRuntimePolicy::RunQuery(const Array<TrajectoryPoint>& traject
     // otherwise a planted one-shot (pivot) wins the poisoned query and the
     // playing pose then looks like itself forever. No gait read.
     const bool reseeded = _chooserReseed;
-    // Keep the reseed LoopOnly guard armed until the Game-side planar speed
-    // settles (teleport frames report ~0 while the spring spins up; the
-    // first query after teleport otherwise plants a one-shot on a
-    // zero-velocity poisoned pose and continuity holds it all phase).
-    // _chooserReseed clears on the first settled scan below, not here.
-    bool keepReseedArmed = _chooserReseed && _callerPlanarSpeed <= 5.0f;
+    // Keep the reseed LoopOnly guard armed while the host asks for it
+    // (HoldReseedFilter): right after a teleport the host's own motion state
+    // is still spinning up, and a query on the zero-velocity reseed pose
+    // would otherwise plant a one-shot that continuity then holds.
+    // _chooserReseed clears on the first scan without the hold, below.
+    bool keepReseedArmed = _chooserReseed && _holdReseedFilter;
     // match, no Split per query in steady-state). Bound: <=8 tags; rebuilt
     // only on scope change. Semantics unchanged: same tags array as Split.
     // P5 twins: this RunQuery pair (_queryTagsKey/_queryTagsCache) is
@@ -1149,14 +1137,14 @@ void MotionMatchingRuntimePolicy::RunQuery(const Array<TrajectoryPoint>& traject
     // (the search is stateless); twin + tail are always-on structural
     // scope cuts, replayed bit-exactly from the trace entry.
     {
-        const bool banLive = EnableReselectBan && _reselectClip >= 0 &&
-            Time::GetGameTime() - _reselectStartTime < ReselectHistoryDuration;
+        const bool banLive = _tuning.ReselectBanHistory > 0.0f && _reselectClip >= 0 &&
+            Time::GetGameTime() - _reselectStartTime < _tuning.ReselectBanHistory;
         settings.ReselectClip = banLive ? _reselectClip : -1;
         settings.ReselectSampleTime = _reselectSampleTime;
-        settings.ReselectBanWindow = banLive ? ReselectSampleWindow : 0.0f;
+        settings.ReselectBanWindow = banLive ? _tuning.ReselectBanWindow : 0.0f;
     }
-    settings.TwinBanWindow = SameSegmentTwinBan;
-    settings.LoopTailExclusion = EnableLoopTailExclusion ? NonLoopTailExclusion : 0.0f;
+    settings.TwinBanWindow = _tuning.SameSegmentTwinBan;
+    settings.LoopTailExclusion = _tuning.LoopTailExclusion;
     // S1 Ã‚Â§7.2/Ã‚Â§18.6 structural validity: non-loop candidates whose
     // future horizon passes the clip end baked a clamped fake-stopped
     // future Ã¢â‚¬â€ never rank them (measured: start-tail samples winning
@@ -1347,7 +1335,7 @@ void MotionMatchingRuntimePolicy::RunQuery(const Array<TrajectoryPoint>& traject
     else if (didSwitch)
     {
         // Arm the reselect ban on the pose we just left (single slot):
-        // it cannot re-win for ReselectHistoryDuration. Captured before
+        // it cannot re-win for ReselectBanHistory seconds. Captured before
         // the switch from live playback state.
         const int32 leftClip = _currentClip;
         const float leftTime = _playback != nullptr ? _playback->CurrentTime : -1.0f;
@@ -1379,8 +1367,7 @@ void MotionMatchingRuntimePolicy::RunQuery(const Array<TrajectoryPoint>& traject
         // already bars far same-clip one-shot wins; this is the playback
         // backstop for stale winners). A finished one-shot holds its end
         // pose here; the next tick's same-scope search (or its loop-only
-        // end-recovery retry) selects the exit clip. Explicit ForcePlayClip
-        // stays the only seek path for one-shots.
+        // end-recovery retry) selects the exit clip.
         const bool winnerIsLoop = _database != nullptr && result.ClipIndex >= 0 &&
             result.ClipIndex < _database->GetClipCount() &&
             _database->GetClipLoop(result.ClipIndex);
@@ -1450,7 +1437,7 @@ bool MotionMatchingRuntimePolicy::TryFastPath(float frameDt)
     // Also miss while the reseed LoopOnly guard is armed (keepReseedArmed):
     // holding a pre-teleport loop continuation through the poisoned window
     // re-plants the cascade just as a one-shot win would.
-    if (_fastPathReseed || (_chooserReseed && _callerPlanarSpeed <= 5.0f))
+    if (_fastPathReseed || (_chooserReseed && _holdReseedFilter))
         return MissFastPath("forced:reseed");
     // MaxValue as threshold would hold ANYTHING, freezing the pre-reset
     // clip forever (observed: whole phases stuck in idle). Force a scan.
@@ -1521,10 +1508,10 @@ bool MotionMatchingRuntimePolicy::TryFastPath(float frameDt)
     // query opportunities; the frame cap scales with the query rate so it
     // still means ~MaxFastPathAge under per-frame search (at 10Hz cadence
     // this reduces to the original constant 5).
-    if (Time::GetGameTime() - _lastFullScanTime > MaxFastPathAge)
+    if (Time::GetGameTime() - _lastFullScanTime > _tuning.FastPathMaxAge)
         return MissFastPath("forced:age");
-    const int32 frameCap = MaxI(MaxFastPathFrames,
-        (int32)ceilf(MaxFastPathAge / MaxF(frameDt, 1e-4f)));
+    const int32 frameCap = MaxI(_tuning.FastPathMaxFrames,
+        (int32)ceilf(_tuning.FastPathMaxAge / MaxF(frameDt, 1e-4f)));
     if (_fastPathFrames > frameCap)
         return MissFastPath("forced:age-frames");
     // A streak of continuation misses means the incumbent keeps looking
@@ -1920,50 +1907,6 @@ float MotionMatchingRuntimePolicy::Wrap180(float a)
 
 
 // P2: legacy unconstrained chooser deleted (was here).
-
-void MotionMatchingRuntimePolicy::ForcePlayClip(int32 clipIndex, float startTime, const String& reason)
-{
-    if (_database == nullptr || _playback == nullptr || _trace == nullptr)
-        return;
-    if (clipIndex < 0 || clipIndex >= _database->GetClipCount())
-        return;
-    // Single authoritative hatch: playback advances the clip (arming
-    // inertialization via Play), then every policy mirror follows in the
-    // same call so playback and policy can never disagree for a frame.
-    const int32 leftClip = _currentClip;
-    _playback->Play(clipIndex, startTime, true);
-    _currentClip = clipIndex;
-    _timeSinceSwitch = 0.0f;
-    // Continuity baseline: the forced clip is the new anchor. Invalidate the
-    // fast-path cost baseline so the next continuation check scans instead
-    // of holding stale data; clear reseed (force is not a teleport) and the
-    // reselect ban (it must not immediately ban the forced clip).
-    _lastScanTotal = MAX_float;
-    _hasLastScanSignature = false;
-    _fastPathReseed = false;
-    _fastPathFrames = 0;
-    _consecutiveContinuationMisses = 0;
-    _reselectClip = -1;
-    _reselectStartTime = -99.0f;
-    // Winner mirrors follow the forced clip (costs unknown until the next
-    // scan; reason carries the hatch label for telemetry/trace).
-    WinnerClip = clipIndex;
-    WinnerClipName = GetClipName(clipIndex);
-    WinnerSample = -1;
-    WinnerCost = MAX_float;
-    SecondBestCost = MAX_float;
-    LastSwitchReason = String(TEXT("force:")) + reason;
-    (void)leftClip;
-    // Structural command entry (no feature vectors by design): replay checks
-    // the clip/time/reason structurally. Search resumes immediately on the
-    // next tick with the caller filter (no hold).
-    RecordPolicyEvent("command", clipIndex, LastSwitchReason);
-    // Stamp the command clip/time on the last entry for the structural check
-    // (RecordPolicyEvent stores clip in CommandClip; time follows).
-    _lastEntry.CommandClip = clipIndex;
-    _lastEntry.CommandTime = startTime;
-}
-
 
 void MotionMatchingRuntimePolicy::RecordTelemetry(float yawRate, const Array<String>& tags,
     const MotionMatchingResult& result, const Float3& actorPos, float timeError)

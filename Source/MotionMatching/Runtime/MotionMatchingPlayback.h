@@ -45,10 +45,13 @@ class MOTIONMATCHING_API MotionMatchingPlayback : public ScriptingObject
     DECLARE_SCRIPTING_TYPE_WITH_CONSTRUCTOR_IMPL(MotionMatchingPlayback, ScriptingObject);
 
 public:
-    // PLAN §6.1 / §18.10 play-rate ownership: Playback is the ONLY place that
-    // applies time. Rate defaults to 1.0, clamped to [0.85, 1.15].
+    // Play-rate ownership: Playback is the ONLY place that applies time.
+    // Rate defaults to 1.0 and is clamped to the range set by SetPlayRateRange
+    // (default [0.85, 1.15]).
     API_PROPERTY() float GetPlayRate() const;
     API_PROPERTY() void SetPlayRate(float value);
+    /// <summary>Sets the clamp range of SetPlayRate. Ignored unless 0 &lt; min &lt;= max.</summary>
+    API_FUNCTION() void SetPlayRateRange(float minRate, float maxRate);
     API_PROPERTY() float GetPlayRateBefore() const;
     API_PROPERTY() float GetPlayRateAfter() const;
     API_FIELD() float LastEffectiveDt = 0.0f;
@@ -58,11 +61,6 @@ public:
     API_FIELD() float InertializationDuration = 0.25f;
     // True while a decay offset is active (telemetry only).
     API_PROPERTY() bool GetInertialActive() const;
-
-    // Turn-in-place visual yaw (4a): per-tick root yaw delta in radians,
-    // measured AFTER sample-time update and BEFORE inertial/strip/pose-snapshot.
-    // C# binds as read-only property RootYawDelta (same pattern as PlayRate).
-    API_PROPERTY() float GetRootYawDelta() const { return _rootYawDelta; }
 
 
     // P2: foot-IK solver + lock machine deleted (was here). Game-side
@@ -84,8 +82,7 @@ public:
     API_FUNCTION() void Setup(
         MotionMatchingDatabase* database,
         SkinnedModel* fallbackModel,
-        const SkeletonProfile& skeleton,
-        const Float3& controllerUpAxis);
+        const SkeletonProfile& skeleton);
     API_FUNCTION() void Stop();
     API_FUNCTION() void Play(int32 clipIndex, float startTime, bool forceSeek);
     API_FUNCTION() void ResetOnTeleport();
@@ -113,7 +110,7 @@ public:
     /// to scripting (no API_FUNCTION) so it needs no binding regen.
     /// </summary>
     const Array<Matrix>& GetSearchLocalsRef() const { return _searchLocals; }
-    API_FUNCTION() void Tick(float deltaTime, AnimatedModel* body, bool grounded);
+    API_FUNCTION() void Tick(float deltaTime, AnimatedModel* body);
 
 #if USE_EDITOR
     API_FUNCTION() static bool RunPlaybackSelfTest(MotionMatchingDatabase* database, AnimatedModel* body, API_PARAM(Out) String& log);
@@ -135,17 +132,8 @@ private:
 
     float _playRate = 1.0f;
     float _playRateBefore = 1.0f;
-    // Turn-in-place root yaw delta state (4a, radians, once per tick).
-    float _rootYawDelta = 0.0f;
-    Quaternion _prevRootSampleRotation = Quaternion(0.0f, 0.0f, 0.0f, 1.0f);
-    bool _hasPrevRootSample = false;
-    Float3 _rootUpAxis = Float3::Zero;
-    bool _hasRootUpAxis = false;
-    // Lazy Play->first-tick baseline (no sampling in Play): Play stores its
-    // target time here; the next Tick samples the baseline pose (same clip)
-    // and reports the full Play->tick interval without skipping the frame.
-    float _rootYawPlayStartTime = 0.0f;
-    bool _hasRootYawPlayStart = false;
+    float _minPlayRate = 0.85f;
+    float _maxPlayRate = 1.15f;
 
     Array<Matrix> _searchLocals;
     Array<Matrix> _prevSearchLocals;
@@ -193,9 +181,4 @@ private:
     static bool TryDecompose(const Matrix& value, Float3& scl, Quaternion& rot, Float3& pos);
     void EnsureHierarchy(SkinnedModel* model);
     void WarnOnce(const String& message);
-    void ResetRootYawState();
-    static bool IsValidUpAxis(const Float3& value);
-    bool TryGetRootSampleRotation(const Array<Matrix>& locals, Quaternion& outRotation) const;
-    float ClampRootYawDelta(float delta, float deltaTime) const;
-    void ApplyRootYawSample(bool currentValid, const Quaternion& currentRotation, float deltaTime, bool wasAtEnd, bool wrapped, bool hasBaseline, const Quaternion& baselineRotation);
 };

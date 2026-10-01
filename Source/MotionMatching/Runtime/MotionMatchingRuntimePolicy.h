@@ -80,6 +80,27 @@ struct MOTIONMATCHING_API MotionMatchingPolicyTuning
     API_FIELD() float TurnPenaltyWeight = 0.03f;
     API_FIELD() float TurnPenaltyYawScale = 4.0f;
 
+    /// <summary>Speed matching: lower/upper play-rate multiplier of a clip (1 = authored speed).</summary>
+    API_FIELD() float PlayRateMin = 0.85f;
+    API_FIELD() float PlayRateMax = 1.15f;
+    /// <summary>Speed matching is off at or below this target speed (world units/s).</summary>
+    API_FIELD() float PlayRateMinSpeed = 10.0f;
+    /// <summary>Actor displacement per tick (world units) treated as a teleport and reseeded.</summary>
+    API_FIELD() float TeleportDistance = 2000.0f;
+    /// <summary>Seconds after init or reseed before searches start.</summary>
+    API_FIELD() float WarmupTime = 0.5f;
+    /// <summary>Longest a continuation check may hold the incumbent without a full scan (seconds).</summary>
+    API_FIELD() float FastPathMaxAge = 0.5f;
+    /// <summary>Minimum frame cap of the continuation hold (scaled up for high frame rates).</summary>
+    API_FIELD() int32 FastPathMaxFrames = 5;
+    /// <summary>Seconds a just-left clip stays banned from winning again; 0 disables the ban.</summary>
+    API_FIELD() float ReselectBanHistory = 0.6f;
+    /// <summary>Half-width (seconds of clip time) of the ban around the left pose.</summary>
+    API_FIELD() float ReselectBanWindow = 0.35f;
+    /// <summary>Samples this close (seconds) to the current pose of the same clip are twins and excluded.</summary>
+    API_FIELD() float SameSegmentTwinBan = 0.25f;
+    /// <summary>Seconds at the end of non-loop clips excluded from search; 0 = off.</summary>
+    API_FIELD() float LoopTailExclusion = 0.0f;
 };
 
 /// <summary>
@@ -174,18 +195,11 @@ public:
         int32 callerLoopFilter,
         int32 callerCandidateBand,
         float callerYawRate,
-        float callerPlanarSpeed);
+        float callerTargetSpeed,
+        bool holdReseedFilter);
     API_FUNCTION() MotionMatchingPlayback* GetPlayback();
     API_FUNCTION() MotionMatchingTraceLog* GetTrace();
     API_FUNCTION() MotionMatchingTraceEntry GetLastEntry() const;
-    /// <summary>
-    /// P2 single authoritative force-clip path (the only hatch besides the
-    /// search-winner Plays inside RunQuery). Synchronizes playback clip/time,
-    /// policy current clip/time, continuity baseline, fast-path invalidation,
-    /// inertial state (via Play), telemetry reason and trace command entry.
-    /// Search resumes immediately on the next tick with the caller filter.
-    /// </summary>
-    API_FUNCTION() void ForcePlayClip(int32 clipIndex, float startTime, const String& reason);
     /// <summary>
     /// P3 explicit editor/tool command: scans the baked database and writes
     /// Cache/MMClipAudit.txt on demand (index|name|tags|loop|turn|travel|net|
@@ -279,8 +293,10 @@ private:
     int32 _callerLoopFilter = 0;
     int32 _callerCandidateBand = 0;
     float _callerYawRate = 0.0f;
-    // Play-rate character speed (Game-side planar u/s, explicit Tick param).
-    float _callerPlanarSpeed = 0.0f;
+    // Speed-matching target speed (host-supplied, world units/s, 0 = off).
+    float _callerTargetSpeed = 0.0f;
+    // Host asks to keep the structural reseed LoopOnly filter armed.
+    bool _holdReseedFilter = false;
 
     // P3: init-time tag cache only (no motion scan, no audit file).
     Array<Array<String>> _clipTags;
@@ -339,7 +355,7 @@ private:
     static float AbsF(float value);
     static int32 MaxI(int32 a, int32 b);
 
-    float SelectPlayRate(float characterPlanarSpeed);
+    float SelectPlayRate(float targetSpeed);
     void EnsureClipSpeedCache();
     // P3: init caches tag SETS only (EnsureClipTagCache) — the motion scan
     // and accel log live inside the explicit static ExportClipAudit command,

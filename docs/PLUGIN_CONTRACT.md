@@ -46,18 +46,30 @@ boundary receives only plain scope/filter data and trajectory points.
   into no-match before calling search.
 
 `LoopFilter` values are `Any = 0`, `LoopOnly = 1`, and `OneShotOnly = 2`.
-`CandidateBand` values are `Any = 0`, `Walk = 1`, `Run = 2`, and `Sprint = 3`.
-The input DTO carries these values as the explicit `CandidateBand` integer;
-the provider owns the enum mapping.
+`CandidateBand` is an integer stored per clip in the database (`0` = any; the
+current format accepts `0..3`). A non-zero band restricts one-shot candidates
+to clips of the same band or band `0`; loops are never cut by it. The host
+decides what each id means.
 Normal warmed queries use the caller's values verbatim after range validation;
 the core does not infer them from velocity, grounded state, gait, or intent.
+
+Two further frame fields are host decisions the core never derives:
+
+- `TargetSpeed` (world units/s, `>= 0`) is the speed the character really
+  moves at. Clip time bends to `TargetSpeed / clipRootSpeed`, clamped to
+  `PlayRateMin..PlayRateMax`. At or below `PlayRateMinSpeed` (or `0`), the clip
+  plays at its authored speed. It has no other effect.
+- `HoldReseedFilter` keeps the structural reseed recovery armed (see below) for
+  as long as it is true.
 
 ## Neutral LoopOnly invariant
 
 The runtime intentionally has two structural recovery paths:
 
-1. After `ResetPlayback` or a detected teleport/discontinuity, the first real
-   reseed query uses `LoopOnly`.
+1. After `ResetPlayback` or a detected teleport/discontinuity, the reseed
+   query uses `LoopOnly` while the frame's `HoldReseedFilter` is true. The
+   first scan that runs with the hold cleared releases it, and the continuation
+   fast path does not hold a pre-reset clip while it is armed.
 2. If a query produces no result while playback reports `IsAtEnd`, the runtime
    retries once with temporal exclusion removed and `LoopOnly`.
 

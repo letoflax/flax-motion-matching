@@ -246,28 +246,9 @@ public static class MMContractTest
             Check("pose-out-is-search-locals", ok, detail);
         }
 
-        // 7: force-hatch lands the requested clip (P0 hatch, logs every call).
-        {
-            var prov = NewCanned("idle", string.Empty);
-            test.ResetPlayback();
-            TickProvider(test, prov, 10);
-            var playback = test.Playback;
-            int clips = test.Database != null ? test.Database.ClipCount : 0;
-            bool ok = false;
-            string detail = "no playback/clips";
-            if (playback != null && clips > 1)
-            {
-                int target = (playback.CurrentClip + 1) % clips;
-                test.ForcePlayClip(target, 0.0f, "contract:force-hatch");
-                ok = playback.CurrentClip == target;
-                detail = "forced=" + target + " current=" + playback.CurrentClip;
-            }
-            Check("force-hatch", ok, detail);
-        }
-
-        // 8: pure search — a grounded fixed-scope soak never takes a
+        // 8: pure search: a grounded fixed-scope soak never takes a
         // machine direct-play (no jump/drive/hold/replay reasons; only
-        // the search-winner path and the ForcePlayClip hatch may Play).
+        // the search-winner path may Play).
         {
             var prov = NewCanned("idle", string.Empty);
             test.ResetPlayback();
@@ -337,24 +318,37 @@ public static class MMContractTest
                 {
                     string tag = "idle";
                     try { string t = db.GetClipTag(target); if (!string.IsNullOrEmpty(t)) tag = t; } catch { }
-                    var prov = NewCanned(tag, string.Empty);
-                    test.ForcePlayClip(target, targetLen * 0.5f, "contract:oneshot-progression");
-                    int seeksBefore = test.SeekCount;
-                    float lastTime = playback.CurrentTime;
-                    bool regressed = false;
-                    bool changed = false;
-                    detail = "held";
-                    for (int i = 0; i < 30; i++)
+                    // One-shot-only scope: soak until the search itself has put a
+                    // one-shot on screen, then watch its progression.
+                    var prov = NewCannedFiltered(tag, string.Empty, 2, 0);
+                    test.ResetPlayback();
+                    TickProvider(test, prov, 60);
+                    int playing = playback.CurrentClip;
+                    bool playingOneShot = playing >= 0 && playing < clips && !db.GetClipLoop(playing);
+                    if (!playingOneShot)
                     {
-                        TickProvider(test, prov, 1);
-                        if (playback.CurrentClip != target) { changed = true; break; }
-                        float now = playback.CurrentTime;
-                        if (now < lastTime - 0.0001f) { regressed = true; detail = "time regressed " + lastTime + " -> " + now; break; }
-                        lastTime = now;
+                        detail = "fixture: one-shot-only search did not put a one-shot on screen (clip " + playing + ")";
                     }
-                    if (changed) { ok = true; detail = "clip changed (legal exit) target=" + target; }
-                    else if (!regressed && test.SeekCount == seeksBefore) { ok = true; detail = "held progression target=" + target + " len=" + targetLen; }
-                    else if (!regressed) { detail = "seeks grew " + seeksBefore + " -> " + test.SeekCount; }
+                    else
+                    {
+                        target = playing;
+                        int seeksBefore = test.SeekCount;
+                        float lastTime = playback.CurrentTime;
+                        bool regressed = false;
+                        bool changed = false;
+                        detail = "held";
+                        for (int i = 0; i < 30; i++)
+                        {
+                            TickProvider(test, prov, 1);
+                            if (playback.CurrentClip != target) { changed = true; break; }
+                            float now = playback.CurrentTime;
+                            if (now < lastTime - 0.0001f) { regressed = true; detail = "time regressed " + lastTime + " -> " + now; break; }
+                            lastTime = now;
+                        }
+                        if (changed) { ok = true; detail = "clip changed (legal exit) target=" + target; }
+                        else if (!regressed && test.SeekCount == seeksBefore) { ok = true; detail = "held progression target=" + target; }
+                        else if (!regressed) { detail = "seeks grew " + seeksBefore + " -> " + test.SeekCount; }
+                    }
                 }
                 else { detail = "no non-loop clip > 1s (fixture missing)"; }
             }

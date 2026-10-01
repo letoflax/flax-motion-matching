@@ -45,9 +45,10 @@ controller.Update(deltaTime, actorWorldTransform, frame);
 ```
 
 The provider owns gameplay interpretation and produces trajectory points,
-include/exclude tag sets, the loop filter, the candidate speed band, and query
-yaw rate. The controller validates filter enum ranges, loads the database on
-first use when necessary, and forwards the frame to the native policy.
+include/exclude tag sets, the loop filter, the candidate band, the query yaw
+rate, the speed-matching target speed, and the reseed hold. The controller
+validates filter enum ranges, loads the database on first use when necessary,
+and forwards the frame to the native policy.
 
 The base search pose is available through `TryGetBasePose` or the reusable
 `TryGetBasePoseInto` overload. The host may apply its own layers or IK and write
