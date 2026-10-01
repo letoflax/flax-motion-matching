@@ -53,8 +53,10 @@ Rules, all checked by `TryValidate` before a bake and at bind time:
 - Every declared node (root, pose and contact bones, after `BoneAliases`)
   must exist in the bake model and in the bound model. A missing node is an
   error that lists the missing names; nothing is skipped silently.
-- Every pose bone and the root must have an animation channel in every clip
-  (see the coverage report below), or the bake fails.
+- Every pose bone and the root must have an animation channel in at least one
+  clip (see the coverage report below), or the bake fails. A clip that lacks a
+  channel (importers drop constant tracks) keeps the bind pose for that node and
+  is only reported.
 - The layout is part of the baked snapshot and of `FeatureLayoutHash`.
   Changing any of the four fields needs a rebake; the controller refuses a
   database whose layout differs from the live schema.
@@ -135,7 +137,8 @@ name to one model node name; channel names must be unique.
 
 Before every bake the baker logs a channel coverage report: channels without a
 node, nodes without a channel and alias suggestions. The bake fails when the
-schema's `RootBone` or any `PoseBones` node has no channel in some clip. Suggestions pair an unresolved channel with the one undriven node
+schema's `RootBone` or any `PoseBones` node has no channel in any clip; a node
+that only some clips lack keeps its bind pose there and appears as a NOTE. Suggestions pair an unresolved channel with the one undriven node
 that has the same normalized name (case, separators, digits, a dominant rig
 prefix such as `CC_Base_` or `mixamorig:`, and left/right markers are
 ignored). Review them before adding them to the schema. The same report is

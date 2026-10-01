@@ -132,7 +132,8 @@ registry-only (rebake required); see [MIGRATION.md](MIGRATION.md).
   channel resolver (`Runtime/MotionMatchingChannelMap.h`) used by the baker, the
   sampler and playback.
 - Bake-time channel coverage report with alias suggestions. The bake fails when
-  Root, Pelvis or either foot has no channel in some clip. Editor:
+  Root, Pelvis or either foot has no channel in any clip (clips that lack one
+  keep the bind pose and are reported). Editor:
   `SuggestBoneAliases`, `DescribeChannelCoverage` and a "Suggest Bone Aliases"
   button in the register window.
 - Skeleton fingerprint stored in the database and checked at bind time

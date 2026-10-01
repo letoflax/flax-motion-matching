@@ -131,7 +131,8 @@ namespace
         Array<String> ChannelNames;      // unique raw channel names over all clips
         Array<String> UnmatchedChannels; // channels whose target is no model node
         Array<String> UndrivenNodes;     // model nodes no clip channel drives
-        Array<String> MissingRequired;   // required role lines (bake fails)
+        Array<String> MissingRequired;   // required roles no clip drives at all (bake fails)
+        Array<String> PartialRequired;   // required roles some clips do not drive (bind pose; report only)
         Array<BoneAlias> Suggestions;
     };
 
@@ -165,8 +166,9 @@ namespace
 
     // Channel/node coverage of every clip against the model through the
     // shared resolver. Required nodes (RootBone and every declared pose
-    // bone) must be driven by a channel in EVERY clip: a clip without them
-    // bakes bind-pose features that no query can match.
+    // bone) must be driven by a channel in at least one clip: a model whose
+    // required nodes no clip drives would bake bind-pose features only. A role
+    // missing in some clips keeps the bind pose there and is only reported.
     void AnalyzeCoverage(
         SkinnedModel* model,
         const Array<Animation*>& clips,
@@ -250,7 +252,11 @@ namespace
         {
             if (roleMissing[r] == 0)
                 continue;
-            out.MissingRequired.Add(String::Format(
+            // A clip may legitimately lack a channel (constant tracks are dropped
+            // on import and keep the bind pose). Only a role that NO clip drives
+            // means the names do not match the model.
+            Array<String>& target = roleMissing[r] >= out.ClipCount ? out.MissingRequired : out.PartialRequired;
+            target.Add(String::Format(
                 TEXT("{} '{}' has no channel in {} of {} clips (first: {})"),
                 roleNames[r], roleNodes[r], roleMissing[r], out.ClipCount, roleFirstClip[r]));
         }
@@ -271,6 +277,8 @@ namespace
             text += String(TEXT("\n  model nodes driven by no clip (keep the bind pose): ")) + JoinNames(coverage.UndrivenNodes, 16);
         if (coverage.Suggestions.HasItems())
             text += String(TEXT("\n  suggested Schema.BoneAliases (channel -> node, by normalized name): ")) + JoinAliases(coverage.Suggestions, 24);
+        for (const String& line : coverage.PartialRequired)
+            text += String(TEXT("\n  NOTE (bind pose is used in those clips): ")) + line;
         for (const String& line : coverage.MissingRequired)
             text += String(TEXT("\n  REQUIRED: ")) + line;
         return text;
@@ -574,7 +582,8 @@ bool MotionMatchingBaker::Bake(
     const float contactMaxHeight = bakedSchema.ContactMaxHeight;
 
     // Channel coverage through the shared resolver (aliases applied). The
-    // bake stops when a required role has no channel in some clip; the
+    // bake stops when a required role has no channel in ANY clip (names do
+    // not match the model); partial gaps keep the bind pose and are reported; the
     // report suggests aliases by normalized name.
     {
         ChannelCoverage coverage;
