@@ -37,6 +37,7 @@ namespace
             {
                 { 1, 2, &Upgrade_1_To_2 },
                 { 2, 3, &Upgrade_2_To_3 },
+                { 3, 4, &Upgrade_3_To_4 },
             };
             setup(upgraders, ARRAY_COUNT(upgraders));
         }
@@ -95,7 +96,7 @@ namespace
                 schema.TrajectorySampleTimes = trajectorySampleTimes;
 
             MemoryWriteStream output(4096);
-            schema.Serialize(output);
+            schema.SerializeV3(output);
             output.Write(sourceAnimations);
             output.Write(sourceTags);
             output.Write(sourceLooping);
@@ -135,7 +136,7 @@ namespace
 
             MemoryReadStream input(chunk->Get(), chunk->Size());
             PoseSearchSchema schema;
-            schema.Deserialize(input);
+            schema.DeserializeV3(input);
             Array<Guid> sourceAnimations;
             Array<String> sourceTagsFlat;
             Array<int32> sourceLooping;
@@ -168,7 +169,7 @@ namespace
             }
 
             MemoryWriteStream output(4096);
-            schema.Serialize(output);
+            schema.SerializeV3(output);
             output.Write(sourceAnimations);
             output.Write(sourceTags);
             output.Write(sourceLooping);
@@ -189,6 +190,143 @@ namespace
             return false;
         }
 
+        /// <summary>
+        /// v3 -> v4 (format v4: authored clip groups, contact gate and bone
+        /// aliases in the schema, skeleton fingerprint, TypeName
+        /// MotionMatching.MotionMatchingDatabase). The registry survives; the
+        /// v3 baked speed bands are carried into the new per-source group
+        /// array (matched by animation id), so a plain rebake keeps the same
+        /// one-shot filter. Baked data is dropped: the schema layout and the
+        /// provenance contract changed, so the database must be rebaked.
+        /// </summary>
+        static bool Upgrade_3_To_4(AssetMigrationContext& context)
+        {
+            const FlaxChunk* chunk = context.Input.Header.Chunks[0];
+            if (chunk == nullptr || !chunk->IsLoaded())
+            {
+                LOG(Warning, "Motion matching database upgrade failed: missing data chunk.");
+                return true;
+            }
+
+            MemoryReadStream input(chunk->Get(), chunk->Size());
+            PoseSearchSchema schema;
+            schema.DeserializeV3(input);
+            Array<Guid> sourceAnimations;
+            Array<Array<String>> sourceTags;
+            Array<int32> sourceLooping;
+            Array<String> tagNames;
+            Array<int32> tagClipCounts;
+            input.Read(sourceAnimations);
+            input.Read(sourceTags);
+            input.Read(sourceLooping);
+            input.Read(tagNames);
+            input.Read(tagClipCounts);
+            if (input.HasError() ||
+                sourceAnimations.Count() != sourceTags.Count() ||
+                sourceAnimations.Count() != sourceLooping.Count())
+            {
+                LOG(Warning, "Motion matching database upgrade failed: corrupted v3 registry.");
+                return true;
+            }
+
+            // v3 baked block, read only to recover the per-clip speed bands
+            // (the v3 tail ends with them) and the clip ids they belong to.
+            Array<Guid> clipAnimations;
+            Array<Array<String>> clipTags;
+            Array<int32> clipLooping;
+            Array<float> clipLengths;
+            Array<int32> clipSampleCounts;
+            Array<int32> sampleClipIndices;
+            Array<float> sampleTimes;
+            Array<float> poseFeatures;
+            Array<float> trajectoryFeatures;
+            Array<Float3> rootPositions;
+            Array<Float3> rootVelocities;
+            Array<Float3> rootForwards;
+            Array<float> poseMeans;
+            Array<float> poseDeviations;
+            Array<float> trajectoryMeans;
+            Array<float> trajectoryDeviations;
+            input.Read(clipAnimations);
+            input.Read(clipTags);
+            input.Read(clipLooping);
+            input.Read(clipLengths);
+            input.Read(clipSampleCounts);
+            input.Read(sampleClipIndices);
+            input.Read(sampleTimes);
+            input.Read(poseFeatures);
+            input.Read(trajectoryFeatures);
+            input.Read(rootPositions);
+            input.Read(rootVelocities);
+            input.Read(rootForwards);
+            input.Read(poseMeans);
+            input.Read(poseDeviations);
+            input.Read(trajectoryMeans);
+            input.Read(trajectoryDeviations);
+            Array<int32> legacyTurnLike;
+            if (!input.HasError() && input.GetPosition() < input.GetLength())
+                input.Read(legacyTurnLike);
+            for (int32 i = 0; i < 6; i++)
+            {
+                int32 ignored = 0;
+                if (!input.HasError() && input.GetPosition() < input.GetLength())
+                    input.ReadInt32(&ignored);
+            }
+            Array<int32> clipSpeedBands;
+            if (!input.HasError() && input.GetPosition() < input.GetLength())
+                input.Read(clipSpeedBands);
+            if (input.HasError())
+                clipSpeedBands.Clear();
+
+            Array<int32> sourceGroups;
+            sourceGroups.Resize(sourceAnimations.Count());
+            int32 recovered = 0;
+            for (int32 i = 0; i < sourceAnimations.Count(); i++)
+            {
+                sourceGroups[i] = 0;
+                for (int32 c = 0; c < clipAnimations.Count() && c < clipSpeedBands.Count(); c++)
+                {
+                    if (clipAnimations[c] == sourceAnimations[i])
+                    {
+                        sourceGroups[i] = clipSpeedBands[c] >= 0 ? clipSpeedBands[c] : 0;
+                        recovered++;
+                        break;
+                    }
+                }
+            }
+
+            MemoryWriteStream output(4096);
+            schema.Serialize(output);
+            output.Write(sourceAnimations);
+            output.Write(sourceTags);
+            output.Write(sourceLooping);
+            output.Write(tagNames);
+            output.Write(tagClipCounts);
+            // Empty baked data (16 slots), empty legacy turn-like slot, six
+            // zero provenance ints, empty clip groups.
+            for (int32 i = 0; i < 16; i++)
+                output.WriteInt32(0);
+            output.WriteInt32(0);
+            for (int32 i = 0; i < 6; i++)
+                output.WriteInt32(0);
+            output.WriteInt32(0);
+            // v4 tail: per-source groups, then an empty skeleton fingerprint.
+            output.Write(sourceGroups);
+            MotionMatchingSkeletonFingerprint().Serialize(output);
+
+            if (context.AllocateChunk(0))
+                return true;
+            context.Output.Header.Chunks[0]->Data.Copy(ToSpan(output));
+            context.Output.Header.TypeName = MotionMatchingDatabase::TypeName;
+
+            LOG(
+                Info,
+                "Motion matching database upgraded to v4: kept {} registered clips ({} groups recovered from the v3 baked bands), baked data cleared (re-bake required).",
+                sourceAnimations.Count(),
+                recovered);
+            return false;
+        }
+
     };
 #endif
 
@@ -197,10 +335,10 @@ namespace
     /// Flax can keep the previous factory entry alive until the old module is
     /// released, so replacing the key is required before adding the new one.
     ///
-    /// Two keys: the frozen serialized TypeName (what database files carry
-    /// in their header) and the scripting type name. Content::CreateVirtualAsset
-    /// finds the factory by the scripting type name, so without the second
-    /// key a database that does not exist yet could not be created.
+    /// Two keys: TypeName (format v4 files and the scripting type name that
+    /// Content::CreateVirtualAsset looks up) and LegacyTypeName, which v1-v3
+    /// files carry in their header. The legacy key only exists so the
+    /// upgrader can read old files; the upgrade rewrites the header.
     /// </summary>
     class MotionMatchingDatabaseFactory : public BinaryAssetFactory<MotionMatchingDatabase>
     {
@@ -208,23 +346,16 @@ namespace
         MotionMatchingDatabaseFactory()
         {
             Register(MotionMatchingDatabase::TypeName);
-            Register(ScriptingTypeName());
+            Register(MotionMatchingDatabase::LegacyTypeName);
         }
 
         ~MotionMatchingDatabaseFactory()
         {
             Unregister(MotionMatchingDatabase::TypeName);
-            Unregister(ScriptingTypeName());
+            Unregister(MotionMatchingDatabase::LegacyTypeName);
         }
 
     private:
-        // The registry keys are string views: the text must outlive the entry.
-        static const StringView& ScriptingTypeName()
-        {
-            static const StringView name(TEXT("MotionMatching.MotionMatchingDatabase"));
-            return name;
-        }
-
         void Register(const StringView& key)
         {
             auto& factories = IAssetFactory::Get();
@@ -288,13 +419,12 @@ namespace
 #endif
 }
 
-// Serialized asset type identity, FROZEN for load compatibility: baked
-// .flax files store this exact UTF-16 string in their header, so renaming
-// it would orphan every shipped database. The C#/scripting namespace moved
-// to MotionMatching; only this binary-asset factory key keeps the legacy
-// name. A future rename requires a rebake + header migration (see
-// docs/MIGRATION.md), not a one-line edit.
-const String MotionMatchingDatabase::TypeName = TEXT("Game.MotionMatchingDatabase");
+// Serialized asset type identity. Format v4 files carry TypeName (equal to
+// the scripting type name); v1-v3 files carry LegacyTypeName and are
+// converted by Upgrade_3_To_4, which rewrites the header (docs/MIGRATION.md).
+// Both strings must be defined before the factory below registers them.
+const String MotionMatchingDatabase::TypeName = TEXT("MotionMatching.MotionMatchingDatabase");
+const String MotionMatchingDatabase::LegacyTypeName = TEXT("Game.MotionMatchingDatabase");
 static MotionMatchingDatabaseFactory CFactoryMotionMatchingDatabase;
 
 namespace
@@ -399,27 +529,15 @@ bool MotionMatchingDatabase::GetClipLoop(int32 clipIndex) const
            _clipLooping[clipIndex] != 0;
 }
 
-bool MotionMatchingDatabase::GetClipTurnLike(int32 clipIndex) const
+int32 MotionMatchingDatabase::GetClipGroup(int32 clipIndex) const
 {
-    if (_clipTurnLike.IsValidIndex(clipIndex))
-        return _clipTurnLike[clipIndex] != 0;
-    // S1 §7.2 / PLAN §12: no filename fallback at runtime. A database without
-    // the baked flag (legacy or stale, e.g. layout/revision mismatch dropped
-    // its baked arrays) is registry-only / REBAKE REQUIRED; turning it into a
-    // turn-like classification by looking at clip paths would reintroduce the
-    // runtime name matching this flag exists to remove. Name matching stays
-    // bake-time only (Baker/MotionMatchingBakeHeuristics.h).
-    return false;
+    // 0 (any) for an invalid index keeps every one-shot eligible.
+    return _clipGroups.IsValidIndex(clipIndex) ? _clipGroups[clipIndex] : 0;
 }
 
-int32 MotionMatchingDatabase::GetClipSpeedBand(int32 clipIndex) const
+bool MotionMatchingDatabase::CheckSkeleton(SkinnedModel* model, String& report) const
 {
-    if (_clipSpeedBands.IsValidIndex(clipIndex))
-        return _clipSpeedBands[clipIndex];
-    // No band data (legacy file): Any keeps every one-shot eligible, exactly
-    // the pre-band behavior. The SchemaContractRevision gate already forces
-    // such files registry-only; this is only a safe default, never a bypass.
-    return 0;
+    return _skeletonFingerprint.Check(model, report);
 }
 
 float MotionMatchingDatabase::GetClipTurnAngle(int32 clipIndex) const
@@ -527,8 +645,8 @@ int32 MotionMatchingDatabase::ComputeSamplingContractHash() const
     MixHashInt(hash, GetPoseFeatureSize());
     MixHashInt(hash, GetTrajectoryFeatureSize());
     MixHashInt(hash, _schema.SampleRate);
-    MixHashFloat(hash, PoseSearchSchema::ContactMaxSpeed);
-    MixHashFloat(hash, PoseSearchSchema::ContactMaxHeight);
+    MixHashFloat(hash, _schema.ContactMaxSpeed);
+    MixHashFloat(hash, _schema.ContactMaxHeight);
     MixHashInt(hash, _schema.TrajectorySampleTimes.Count());
     for (int32 i = 0; i < _schema.TrajectorySampleTimes.Count(); i++)
         MixHashFloat(hash, _schema.TrajectorySampleTimes[i]);
@@ -589,8 +707,7 @@ int64 MotionMatchingDatabase::ComputeClipMetadataHash() const
         return 0;
     uint64 hash = Fnv64Offset;
     Mix64Array(hash, _clipLooping);
-    Mix64Array(hash, _clipTurnLike);
-    Mix64Array(hash, _clipSpeedBands);
+    Mix64Array(hash, _clipGroups);
     Mix64Array(hash, _clipTurnAngles);
     const int32 clipCount = _clipTags.Count();
     Mix64(hash, &clipCount, sizeof(clipCount));
@@ -613,7 +730,7 @@ int64 MotionMatchingDatabase::ComputeClipMetadataHash() const
 int32 MotionMatchingDatabase::ComputeSourceManifestHash() const
 {
     // Source manifest identity: every registered source asset's 16-byte ID
-    // plus its tag and loop flag. Flax's runtime Asset API exposes no stable
+    // plus its tag set, loop flag and group. Flax's runtime Asset API exposes no stable
     // source file timestamp, so the PLAN §18.5 "asset id+timestamp" is carried
     // by this ID/tag/loop identity; the tool side is BakeToolBuildId. A change
     // here means the registry no longer matches the bake snapshot.
@@ -629,6 +746,7 @@ int32 MotionMatchingDatabase::ComputeSourceManifestHash() const
         for (const String& tag : set)
             MixHashString(hash, tag);
         MixHashInt(hash, _sourceLooping.IsValidIndex(i) && _sourceLooping[i] != 0 ? 1 : 0);
+        MixHashInt(hash, GetSourceClipGroup(i));
     }
     return FinishHash(hash);
 }
@@ -663,13 +781,19 @@ bool MotionMatchingDatabase::GetSourceClipLoop(int32 sourceIndex) const
            _sourceLooping[sourceIndex] != 0;
 }
 
+int32 MotionMatchingDatabase::GetSourceClipGroup(int32 sourceIndex) const
+{
+    return _sourceGroups.IsValidIndex(sourceIndex) ? _sourceGroups[sourceIndex] : 0;
+}
+
 #if USE_EDITOR
 
 bool MotionMatchingDatabase::AddClips(
     const String& databasePath,
     const Array<String>& tags,
     const Array<Animation*>& animations,
-    bool loop)
+    bool loop,
+    int32 group)
 {
     const Array<String> set = NormalizeTags(tags);
     if (set.IsEmpty() || animations.IsEmpty())
@@ -677,12 +801,17 @@ bool MotionMatchingDatabase::AddClips(
         LOG(Error, "Cannot add motion matching clips without tags and animations.");
         return false;
     }
+    if (group < 0)
+    {
+        LOG(Error, "Cannot add motion matching clips: group {} is negative (0 = any).", group);
+        return false;
+    }
 
     MotionMatchingDatabase* database = LoadOrCreateDatabase(databasePath);
     if (database == nullptr)
         return false;
 
-    const bool changed = database->AddSourceClips(set, animations, loop);
+    const bool changed = database->AddSourceClips(set, animations, loop, group);
     if (database->IsVirtual() && !changed)
         return false;
     if (changed &&
@@ -691,9 +820,10 @@ bool MotionMatchingDatabase::AddClips(
 
     LOG(
         Info,
-        "Motion matching clips persisted: total={}, tags='{}'.",
+        "Motion matching clips persisted: total={}, tags='{}', group={}.",
         database->GetAnimationClipsCount(),
-        JoinTags(set));
+        JoinTags(set),
+        group);
     return true;
 }
 
@@ -702,6 +832,7 @@ bool MotionMatchingDatabase::AddClipFiles(
     const Array<String>& tags,
     const Array<String>& animationPaths,
     bool loop,
+    int32 group,
     int32& addedCount)
 {
     addedCount = 0;
@@ -715,7 +846,7 @@ bool MotionMatchingDatabase::AddClipFiles(
     }
 
     addedCount = animations.Count();
-    return addedCount > 0 && AddClips(databasePath, tags, animations, loop);
+    return addedCount > 0 && AddClips(databasePath, tags, animations, loop, group);
 }
 
 bool MotionMatchingDatabase::ClearClips(const String& databasePath)
@@ -736,12 +867,13 @@ bool MotionMatchingDatabase::UpdateSourceClip(
     const String& databasePath,
     int32 sourceIndex,
     const Array<String>& tags,
-    bool loop)
+    bool loop,
+    int32 group)
 {
     const Array<String> set = NormalizeTags(tags);
-    if (set.IsEmpty())
+    if (set.IsEmpty() || group < 0)
     {
-        LOG(Error, "Cannot update motion matching clip without tags.");
+        LOG(Error, "Cannot update motion matching clip without tags or with a negative group.");
         return false;
     }
 
@@ -756,6 +888,7 @@ bool MotionMatchingDatabase::UpdateSourceClip(
 
     database->_sourceTags[sourceIndex] = set;
     database->_sourceLooping[sourceIndex] = loop ? 1 : 0;
+    database->_sourceGroups[sourceIndex] = group;
     database->RebuildTagCounts();
     // Source tags feed baked clips, so any baked data is stale now.
     database->ClearBakedData();
@@ -764,10 +897,11 @@ bool MotionMatchingDatabase::UpdateSourceClip(
 
     LOG(
         Info,
-        "Motion matching clip updated: index={}, tags='{}', loop={}. Rebake required.",
+        "Motion matching clip updated: index={}, tags='{}', loop={}, group={}. Rebake required.",
         sourceIndex,
         JoinTags(set),
-        loop ? 1 : 0);
+        loop ? 1 : 0,
+        group);
     return true;
 }
 
@@ -787,6 +921,7 @@ bool MotionMatchingDatabase::RemoveSourceClip(
     database->_sourceAnimations.RemoveAt(sourceIndex);
     database->_sourceTags.RemoveAt(sourceIndex);
     database->_sourceLooping.RemoveAt(sourceIndex);
+    database->_sourceGroups.RemoveAt(sourceIndex);
     database->RebuildTagCounts();
     database->ClearBakedData();
     if (database->IsVirtual() ? database->Save(databasePath) : database->Save())
@@ -801,10 +936,13 @@ bool MotionMatchingDatabase::ApplyClipEdits(
     const Array<int32>& updateIndices,
     const Array<String>& updateTagSets,
     const Array<int32>& updateLoops,
+    const Array<int32>& updateGroups,
     const Array<int32>& removeIndices)
 {
+    // updateGroups may be empty (keep every group) or match updateIndices.
     if (updateIndices.Count() != updateTagSets.Count() ||
-        updateIndices.Count() != updateLoops.Count())
+        updateIndices.Count() != updateLoops.Count() ||
+        (updateGroups.HasItems() && updateGroups.Count() != updateIndices.Count()))
     {
         LOG(Error, "Cannot apply motion matching clip edits: mismatched array sizes.");
         return false;
@@ -823,7 +961,8 @@ bool MotionMatchingDatabase::ApplyClipEdits(
     {
         updateSets.Add(SplitTagSet(updateTagSets[i]));
         if (updateIndices[i] < 0 || updateIndices[i] >= sourceCount ||
-            updateSets[i].IsEmpty())
+            updateSets[i].IsEmpty() ||
+            (updateGroups.HasItems() && updateGroups[i] < 0))
         {
             LOG(Error, "Cannot apply motion matching clip edits: invalid update at position {}.", i);
             return false;
@@ -842,6 +981,8 @@ bool MotionMatchingDatabase::ApplyClipEdits(
     {
         database->_sourceTags[updateIndices[i]] = updateSets[i];
         database->_sourceLooping[updateIndices[i]] = updateLoops[i] != 0 ? 1 : 0;
+        if (updateGroups.HasItems())
+            database->_sourceGroups[updateIndices[i]] = updateGroups[i];
     }
 
     if (!removeIndices.IsEmpty())
@@ -851,9 +992,11 @@ bool MotionMatchingDatabase::ApplyClipEdits(
         Array<AssetReference<Animation>> keptAnimations;
         Array<Array<String>> keptTags;
         Array<int32> keptLooping;
+        Array<int32> keptGroups;
         keptAnimations.EnsureCapacity(sourceCount);
         keptTags.EnsureCapacity(sourceCount);
         keptLooping.EnsureCapacity(sourceCount);
+        keptGroups.EnsureCapacity(sourceCount);
         for (int32 i = 0; i < sourceCount; i++)
         {
             if (removeIndices.Contains(i))
@@ -861,10 +1004,12 @@ bool MotionMatchingDatabase::ApplyClipEdits(
             keptAnimations.Add(database->_sourceAnimations[i]);
             keptTags.Add(database->_sourceTags[i]);
             keptLooping.Add(database->_sourceLooping[i]);
+            keptGroups.Add(database->_sourceGroups[i]);
         }
         database->_sourceAnimations = keptAnimations;
         database->_sourceTags = keptTags;
         database->_sourceLooping = keptLooping;
+        database->_sourceGroups = keptGroups;
     }
 
     database->RebuildTagCounts();
@@ -940,6 +1085,7 @@ MotionMatchingDatabase::ValidationStatus MotionMatchingDatabase::ValidateDataSta
     const int32 sourceCount = _sourceAnimations.Count();
     if (_sourceTags.Count() != sourceCount ||
         _sourceLooping.Count() != sourceCount ||
+        _sourceGroups.Count() != sourceCount ||
         _tagNames.Count() != _tagClipCounts.Count())
     {
         reason = TEXT("source registry arrays have inconsistent sizes");
@@ -954,7 +1100,8 @@ MotionMatchingDatabase::ValidationStatus MotionMatchingDatabase::ValidateDataSta
     {
         if (!_sourceAnimations[i].GetID().IsValid() ||
             _sourceTags[i].IsEmpty() ||
-            (_sourceLooping[i] != 0 && _sourceLooping[i] != 1))
+            (_sourceLooping[i] != 0 && _sourceLooping[i] != 1) ||
+            _sourceGroups[i] < 0)
         {
             reason = String::Format(TEXT("source clip {} is invalid"), i);
             return ValidationStatus::Corrupt;
@@ -984,7 +1131,8 @@ MotionMatchingDatabase::ValidationStatus MotionMatchingDatabase::ValidateDataSta
         // Unbaked database: only the source clip registry is meaningful.
         if (clipCount != 0 ||
             !_poseFeatureDeviations.IsEmpty() ||
-            !_trajectoryFeatureDeviations.IsEmpty())
+            !_trajectoryFeatureDeviations.IsEmpty() ||
+            !_skeletonFingerprint.IsEmpty())
         {
             reason = TEXT("unbaked database still carries baked arrays");
             return ValidationStatus::Corrupt;
@@ -1045,8 +1193,7 @@ MotionMatchingDatabase::ValidationStatus MotionMatchingDatabase::ValidateDataSta
     // ---- Baked structural invariants (CORRUPT): provenance is current ----
     if (_clipTags.Count() != clipCount ||
         _clipLooping.Count() != clipCount ||
-        (_clipTurnLike.Count() != clipCount && _clipTurnLike.Count() != 0) ||
-        (_clipSpeedBands.Count() != clipCount && _clipSpeedBands.Count() != 0) ||
+        _clipGroups.Count() != clipCount ||
         (_clipTurnAngles.Count() != clipCount && _clipTurnAngles.Count() != 0) ||
         _clipLengths.Count() != clipCount ||
         _clipSampleCounts.Count() != clipCount)
@@ -1059,8 +1206,7 @@ MotionMatchingDatabase::ValidationStatus MotionMatchingDatabase::ValidateDataSta
         if (!_clipAnimations[i].GetID().IsValid() ||
             _clipTags[i].IsEmpty() ||
             (_clipLooping[i] != 0 && _clipLooping[i] != 1) ||
-            (_clipTurnLike.Count() != 0 && _clipTurnLike[i] != 0 && _clipTurnLike[i] != 1) ||
-            (_clipSpeedBands.Count() != 0 && (_clipSpeedBands[i] < 0 || _clipSpeedBands[i] > 3)) ||
+            _clipGroups[i] < 0 ||
             _clipLengths[i] <= 0.0f)
         {
             reason = String::Format(TEXT("baked clip {} is invalid"), i);
@@ -1097,6 +1243,12 @@ MotionMatchingDatabase::ValidationStatus MotionMatchingDatabase::ValidateDataSta
             reason = TEXT("a sample clip index is out of range");
             return ValidationStatus::Corrupt;
         }
+    }
+
+    if (!_skeletonFingerprint.IsConsistent())
+    {
+        reason = TEXT("baked skeleton fingerprint is inconsistent");
+        return ValidationStatus::Corrupt;
     }
 
     // The schema snapshot must be usable by the runtime query builder.
@@ -1205,13 +1357,15 @@ MotionMatchingDatabase::ValidationStatus MotionMatchingDatabase::ValidateDataSta
 void MotionMatchingDatabase::GetSourceData(
     Array<Animation*>& animations,
     Array<Array<String>>& tags,
-    Array<int32>& loopingClips) const
+    Array<int32>& loopingClips,
+    Array<int32>& groups) const
 {
     animations.Resize(_sourceAnimations.Count());
     for (int32 i = 0; i < _sourceAnimations.Count(); i++)
         animations[i] = _sourceAnimations[i].Get();
     tags = _sourceTags;
     loopingClips = _sourceLooping;
+    groups = _sourceGroups;
 }
 
 void MotionMatchingDatabase::ClearBakedData()
@@ -1226,8 +1380,7 @@ void MotionMatchingDatabase::ClearBakedData()
     _clipAnimations.Clear();
     _clipTags.Clear();
     _clipLooping.Clear();
-    _clipTurnLike.Clear();
-    _clipSpeedBands.Clear();
+    _clipGroups.Clear();
     _clipTurnAngles.Clear();
     _clipLengths.Clear();
     _clipSampleCounts.Clear();
@@ -1240,6 +1393,7 @@ void MotionMatchingDatabase::ClearBakedData()
     _rootForwards.Clear();
     _poseFeatureDeviations.Clear();
     _trajectoryFeatureDeviations.Clear();
+    _skeletonFingerprint.Clear();
 }
 
 void MotionMatchingDatabase::RebuildTagCounts()
@@ -1279,6 +1433,7 @@ uint64 MotionMatchingDatabase::GetMemoryUsage() const
     for (const Array<String>& set : _sourceTags)
         result += set.Capacity() * sizeof(String);
     result += _sourceLooping.Capacity() * sizeof(int32);
+    result += _sourceGroups.Capacity() * sizeof(int32);
     result += _tagNames.Capacity() * sizeof(String);
     result += _tagClipCounts.Capacity() * sizeof(int32);
     result += _clipAnimations.Capacity() * sizeof(AssetReference<Animation>);
@@ -1286,8 +1441,7 @@ uint64 MotionMatchingDatabase::GetMemoryUsage() const
     for (const Array<String>& set : _clipTags)
         result += set.Capacity() * sizeof(String);
     result += _clipLooping.Capacity() * sizeof(int32);
-    result += _clipTurnLike.Capacity() * sizeof(int32);
-    result += _clipSpeedBands.Capacity() * sizeof(int32);
+    result += _clipGroups.Capacity() * sizeof(int32);
     result += _clipTurnAngles.Capacity() * sizeof(float);
     result += _clipLengths.Capacity() * sizeof(float);
     result += _clipSampleCounts.Capacity() * sizeof(int32);
@@ -1301,6 +1455,10 @@ uint64 MotionMatchingDatabase::GetMemoryUsage() const
     result += _rootForwards.Capacity() * sizeof(Float3);
     result += _poseFeatureDeviations.Capacity() * sizeof(float);
     result += _trajectoryFeatureDeviations.Capacity() * sizeof(float);
+    result += _skeletonFingerprint.NodeNames.Capacity() * sizeof(String);
+    result += (_skeletonFingerprint.ParentIndices.Capacity() +
+        _skeletonFingerprint.Translations.Capacity() +
+        _skeletonFingerprint.NodeFlags.Capacity()) * sizeof(int32);
     return result;
 }
 
@@ -1341,11 +1499,13 @@ Asset::LoadResult MotionMatchingDatabase::load()
     stream.Read(_poseFeatureDeviations);
     stream.Read(legacyTrajectoryMeans);
     stream.Read(_trajectoryFeatureDeviations);
-    // Tail fields appended after the v2 layout: legacy databases end above,
-    // so read them only when bytes remain (then ValidateData tolerates the
-    // empty array and GetClipTurnLike derives from clip paths).
+    // Format v4 load only (older files are converted by the upgrader before
+    // they get here). Tail fields stay conditional reads for robustness.
+    // Legacy turn-like slot: written empty since v4 (the flag was only ever
+    // read by the clip audit), kept so the byte layout never reorders.
+    Array<int32> legacyTurnLike;
     if (!stream.HasError() && stream.GetPosition() < stream.GetLength())
-        stream.Read(_clipTurnLike);
+        stream.Read(legacyTurnLike);
     // Normalization revision tail (Phase 2): absent in older files (= 0).
     int32 storedRevision = 0;
     if (!stream.HasError() && stream.GetPosition() < stream.GetLength())
@@ -1375,11 +1535,21 @@ Asset::LoadResult MotionMatchingDatabase::load()
     if (!stream.HasError() && stream.GetPosition() < stream.GetLength())
         stream.ReadInt32(&storedBakeToolId);
     _bakeToolBuildId = storedBakeToolId;
-    // Per-clip speed bands (rev 2): absent in older files (empty = Any for
-    // every clip, the pre-band behavior). The SchemaContractRevision gate
-    // above already classifies such files registry-only.
+    // Per-clip groups (the v3 speed-band slot).
     if (!stream.HasError() && stream.GetPosition() < stream.GetLength())
-        stream.Read(_clipSpeedBands);
+        stream.Read(_clipGroups);
+    // v4 tail: per-source groups, then the skeleton fingerprint.
+    if (!stream.HasError() && stream.GetPosition() < stream.GetLength())
+        stream.Read(_sourceGroups);
+    if (!stream.HasError() && stream.GetPosition() < stream.GetLength())
+        _skeletonFingerprint.Deserialize(stream);
+    // A registry written without groups reads as all-any.
+    if (!stream.HasError() && _sourceGroups.IsEmpty() && _sourceAnimations.HasItems())
+    {
+        _sourceGroups.Resize(_sourceAnimations.Count());
+        for (int32 i = 0; i < _sourceGroups.Count(); i++)
+            _sourceGroups[i] = 0;
+    }
 
     // D1 §18.5 three-way gate. Registry-only stale (legacy layout or a
     // provenance revision/hash mismatch) keeps the clip registry but drops the
@@ -1426,6 +1596,7 @@ void MotionMatchingDatabase::unload(bool isReloading)
     _sourceAnimations.Clear();
     _sourceTags.Clear();
     _sourceLooping.Clear();
+    _sourceGroups.Clear();
     _tagNames.Clear();
     _tagClipCounts.Clear();
     ClearBakedData();

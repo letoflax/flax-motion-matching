@@ -166,16 +166,14 @@ struct MOTIONMATCHING_API MotionMatchingSearchSettings
     API_FIELD() float TurnPenaltyYawScale = 4.0f;
 
     /// <summary>
-    /// Onset one-shot gait filter (0 = Any). When set (Walk/Run/Sprint),
-    /// ONE-SHOT candidates whose baked speed band disagrees are skipped, so a
-    /// walk onset cannot coin-flip a run start: at the onset instant the
-    /// features carry almost no gait information, only intent does. Loops are
-    /// never band-cut. The policy sets this from desired speed on
-    /// speed-increase onsets only; stale databases without band data report
-    /// Any for every clip (no behavior change, still gated stale by
-    /// SchemaContractRevision).
+    /// One-shot clip group filter (0 = any). When non-zero, ONE-SHOT
+    /// candidates whose baked clip group is non-zero and different are
+    /// skipped; loops and group-0 clips are never cut. Group ids are authored
+    /// in the clip registry and their meaning belongs to the host (flax-test
+    /// uses 1/2/3 for walk/run/sprint so an onset cannot coin-flip a gait).
+    /// The policy passes MotionMatchingFrameInput.ClipGroup verbatim.
     /// </summary>
-    API_FIELD() int32 OneShotBand = 0;
+    API_FIELD() int32 OneShotGroup = 0;
 
     /// <summary>
     /// Per-frame rotating-stride cursor. When MaxCandidates budgets a strided

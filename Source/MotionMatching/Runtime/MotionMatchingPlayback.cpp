@@ -1,6 +1,7 @@
 #include "MotionMatchingPlayback.h"
 
 #include "MotionMatchingSampler.h"
+#include "MotionMatchingChannelMap.h"
 #include "../Database/MotionMatchingDatabase.h"
 #include "Engine/Content/Assets/Animation.h"
 #include "Engine/Content/Assets/SkinnedModel.h"
@@ -123,9 +124,16 @@ void MotionMatchingPlayback::Setup(
     _clips.Clear();
     _lengths.Clear();
     _loops.Clear();
+    _aliases.Clear();
+    _channelMaps.Clear();
+    _channelMapModel = nullptr;
 
     if (_database == nullptr || !_database->IsBaked())
         return;
+
+    // Clips are sampled with the aliases the database was baked with, through
+    // the same channel resolver as the baker.
+    _aliases = _database->GetSchema().BoneAliases;
 
     const int32 count = _database->GetClipCount();
     _lengths = _database->GetClipLengths();
@@ -341,8 +349,12 @@ void MotionMatchingPlayback::Tick(float deltaTime, AnimatedModel* body)
     _tickFrameId++;
     Array<Matrix> locals;
     String error;
-    if (!MotionMatchingSampler::SampleClipLocalPose(_clips[CurrentClip], model, CurrentTime, locals, error))
+    const Array<int32>* channelMap = GetChannelMap(CurrentClip, model);
+    if (channelMap == nullptr ||
+        !MotionMatchingSampler::SampleClipLocalPoseMapped(_clips[CurrentClip], model, *channelMap, CurrentTime, locals, error))
     {
+        if (channelMap == nullptr)
+            error = TEXT("clip channel map is unavailable.");
         WarnOnce(String(TEXT("Motion matching playback stopped: ")) + error);
         return;
     }
@@ -472,7 +484,9 @@ void MotionMatchingPlayback::BuildInertialOffsets(Array<Matrix>& newBase, Skinne
             prevTime = MaxF(prevTime, 0.0f);
         }
         String sampleError;
-        if (MotionMatchingSampler::SampleClipLocalPose(_clips[CurrentClip], model, prevTime, newPrevStorage, sampleError))
+        const Array<int32>* channelMap = GetChannelMap(CurrentClip, model);
+        if (channelMap != nullptr &&
+            MotionMatchingSampler::SampleClipLocalPoseMapped(_clips[CurrentClip], model, *channelMap, prevTime, newPrevStorage, sampleError))
         {
             if (_hasReferenceRoot && _rootNodeIndex >= 0 && _rootNodeIndex < newPrevStorage.Count())
             {
@@ -706,6 +720,31 @@ bool MotionMatchingPlayback::TryDecompose(const Matrix& value, Float3& scl, Quat
     value.Decompose(scl, rot, pos);
     return std::isfinite(scl.X + scl.Y + scl.Z + pos.X + pos.Y + pos.Z +
         rot.X + rot.Y + rot.Z + rot.W);
+}
+
+const Array<int32>* MotionMatchingPlayback::GetChannelMap(int32 clipIndex, SkinnedModel* model)
+{
+    if (model == nullptr || clipIndex < 0 || clipIndex >= _clips.Count() || _clips[clipIndex] == nullptr)
+        return nullptr;
+    // One table per clip/model pair, built on first use: a model swap drops
+    // every cached table.
+    if (_channelMapModel != model)
+    {
+        _channelMaps.Clear();
+        _channelMapModel = model;
+    }
+    if (_channelMaps.Count() != _clips.Count())
+        _channelMaps.Resize(_clips.Count());
+    Array<int32>& map = _channelMaps[clipIndex];
+    const int32 nodeCount = model->GetNodes().Count();
+    if (map.Count() != nodeCount)
+    {
+        Animation* clip = _clips[clipIndex];
+        if (clip->WaitForLoaded() || model->WaitForLoaded())
+            return nullptr;
+        MotionMatchingChannelMap::Build(model->GetNodes(), clip->Data.Channels, _aliases, map);
+    }
+    return &map;
 }
 
 void MotionMatchingPlayback::EnsureHierarchy(SkinnedModel* model)

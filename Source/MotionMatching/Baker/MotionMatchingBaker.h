@@ -2,6 +2,7 @@
 
 #if USE_EDITOR
 
+#include "Engine/Content/Assets/Animation.h"
 #include "Engine/Content/Assets/SkinnedModel.h"
 #include "../Schema/PoseSearchSchema.h"
 
@@ -21,7 +22,11 @@ public:
     /// features, stores the schema snapshot, then saves the database asset.
     /// Feature sizes are defined by PoseSearchSchema (pose: 7 bones x pos+vel
     /// + 2 foot contacts, trajectory: 6 points x planar pos+dir+yawrate).
-    /// Schema weights are stored but not applied.
+    /// Schema weights are stored but not applied. Before sampling, the bake
+    /// logs a channel coverage report (clip channels vs model nodes, alias
+    /// suggestions) and FAILS when Root/Pelvis/LeftFoot/RightFoot have no
+    /// channel in some clip. The skeleton fingerprint stored with the data
+    /// lets a controller refuse a model the clips do not fit.
     /// </summary>
     API_FUNCTION()
     static bool Bake(
@@ -30,6 +35,31 @@ public:
         MotionMatchingDatabase* database,
         API_PARAM(Out) int32& bakedClipCount,
         API_PARAM(Out) int32& bakedSampleCount);
+
+    /// <summary>
+    /// Alias suggestions for baking clips on a model: every clip channel that
+    /// resolves to no model node (schema aliases applied) paired with the one
+    /// undriven node of the same normalized name (case, separators and a
+    /// dominant rig prefix ignored, side tokens l/left and r/right unified).
+    /// Ambiguous names get no suggestion. Review before adding them to
+    /// Schema.BoneAliases: aliases rename only, they never fix proportions.
+    /// </summary>
+    API_FUNCTION()
+    static Array<BoneAlias> SuggestBoneAliases(
+        SkinnedModel* model,
+        const Array<Animation*>& clips,
+        const PoseSearchSchema& schema);
+
+    /// <summary>
+    /// The coverage report the bake logs (channels matching no node, nodes
+    /// driven by no clip, alias suggestions, missing required roles, clip
+    /// proportions that differ from the model), without baking.
+    /// </summary>
+    API_FUNCTION()
+    static String DescribeChannelCoverage(
+        SkinnedModel* model,
+        const Array<Animation*>& clips,
+        const PoseSearchSchema& schema);
 };
 
 #endif

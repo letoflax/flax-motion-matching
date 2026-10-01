@@ -21,7 +21,7 @@ PUBLIC_REFERENCES = {
     "Source/MotionMatching/MotionMatchingInputContract.cs": (
         "interface IMotionMatchingInputProvider", "struct MotionMatchingInputContext",
         "struct MotionMatchingFrameInput", "public int LoopFilter;",
-        "public int CandidateBand;", "public float QueryYawRate;",
+        "public int ClipGroup;", "public float QueryYawRate;",
         "public float TargetSpeed;", "public bool HoldReseedFilter;",
     ),
     "Source/MotionMatching/Runtime/MotionMatchingRuntimePolicy.h": (
@@ -35,14 +35,16 @@ PUBLIC_REFERENCES = {
     "Source/MotionMatching/Schema/PoseSearchSchema.h": (
         "struct MOTIONMATCHING_API PoseSearchSchema", "API_FIELD() SkeletonProfile Skeleton;",
         "TrajectorySampleTimes", "bool TryValidate(String& error) const",
+        "float ContactMaxSpeed", "float ContactMaxHeight", "Array<BoneAlias> BoneAliases;",
     ),
     "Source/MotionMatching/Database/MotionMatchingDatabase.h": (
         "class MOTIONMATCHING_API MotionMatchingDatabase", "GetClipTags",
-        "GetClipLoop", "ValidateSavedDatabase",
+        "GetClipLoop", "GetClipGroup", "ValidateSavedDatabase", "CheckSkeleton",
     ),
     "Source/MotionMatchingEditor/MotionMatchingEditorService.cs": (
         "class ClipRegistryImportOptions", "ExportClipRegistry",
         "ImportClipRegistry", "BakeDatabase", "GenerateClipAudit",
+        "InferGroup", "SuggestBoneAliases",
     ),
 }
 
@@ -126,15 +128,30 @@ def audit(root=ROOT, overrides=None):
         if marker not in _text(root, "docs/PLUGIN_CONTRACT.md", overrides):
             failures.append("contract docs omit recovery/filter term: %s" % marker)
 
-    # Asset identity is intentionally a raw-source check: the string must stay
-    # available to the factory even though it is not a scripting namespace.
+    # Asset identity is intentionally a raw-source check (M3, format v4): new
+    # files carry the scripting type name; the legacy key stays registered so
+    # v1-v3 files still load and upgrade.
     database_cpp = _text(root, "Source/MotionMatching/Database/MotionMatchingDatabase.cpp", overrides)
-    if 'MotionMatchingDatabase::TypeName = TEXT("Game.MotionMatchingDatabase")' not in database_cpp:
-        failures.append("legacy database TypeName policy changed")
+    database_h = _text(root, "Source/MotionMatching/Database/MotionMatchingDatabase.h", overrides)
+    if 'MotionMatchingDatabase::TypeName = TEXT("MotionMatching.MotionMatchingDatabase")' not in database_cpp:
+        failures.append("database TypeName policy changed")
+    if 'MotionMatchingDatabase::LegacyTypeName = TEXT("Game.MotionMatchingDatabase")' not in database_cpp:
+        failures.append("legacy database TypeName no longer defined")
+    for marker in ("Register(MotionMatchingDatabase::TypeName);",
+                   "Register(MotionMatchingDatabase::LegacyTypeName);",
+                   "context.Output.Header.TypeName = MotionMatchingDatabase::TypeName;",
+                   "{ 3, 4, &Upgrade_3_To_4 }"):
+        if marker not in database_cpp:
+            failures.append("database migration marker missing: %s" % marker)
+    if "DECLARE_BINARY_ASSET_HEADER(MotionMatchingDatabase, 4)" not in database_h:
+        failures.append("database format version is not 4")
     migration = _text(root, "docs/MIGRATION.md", overrides)
-    for marker in ("Game.MotionMatchingDatabase", "frozen", "Do not rewrite"):
+    for marker in ("Game.MotionMatchingDatabase", "MotionMatching.MotionMatchingDatabase",
+                   "Upgrade_3_To_4", "rebake"):
         if marker not in migration:
-            failures.append("migration docs omit TypeName policy: %s" % marker)
+            failures.append("migration docs omit TypeName/upgrade policy: %s" % marker)
+    if "frozen" in migration:
+        failures.append("migration docs still call the TypeName frozen")
 
     # Coupling boundary: comments and literals do not count as code references.
     source_root = root / "Source"
@@ -171,11 +188,14 @@ def audit(root=ROOT, overrides=None):
     if 'options.PublicDependencies.Add("MotionMatching")' not in editor_build:
         failures.append("editor module does not declare runtime dependency")
 
-    sample = root / "Source/MotionMatchingEditor/Samples/MotionMatchingAutoSetup.cs"
-    if not sample.is_file():
-        failures.append("sample auto-setup is not isolated under Source/MotionMatchingEditor/Samples")
-    if (root / "Source/MotionMatchingEditor/MotionMatchingAutoSetup.cs").exists():
-        failures.append("sample auto-setup leaked into generic editor source")
+    # M3: project naming conventions live in the host (flax-test keeps them
+    # in Source/Game/Animation/Registry/GaspClipConventions.cs); the plugin
+    # ships no sample setup and never reads file names.
+    for leftover in ("Source/MotionMatchingEditor/Samples/MotionMatchingAutoSetup.cs",
+                     "Source/MotionMatchingEditor/MotionMatchingAutoSetup.cs",
+                     "Source/MotionMatching/Baker/MotionMatchingBakeHeuristics.h"):
+        if (root / leftover).exists():
+            failures.append("host naming conventions leaked into the plugin: %s" % leftover)
 
     # Verify every relative Markdown link in plugin docs points at a file.
     for path in (root / "docs").glob("*.md"):

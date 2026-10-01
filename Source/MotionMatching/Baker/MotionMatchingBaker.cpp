@@ -3,6 +3,8 @@
 #if USE_EDITOR
 
 #include "../Database/MotionMatchingDatabase.h"
+#include "../Database/MotionMatchingSkeletonFingerprint.h"
+#include "../Runtime/MotionMatchingChannelMap.h"
 #include "../Runtime/MotionMatchingSampler.h"
 #include "Engine/Core/Log.h"
 #include "Engine/Core/Math/Math.h"
@@ -22,9 +24,6 @@ namespace
     constexpr int32 TrajectoryPointSize = PoseSearchSchema::TrajectoryFloatsPerPoint;
     constexpr int32 TrajectoryFeatureSize = PoseSearchSchema::GetTrajectoryFeatureSize();
     constexpr float MinimumDeltaTime = 0.000001f;
-    // Foot-contact gate lives in PoseSearchSchema (shared with the live query).
-    constexpr float ContactMaxSpeed = PoseSearchSchema::ContactMaxSpeed;
-    constexpr float ContactMaxHeight = PoseSearchSchema::ContactMaxHeight;
 
     struct ClipBakeInfo
     {
@@ -67,9 +66,13 @@ namespace
         IncludeRange(minimums, maximums, offset + 2, value.Z);
     }
 
+    // nodeToChannel comes from MotionMatchingChannelMap::Build (once per
+    // clip, schema aliases applied): the same resolver the runtime sampler
+    // uses, so bake and playback drive identical nodes.
     bool SampleAnimationModelPose(
         Animation* animation,
         SkinnedModel* model,
+        const Array<int32>& nodeToChannel,
         float time,
         Array<Matrix>& nodeTransforms)
     {
@@ -89,30 +92,23 @@ namespace
         const auto& channels = animation->Data.Channels;
         const int32 nodeCount = nodes.Count();
         const float sampleFrame = time * framesPerSecond;
+        if (nodeToChannel.Count() != nodeCount)
+            return false;
 
         nodeTransforms.Resize(nodeCount);
 
+        Transform local;
         for (int32 nodeIndex = 0; nodeIndex < nodeCount; nodeIndex++)
         {
             const auto& node = nodes[nodeIndex];
-            Transform local = node.LocalTransform;
-
-            for (int32 channelIndex = 0; channelIndex < channels.Count(); channelIndex++)
-            {
-                const auto& channel = channels[channelIndex];
-                if (channel.NodeName != node.Name)
-                    continue;
-
-                // Keep bind-pose values for animation sub-tracks removed by
-                // import or keyframe optimization.
-                if (channel.Position.GetKeyframes().HasItems())
-                    channel.Position.Evaluate(local.Translation, sampleFrame, false);
-                if (channel.Rotation.GetKeyframes().HasItems())
-                    channel.Rotation.Evaluate(local.Orientation, sampleFrame, false);
-                if (channel.Scale.GetKeyframes().HasItems())
-                    channel.Scale.Evaluate(local.Scale, sampleFrame, false);
-                break;
-            }
+            const int32 channelIndex = nodeToChannel[nodeIndex];
+            // Sub-tracks removed by import or keyframe optimization keep
+            // their bind-pose values (inside EvaluateLocal).
+            MotionMatchingChannelMap::EvaluateLocal(
+                node,
+                channelIndex >= 0 && channelIndex < channels.Count() ? &channels[channelIndex] : nullptr,
+                sampleFrame,
+                local);
 
             const Matrix localMatrix = local.GetWorld();
             if (node.ParentIndex >= 0 && node.ParentIndex < nodeIndex)
@@ -129,6 +125,146 @@ namespace
         }
 
         return true;
+    }
+
+    // ---- Channel coverage (bake report + editor alias suggestions) ----
+
+    struct ChannelCoverage
+    {
+        int32 ClipCount = 0;
+        Array<String> ChannelNames;      // unique raw channel names over all clips
+        Array<String> UnmatchedChannels; // channels whose target is no model node
+        Array<String> UndrivenNodes;     // model nodes no clip channel drives
+        Array<String> MissingRequired;   // required role lines (bake fails)
+        Array<BoneAlias> Suggestions;
+    };
+
+    String JoinNames(const Array<String>& names, int32 maxCount)
+    {
+        String out;
+        for (int32 i = 0; i < names.Count() && i < maxCount; i++)
+        {
+            if (i > 0)
+                out += TEXT(", ");
+            out += names[i];
+        }
+        if (names.Count() > maxCount)
+            out += String::Format(TEXT(" (+{} more)"), names.Count() - maxCount);
+        return out;
+    }
+
+    String JoinAliases(const Array<BoneAlias>& aliases, int32 maxCount)
+    {
+        String out;
+        for (int32 i = 0; i < aliases.Count() && i < maxCount; i++)
+        {
+            if (i > 0)
+                out += TEXT(", ");
+            out += aliases[i].Channel + TEXT(" -> ") + aliases[i].Node;
+        }
+        if (aliases.Count() > maxCount)
+            out += String::Format(TEXT(" (+{} more)"), aliases.Count() - maxCount);
+        return out;
+    }
+
+    // Channel/node coverage of every clip against the model through the
+    // shared resolver. Required roles (Root, Pelvis, LeftFoot, RightFoot)
+    // must be driven by a channel in EVERY clip: a clip without them bakes
+    // bind-pose features that no query can match.
+    void AnalyzeCoverage(
+        SkinnedModel* model,
+        const Array<Animation*>& clips,
+        const PoseSearchSchema& schema,
+        ChannelCoverage& out)
+    {
+        out = ChannelCoverage();
+        if (model == nullptr || model->WaitForLoaded())
+            return;
+        const auto& nodes = model->GetNodes();
+        Array<String> nodeNames;
+        nodeNames.Resize(nodes.Count());
+        for (int32 n = 0; n < nodes.Count(); n++)
+            nodeNames[n] = nodes[n].Name;
+        Array<bool> nodeDriven;
+        nodeDriven.Resize(nodes.Count());
+        for (int32 n = 0; n < nodes.Count(); n++)
+            nodeDriven[n] = false;
+
+        const SkeletonProfile& skeleton = schema.Skeleton;
+        const Char* roleNames[4] = { TEXT("Root"), TEXT("Pelvis"), TEXT("LeftFoot"), TEXT("RightFoot") };
+        const String* roleNodes[4] = { &skeleton.Root, &skeleton.Pelvis, &skeleton.LeftFoot, &skeleton.RightFoot };
+        int32 roleIndex[4];
+        int32 roleMissing[4] = { 0, 0, 0, 0 };
+        String roleFirstClip[4];
+        for (int32 r = 0; r < 4; r++)
+            roleIndex[r] = model->FindNode(*roleNodes[r]);
+
+        Array<int32> nodeToChannel;
+        for (Animation* clip : clips)
+        {
+            if (clip == nullptr || clip->WaitForLoaded())
+                continue;
+            out.ClipCount++;
+            const auto& channels = clip->Data.Channels;
+            for (const NodeAnimationData& channel : channels)
+            {
+                if (!out.ChannelNames.Contains(channel.NodeName))
+                    out.ChannelNames.Add(channel.NodeName);
+            }
+            MotionMatchingChannelMap::Build(nodes, channels, schema.BoneAliases, nodeToChannel);
+            for (int32 n = 0; n < nodes.Count(); n++)
+            {
+                if (nodeToChannel[n] >= 0)
+                    nodeDriven[n] = true;
+            }
+            for (int32 r = 0; r < 4; r++)
+            {
+                if (roleIndex[r] >= 0 && nodeToChannel[roleIndex[r]] >= 0)
+                    continue;
+                if (roleMissing[r]++ == 0)
+                    roleFirstClip[r] = StringUtils::GetFileNameWithoutExtension(clip->GetPath());
+            }
+        }
+
+        for (const String& channel : out.ChannelNames)
+        {
+            const String& target = MotionMatchingChannelMap::ResolveTarget(channel, schema.BoneAliases);
+            if (!nodeNames.Contains(target))
+                out.UnmatchedChannels.Add(channel);
+        }
+        for (int32 n = 0; n < nodes.Count(); n++)
+        {
+            if (!nodeDriven[n])
+                out.UndrivenNodes.Add(nodeNames[n]);
+        }
+        for (int32 r = 0; r < 4; r++)
+        {
+            if (roleMissing[r] == 0)
+                continue;
+            out.MissingRequired.Add(String::Format(
+                TEXT("{} '{}' has no channel in {} of {} clips (first: {})"),
+                String(roleNames[r]), *roleNodes[r], roleMissing[r], out.ClipCount, roleFirstClip[r]));
+        }
+        MotionMatchingChannelMap::SuggestAliases(out.ChannelNames, nodeNames, schema.BoneAliases, out.Suggestions);
+    }
+
+    String DescribeCoverage(const ChannelCoverage& coverage)
+    {
+        String text = String::Format(
+            TEXT("Bake channel coverage: {} clips, {} channel names, {} match no model node, {} model nodes driven by no clip"),
+            coverage.ClipCount,
+            coverage.ChannelNames.Count(),
+            coverage.UnmatchedChannels.Count(),
+            coverage.UndrivenNodes.Count());
+        if (coverage.UnmatchedChannels.HasItems())
+            text += String(TEXT("\n  channels matching no node: ")) + JoinNames(coverage.UnmatchedChannels, 16);
+        if (coverage.UndrivenNodes.HasItems())
+            text += String(TEXT("\n  model nodes driven by no clip (keep the bind pose): ")) + JoinNames(coverage.UndrivenNodes, 16);
+        if (coverage.Suggestions.HasItems())
+            text += String(TEXT("\n  suggested Schema.BoneAliases (channel -> node, by normalized name): ")) + JoinAliases(coverage.Suggestions, 24);
+        for (const String& line : coverage.MissingRequired)
+            text += String(TEXT("\n  REQUIRED: ")) + line;
+        return text;
     }
 
     Float3 GetRelativePosition(const Matrix& transform, const Matrix& referenceInverse)
@@ -329,7 +465,8 @@ bool MotionMatchingBaker::Bake(
     Array<Animation*> animations;
     Array<Array<String>> tags;
     Array<int32> loopingClips;
-    database->GetSourceData(animations, tags, loopingClips);
+    Array<int32> clipGroups;
+    database->GetSourceData(animations, tags, loopingClips, clipGroups);
 
     Array<int32> sourceClipIndices;
     Array<float> clipLengths;
@@ -356,9 +493,10 @@ bool MotionMatchingBaker::Bake(
         return false;
     }
     if (animations.Count() != tags.Count() ||
-        animations.Count() != loopingClips.Count())
+        animations.Count() != loopingClips.Count() ||
+        animations.Count() != clipGroups.Count())
     {
-        LOG(Error, "Motion matching bake failed: animation, tag, and loop-flag counts differ.");
+        LOG(Error, "Motion matching bake failed: animation, tag, loop-flag and group counts differ.");
         return false;
     }
 
@@ -393,6 +531,52 @@ bool MotionMatchingBaker::Bake(
     const int32 rootIndex = nodeIndices.Root;
     int32 poseBoneIndices[PoseBoneCount];
     nodeIndices.GetPoseBoneIndices(poseBoneIndices);
+    const float contactMaxSpeed = bakedSchema.ContactMaxSpeed;
+    const float contactMaxHeight = bakedSchema.ContactMaxHeight;
+
+    // Channel coverage through the shared resolver (aliases applied). The
+    // bake stops when a required role has no channel in some clip; the
+    // report suggests aliases by normalized name.
+    {
+        ChannelCoverage coverage;
+        AnalyzeCoverage(model, animations, bakedSchema, coverage);
+        const String coverageText = DescribeCoverage(coverage);
+        if (coverage.MissingRequired.HasItems())
+        {
+            LOG(Error, "{}", coverageText);
+            LOG(Error, "Motion matching bake failed: required skeleton nodes have no animation channel (see coverage above). "
+                "Map clip channel names onto model nodes with Schema.BoneAliases (suggestions above), or retarget the clips "
+                "offline onto this skeleton and bake again.");
+            return false;
+        }
+        LOG(Info, "{}", coverageText);
+    }
+
+    // Skeleton fingerprint: what the features were baked on, checked again
+    // when a controller binds the database to a model.
+    MotionMatchingSkeletonFingerprint skeletonFingerprint;
+    {
+        String proportionReport;
+        if (!MotionMatchingSkeletonFingerprint::Build(model, animations, bakedSchema.BoneAliases, skeletonFingerprint, proportionReport))
+        {
+            LOG(Error, "Motion matching bake failed: cannot build the skeleton fingerprint of the model.");
+            return false;
+        }
+        if (proportionReport.HasChars())
+        {
+            LOG(Warning, "Motion matching bake: the clips do not fit this model's proportions: {}. The baked features keep the "
+                "clip proportions, and a controller will refuse to bind this database to a model with this bind pose "
+                "(Schema.BoneAliases only rename). Retarget the clips offline onto this skeleton and bake again.", proportionReport);
+        }
+        int32 relevant = 0;
+        for (int32 flags : skeletonFingerprint.NodeFlags)
+        {
+            if ((flags & MotionMatchingSkeletonFingerprint::Relevant) != 0)
+                relevant++;
+        }
+        LOG(Info, "Skeleton fingerprint: {} nodes, {} relevant (clip-driven or ancestors), hash {}.",
+            skeletonFingerprint.NodeNames.Count(), relevant, skeletonFingerprint.ComputeHash());
+    }
 
     LOG(
         Info,
@@ -456,12 +640,13 @@ bool MotionMatchingBaker::Bake(
         clipSampleCounts.Add(count);
         LOG(
             Info,
-            "Added clip '{}' for tags '{}' with length {}, sample count {}, loop={}.",
+            "Added clip '{}' for tags '{}' with length {}, sample count {}, loop={}, group={}.",
             StringUtils::GetFileNameWithoutExtension(animation->GetPath()),
             MotionMatchingDatabase::JoinTags(tags[sourceIndex]),
             length,
             count,
-            info.Loop);
+            info.Loop,
+            clipGroups[sourceIndex]);
     }
 
     if (clips.IsEmpty() || totalSampleCount <= 0)
@@ -508,16 +693,19 @@ bool MotionMatchingBaker::Bake(
     }
 
     Array<Matrix> pose;
+    Array<int32> nodeToChannel;
     for (int32 clipIndex = 0; clipIndex < clips.Count(); clipIndex++)
     {
         ClipBakeInfo& clip = clips[clipIndex];
+        // One node-to-channel table per clip (shared resolver, aliases applied).
+        MotionMatchingChannelMap::Build(model->GetNodes(), clip.Clip->Data.Channels, bakedSchema.BoneAliases, nodeToChannel);
         for (int32 localSampleIndex = 0; localSampleIndex < clip.SampleCount; localSampleIndex++)
         {
             const int32 sampleIndex = clip.SampleStart + localSampleIndex;
             const float time = MotionMatchingSampler::ComputeSampleTime(
                 localSampleIndex, clip.Length, sampleRate);
 
-            if (!SampleAnimationModelPose(clip.Clip, model, time, pose))
+            if (!SampleAnimationModelPose(clip.Clip, model, nodeToChannel, time, pose))
             {
                 LOG(
                     Error,
@@ -593,7 +781,7 @@ bool MotionMatchingBaker::Bake(
 
         clip.StartRootTransform = samples[clip.SampleStart].RootTransform;
         clip.StartRootInverse = Matrix::Invert(clip.StartRootTransform);
-        if (!SampleAnimationModelPose(clip.Clip, model, clip.Length, pose) ||
+        if (!SampleAnimationModelPose(clip.Clip, model, nodeToChannel, clip.Length, pose) ||
             rootIndex >= pose.Count())
         {
             LOG(
@@ -719,11 +907,11 @@ bool MotionMatchingBaker::Bake(
         const float contactHeightR = PoseSearchSchema::ComputeContactHeight(
             current.Positions[2], rootOrigin, rootUpAxis);
         const float contactL = PoseSearchSchema::IsPlantedContact(
-            poseVelocityRootRelative[1].LengthSquared(), ContactMaxSpeed,
-            contactHeightL, ContactMaxHeight) ? 1.0f : 0.0f;
+            poseVelocityRootRelative[1].LengthSquared(), contactMaxSpeed,
+            contactHeightL, contactMaxHeight) ? 1.0f : 0.0f;
         const float contactR = PoseSearchSchema::IsPlantedContact(
-            poseVelocityRootRelative[2].LengthSquared(), ContactMaxSpeed,
-            contactHeightR, ContactMaxHeight) ? 1.0f : 0.0f;
+            poseVelocityRootRelative[2].LengthSquared(), contactMaxSpeed,
+            contactHeightR, contactMaxHeight) ? 1.0f : 0.0f;
         poseFeatures[contactOffsetL] = contactL;
         poseFeatures[contactOffsetR] = contactR;
         IncludeRange(featureMinimums, featureMaximums, PoseSearchSchema::GetContactFeatureOffset(0), contactL);
@@ -1024,7 +1212,8 @@ bool MotionMatchingBaker::Bake(
         poseFeatures,
         trajectoryFeatures,
         poseFeatureDeviations,
-        trajectoryFeatureDeviations);
+        trajectoryFeatureDeviations,
+        skeletonFingerprint);
     if (!database->ValidateData())
     {
         LOG(Error, "Motion matching bake failed: generated database did not pass validation.");
@@ -1074,6 +1263,34 @@ bool MotionMatchingBaker::Bake(
     bakedClipCount = expectedClipCount;
     bakedSampleCount = expectedSampleCount;
     return true;
+}
+
+Array<BoneAlias> MotionMatchingBaker::SuggestBoneAliases(
+    SkinnedModel* model,
+    const Array<Animation*>& clips,
+    const PoseSearchSchema& schema)
+{
+    ChannelCoverage coverage;
+    AnalyzeCoverage(model, clips, schema, coverage);
+    return coverage.Suggestions;
+}
+
+String MotionMatchingBaker::DescribeChannelCoverage(
+    SkinnedModel* model,
+    const Array<Animation*>& clips,
+    const PoseSearchSchema& schema)
+{
+    if (model == nullptr || model->WaitForLoaded())
+        return String(TEXT("Channel coverage unavailable: the model is not loaded."));
+    ChannelCoverage coverage;
+    AnalyzeCoverage(model, clips, schema, coverage);
+    String text = DescribeCoverage(coverage);
+    MotionMatchingSkeletonFingerprint fingerprint;
+    String proportionReport;
+    if (MotionMatchingSkeletonFingerprint::Build(model, clips, schema.BoneAliases, fingerprint, proportionReport) &&
+        proportionReport.HasChars())
+        text += String(TEXT("\n  PROPORTIONS: ")) + proportionReport;
+    return text;
 }
 
 #endif

@@ -45,7 +45,7 @@ controller.Update(deltaTime, actorWorldTransform, frame);
 ```
 
 The provider owns gameplay interpretation and produces trajectory points,
-include/exclude tag sets, the loop filter, the candidate band, the query yaw
+include/exclude tag sets, the loop filter, the clip group, the query yaw
 rate, the speed-matching target speed, and the reseed hold. The controller
 validates filter enum ranges, loads the database on first use when necessary,
 and forwards the frame to the native policy.

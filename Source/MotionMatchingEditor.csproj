@@ -176,7 +176,6 @@
     <Compile Include="MotionMatchingEditor\MotionMatchingEditorService.cs" />
     <Compile Include="MotionMatchingEditor\MotionMatchingTuningWindow.cs" />
     <Compile Include="MotionMatchingEditor\RegisterClipsWindow.cs" />
-    <Compile Include="MotionMatchingEditor\Samples\MotionMatchingAutoSetup.cs" />
   </ItemGroup>
   <ItemGroup Condition=" '$(Configuration)|$(Platform)' == 'Editor.Windows.Debug|x64' " >
     <Compile Visible="false" Include="D:\Code\flax\flax-test\Plugins\MotionMatching\Cache\Intermediate\MotionMatchingEditorTarget\Windows\x64\Debug\MotionMatching\MotionMatching.Bindings.Gen.cs" />

@@ -8,12 +8,10 @@ input-provider contract. References the engine only — never a game.
   helper). No locomotion policy: gait/scope decisions live in the host.
 - `Source/MotionMatchingEditor` — editor module (services, baker/tuning/
   registry windows, generic registry import/export, baker/tuning, and contract
-  tests). Registry entries carry their own asset paths, tags, and loop flags;
-  host-specific inference can be supplied explicitly through
-  `ClipRegistryImportOptions`.
-- `Source/MotionMatchingEditor/Samples` — opt-in flax-test sample automation
-  (`MotionMatchingAutoSetup`), including the sample `Animations/Humanoid`
-  convention. Generic editor workflows do not invoke it.
+  tests). Registry entries carry their own asset paths, tags, loop flags and
+  clip groups; host-specific inference can be supplied explicitly through
+  `ClipRegistryImportOptions`. The plugin never reads file names and ships no
+  project naming conventions (flax-test keeps its GASP rules game-side).
 
 ## Host documentation
 
@@ -22,9 +20,10 @@ input-provider contract. References the engine only — never a game.
 - [Public contract](docs/PLUGIN_CONTRACT.md): input/output ownership, coordinates,
   tag/filter semantics, and the explicit LoopOnly recovery invariant.
 - [Lifecycle](docs/LIFECYCLE.md): initialization, reset, rebind, and cleanup.
-- [Authoring](docs/AUTHORING.md): rig/schema setup, registry import/export, baking.
-- [Migration and asset identity](docs/MIGRATION.md): scripting names versus the
-  frozen legacy binary database TypeName.
+- [Authoring](docs/AUTHORING.md): rig/schema setup, registry import/export,
+  baking, skeletons, bone aliases and retargeting.
+- [Migration and asset identity](docs/MIGRATION.md): database TypeName, the
+  format v4 upgrade and the bind-time checks.
 
 ## Offline contract gate
 

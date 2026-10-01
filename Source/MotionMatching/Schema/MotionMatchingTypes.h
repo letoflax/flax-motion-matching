@@ -87,6 +87,28 @@ API_STRUCT(Namespace="MotionMatching") struct MOTIONMATCHING_API SkeletonProfile
 };
 
 /// <summary>
+/// One bone alias: an animation channel name of the source clips mapped onto
+/// a node name of the skinned model the database is baked and played on.
+/// Aliases rename only; they do not retarget rest pose or proportions (use an
+/// offline retarget tool for that, the plugin refuses mismatched skeletons).
+/// </summary>
+API_STRUCT(Namespace="MotionMatching") struct MOTIONMATCHING_API BoneAlias
+{
+    DECLARE_SCRIPTING_TYPE_MINIMAL(BoneAlias);
+
+    /// <summary>Animation channel name as stored in the clips.</summary>
+    API_FIELD() String Channel;
+
+    /// <summary>Model skeleton node name the channel drives.</summary>
+    API_FIELD() String Node;
+
+    bool operator==(const BoneAlias& other) const
+    {
+        return Channel == other.Channel && Node == other.Node;
+    }
+};
+
+/// <summary>
 /// Native skeleton-profile helpers exposed to C#.
 /// </summary>
 API_CLASS(Static, Namespace="MotionMatching")

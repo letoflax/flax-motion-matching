@@ -47,6 +47,14 @@ public class MotionMatchingController : IDisposable
 
     public AnimatedModel CharacterBody;
 
+    // Explicit opt-out of the bind-time checks (debug only). By default a
+    // database whose baked schema or skeleton fingerprint does not fit the
+    // CharacterBody model is refused: the controller stays not ready and
+    // BindingReport names the cause and the fix (Schema.BoneAliases for
+    // renamed bones, offline retarget for other proportions). True binds
+    // anyway and logs a warning instead.
+    public bool AllowBindingMismatch = false;
+
     public float QueryInterval = 0.1f;
 
     // Per-frame search: the query gate runs every warmed tick instead of on
@@ -211,6 +219,10 @@ public class MotionMatchingController : IDisposable
 
     public int FastPathHits { get; private set; }
 
+    // Result of the last bind attempt (native bind-time checks). Kept after
+    // a refused binding so hosts and tools can show why.
+    public string BindingReport { get; private set; } = string.Empty;
+
     private MotionMatchingRuntimePolicy _policy;
     private bool _diagnosticsWarned;
     private MotionMatchingDatabase _boundDatabase;
@@ -218,6 +230,15 @@ public class MotionMatchingController : IDisposable
     private SkinnedModel _boundModel;
     private PoseSearchSchema _boundSchema;
     private string _loadedDatabaseFile = string.Empty;
+    // Refused-binding latch: the native policy logs the refusal once; the
+    // controller retries only when the database, body, model, schema or the
+    // opt-out changes (or after RefreshDatabaseStatus/Shutdown).
+    private bool _bindRefused;
+    private MotionMatchingDatabase _refusedDatabase;
+    private AnimatedModel _refusedBody;
+    private SkinnedModel _refusedModel;
+    private PoseSearchSchema _refusedSchema;
+    private bool _refusedAllowMismatch;
 
     public float[] TrajectorySampleTimes
     {
@@ -376,6 +397,11 @@ public class MotionMatchingController : IDisposable
         _boundSchema = default;
         _sampleTimesDb = null;
         _sampleTimesCache = Array.Empty<float>();
+        _bindRefused = false;
+        _refusedDatabase = null;
+        _refusedBody = null;
+        _refusedModel = null;
+        _refusedSchema = default;
         ResetRuntimeStatus();
         if (policy)
         {
@@ -466,20 +492,34 @@ public class MotionMatchingController : IDisposable
             EnsureDatabaseLoadedForGame();
             if (!Database || !Database.IsBaked || !CharacterBody.SkinnedModel)
                 return;
+            if (_bindRefused &&
+                ReferenceEquals(Database, _refusedDatabase) &&
+                ReferenceEquals(CharacterBody, _refusedBody) &&
+                ReferenceEquals(CharacterBody.SkinnedModel, _refusedModel) &&
+                AllowBindingMismatch == _refusedAllowMismatch &&
+                SchemaBindingEquals(Schema, _refusedSchema))
+                return;
             _policy = new MotionMatchingRuntimePolicy();
-            _policy.Initialize(Database, CharacterBody, Schema, InertializationDuration);
+            _policy.Initialize(Database, CharacterBody, Schema, InertializationDuration, AllowBindingMismatch);
+            string report = _policy.BindingReport ?? string.Empty;
             if (!_policy.IsReady)
             {
                 Shutdown();
+                BindingReport = report;
+                _bindRefused = true;
+                _refusedDatabase = Database;
+                _refusedBody = CharacterBody;
+                _refusedModel = CharacterBody.SkinnedModel;
+                _refusedSchema = SnapshotSchema(Schema);
+                _refusedAllowMismatch = AllowBindingMismatch;
                 return;
             }
+            BindingReport = report;
             _boundDatabase = Database;
             _boundBody = CharacterBody;
             _boundModel = CharacterBody.SkinnedModel;
-            _boundSchema = Schema;
-            // Snapshot array contents too: hosts can edit sample times in place.
-            _boundSchema.TrajectorySampleTimes = Schema.TrajectorySampleTimes != null
-                ? (float[])Schema.TrajectorySampleTimes.Clone() : Array.Empty<float>();
+            // Snapshot array contents too: hosts can edit arrays in place.
+            _boundSchema = SnapshotSchema(Schema);
         }
         if (!_policy.IsReady)
             return;
@@ -493,7 +533,7 @@ public class MotionMatchingController : IDisposable
         }
 
         // P2: the snapshot carries the caller scope only (movement fields
-        // died with the native gameplay state). LoopFilter/CandidateBand/
+        // died with the native gameplay state). LoopFilter/ClipGroup/
         // YawRate ride explicit Tick params (never inferred); the core uses
         // them verbatim. No new native struct field (bindings cap 64).
         var snapshot = new MotionMatchingPlayerSnapshot
@@ -536,13 +576,13 @@ public class MotionMatchingController : IDisposable
             LoopTailExclusion = LoopTailExclusion,
         };
         int callerLoop = input.LoopFilter >= 0 && input.LoopFilter <= 2 ? input.LoopFilter : 0;
-        int callerBand = input.CandidateBand >= 0 && input.CandidateBand <= 3 ? input.CandidateBand : 0;
+        int callerGroup = input.ClipGroup >= 0 ? input.ClipGroup : 0;
         float callerYaw = input.QueryYawRate >= 0.0f && input.QueryYawRate < 1e29f ? input.QueryYawRate : 0.0f;
         float targetSpeed = input.TargetSpeed >= 0.0f && input.TargetSpeed < 1e29f ? input.TargetSpeed : 0.0f;
         _policy.Tick(deltaTime, snapshot,
             input.Points ?? Array.Empty<TrajectoryPoint>(),
             actorWorld.GetWorld(), TrajectorySampleTimes, tuning,
-            callerLoop, callerBand, callerYaw, targetSpeed, input.HoldReseedFilter);
+            callerLoop, callerGroup, callerYaw, targetSpeed, input.HoldReseedFilter);
 
         PolicyState = _policy.PolicyState;
         WinnerSample = _policy.WinnerSample;
@@ -633,6 +673,19 @@ public class MotionMatchingController : IDisposable
         return schema;
     }
 
+    // Copy with private arrays, so in-place host edits of the live schema
+    // arrays never alter a stored snapshot.
+    private static PoseSearchSchema SnapshotSchema(in PoseSearchSchema schema)
+    {
+        var copy = schema;
+        copy.TrajectorySampleTimes = schema.TrajectorySampleTimes != null
+            ? (float[])schema.TrajectorySampleTimes.Clone() : Array.Empty<float>();
+        copy.BoneAliases = schema.BoneAliases != null
+            ? (BoneAlias[])schema.BoneAliases.Clone() : Array.Empty<BoneAlias>();
+        return copy;
+    }
+
+    // Mirrors PoseSearchSchema::operator== field by field (keep in sync).
     public static bool SchemaEquals(in PoseSearchSchema a, in PoseSearchSchema b)
     {
         float AxisTolerance = 0.001f;
@@ -642,8 +695,21 @@ public class MotionMatchingController : IDisposable
             !Float3.NearEqual(Float3.Normalize(a.RootForwardAxis), Float3.Normalize(b.RootForwardAxis), AxisTolerance) ||
             !Float3.NearEqual(Float3.Normalize(a.RootUpAxis), Float3.Normalize(b.RootUpAxis), AxisTolerance) ||
             a.PoseWeight != b.PoseWeight ||
-            a.TrajectoryWeight != b.TrajectoryWeight)
+            a.TrajectoryWeight != b.TrajectoryWeight ||
+            a.ContactMaxSpeed != b.ContactMaxSpeed ||
+            a.ContactMaxHeight != b.ContactMaxHeight)
             return false;
+
+        var aa = a.BoneAliases ?? Array.Empty<BoneAlias>();
+        var ab = b.BoneAliases ?? Array.Empty<BoneAlias>();
+        if (aa.Length != ab.Length)
+            return false;
+        for (int i = 0; i < aa.Length; i++)
+        {
+            if (!string.Equals(aa[i].Channel ?? string.Empty, ab[i].Channel ?? string.Empty, StringComparison.Ordinal) ||
+                !string.Equals(aa[i].Node ?? string.Empty, ab[i].Node ?? string.Empty, StringComparison.Ordinal))
+                return false;
+        }
 
         if (a.Skeleton.Root != b.Skeleton.Root ||
             a.Skeleton.Pelvis != b.Skeleton.Pelvis ||

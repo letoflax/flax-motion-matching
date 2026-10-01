@@ -84,6 +84,31 @@ bool PoseSearchSchema::TryValidate(String &error) const
         return false;
     }
 
+    if (!std::isfinite(ContactMaxSpeed) || !std::isfinite(ContactMaxHeight) ||
+        ContactMaxSpeed <= 0.0f || ContactMaxHeight <= 0.0f)
+    {
+        error = TEXT("ContactMaxSpeed and ContactMaxHeight must be finite and greater than zero.");
+        return false;
+    }
+
+    for (int32 i = 0; i < BoneAliases.Count(); i++)
+    {
+        const BoneAlias& alias = BoneAliases[i];
+        if (alias.Channel.IsEmpty() || alias.Node.IsEmpty())
+        {
+            error = String::Format(TEXT("BoneAliases[{}] needs both a Channel and a Node name."), i);
+            return false;
+        }
+        for (int32 j = 0; j < i; j++)
+        {
+            if (BoneAliases[j].Channel == alias.Channel)
+            {
+                error = String::Format(TEXT("BoneAliases maps channel '{}' twice."), alias.Channel);
+                return false;
+            }
+        }
+    }
+
     if (!ValidateLayout(error))
         return false;
 
@@ -437,11 +462,19 @@ bool PoseSearchSchema::operator==(const PoseSearchSchema &other) const
         if (TrajectorySampleTimes[i] != other.TrajectorySampleTimes[i])
             return false;
 
+    if (BoneAliases.Count() != other.BoneAliases.Count())
+        return false;
+    for (int32 i = 0; i < BoneAliases.Count(); i++)
+        if (!(BoneAliases[i] == other.BoneAliases[i]))
+            return false;
+
     return SampleRate == other.SampleRate &&
            Float3::NearEqual(Float3::Normalize(RootForwardAxis), Float3::Normalize(other.RootForwardAxis), AxisTolerance) &&
            Float3::NearEqual(Float3::Normalize(RootUpAxis), Float3::Normalize(other.RootUpAxis), AxisTolerance) &&
            PoseWeight == other.PoseWeight &&
            TrajectoryWeight == other.TrajectoryWeight &&
+           ContactMaxSpeed == other.ContactMaxSpeed &&
+           ContactMaxHeight == other.ContactMaxHeight &&
            Skeleton.Root == other.Skeleton.Root &&
            Skeleton.Pelvis == other.Skeleton.Pelvis &&
            Skeleton.Spine == other.Skeleton.Spine &&
@@ -453,6 +486,44 @@ bool PoseSearchSchema::operator==(const PoseSearchSchema &other) const
 }
 
 void PoseSearchSchema::Serialize(WriteStream &stream) const
+{
+    // v4: v3 fields first (unchanged order), new fields appended.
+    SerializeV3(stream);
+    stream.WriteFloat(ContactMaxSpeed);
+    stream.WriteFloat(ContactMaxHeight);
+    stream.WriteInt32(BoneAliases.Count());
+    for (const BoneAlias& alias : BoneAliases)
+    {
+        stream.Write(alias.Channel);
+        stream.Write(alias.Node);
+    }
+}
+
+void PoseSearchSchema::Deserialize(ReadStream &stream)
+{
+    DeserializeV3(stream);
+    stream.ReadFloat(&ContactMaxSpeed);
+    stream.ReadFloat(&ContactMaxHeight);
+    int32 aliasCount = 0;
+    stream.ReadInt32(&aliasCount);
+    BoneAliases.Clear();
+    // Bounded: a corrupt count must not allocate unbounded memory; the
+    // stream error flag fails the load below.
+    if (aliasCount < 0 || aliasCount > 4096)
+    {
+        aliasCount = 0;
+        stream.SetPosition(stream.GetLength());
+    }
+    for (int32 i = 0; i < aliasCount && !stream.HasError(); i++)
+    {
+        BoneAlias alias;
+        stream.Read(alias.Channel);
+        stream.Read(alias.Node);
+        BoneAliases.Add(alias);
+    }
+}
+
+void PoseSearchSchema::SerializeV3(WriteStream &stream) const
 {
     stream.WriteInt32(SampleRate);
     stream.Write(RootForwardAxis);
@@ -470,7 +541,7 @@ void PoseSearchSchema::Serialize(WriteStream &stream) const
     stream.Write(TrajectorySampleTimes);
 }
 
-void PoseSearchSchema::Deserialize(ReadStream &stream)
+void PoseSearchSchema::DeserializeV3(ReadStream &stream)
 {
     stream.ReadInt32(&SampleRate);
     stream.Read(RootForwardAxis);

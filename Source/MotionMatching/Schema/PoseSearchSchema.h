@@ -57,6 +57,31 @@ struct MOTIONMATCHING_API PoseSearchSchema
     /// </summary>
     API_FIELD() Array<float> TrajectorySampleTimes = { -0.4f, -0.2f, 0.0f, 0.2f, 0.4f, 0.6f };
 
+    /// <summary>
+    /// Foot-contact gate, speed part, in world units per second (the rig's
+    /// length unit per second; centimeters on the default rigs). A foot counts
+    /// as planted while its root-relative velocity is at or below this speed
+    /// AND its height is at or below ContactMaxHeight. Baked into the contact
+    /// features and reused by the live query, so changing it requires a rebake.
+    /// </summary>
+    API_FIELD(Attributes="Limit(0)") float ContactMaxSpeed = 300.0f;
+
+    /// <summary>
+    /// Foot-contact gate, height part, in world units: the foot height above
+    /// the root, measured along RootUpAxis. See ContactMaxSpeed.
+    /// </summary>
+    API_FIELD(Attributes="Limit(0)") float ContactMaxHeight = 12.0f;
+
+    /// <summary>
+    /// Bone aliases: clip channel name to model node name, applied by the one
+    /// shared channel resolver at bake time and at runtime sampling. Aliases
+    /// only rename. Clips authored for a skeleton with other proportions or
+    /// another rest pose must be retargeted offline first; the database
+    /// records a skeleton fingerprint and refuses to bind to a model that does
+    /// not match it. Changing aliases requires a rebake.
+    /// </summary>
+    API_FIELD() Array<BoneAlias> BoneAliases;
+
     // Feature layout (v3, M3 upper body). Pose bones are extracted in this
     // fixed order: [0] pelvis, [1] left foot, [2] right foot, [3] spine,
     // [4] head, [5] left hand, [6] right hand. After the velocity block come
@@ -67,10 +92,6 @@ struct MOTIONMATCHING_API PoseSearchSchema
     static constexpr int32 TrajectoryPointCount = 6;
     static constexpr int32 TrajectoryFloatsPerPoint = 5;    // planar position xy + planar facing xy + yaw rate
     static constexpr float AxisTolerance = 0.001f;       // tolerance for axis validation
-    // Foot-contact gate shared by the baker and the live query: a foot counts
-    // as planted while slow and low in the root frame.
-    static constexpr float ContactMaxSpeed = 300.0f;
-    static constexpr float ContactMaxHeight = 12.0f;
     // Normalization revision (Phase 3 N1b UE-style): bumped when the bake-time
     // statistics change shape. Stored per-database (NOT in the schema
     // snapshot); databases baked with an older revision load registry-only
@@ -158,10 +179,9 @@ struct MOTIONMATCHING_API PoseSearchSchema
     static void DescribePoseChannels(Array<FeatureChannel>& outChannels);
     static void DescribeTrajectoryChannels(Array<FeatureChannel>& outChannels);
 
-    // NOTE: the bake-time filename->band mapping used to live here
-    // (ClipSpeedBand + BandFromClipName). It moved to Baker/
-    // MotionMatchingBakeHeuristics.h: the runtime schema must not know
-    // filename conventions. Stored bands stay plain ints in the database.
+    // Clip groups (the one-shot group filter) are plain ints authored in the
+    // clip registry. Neither the schema nor the baker infers anything from
+    // asset names.
 
     /// <summary>
     /// N1 layout validation: every channel inside its block bounds, no two
@@ -216,9 +236,9 @@ struct MOTIONMATCHING_API PoseSearchSchema
 
     /// <summary>
     /// C1 shared contact gate: planted while slow and low. Speed is passed
-    /// squared to avoid a sqrt on the hot path. Bake/query pass the
-    /// root-relative pose velocity; playback passes the world foot velocity
-    /// with its own runtime-owned threshold (same default, independent knob).
+    /// squared to avoid a sqrt on the hot path. Bake and query pass the
+    /// root-relative pose velocity and the schema's ContactMaxSpeed /
+    /// ContactMaxHeight (the query reads them from the baked snapshot).
     /// </summary>
     static bool IsPlantedContact(float speedSquared, float maxSpeed, float height, float maxHeight);
 
@@ -228,6 +248,17 @@ struct MOTIONMATCHING_API PoseSearchSchema
         return !(*this == other);
     }
 
+    /// <summary>
+    /// Database format v4 layout: the v3 fields in their original order, then
+    /// ContactMaxSpeed, ContactMaxHeight and BoneAliases.
+    /// </summary>
     void Serialize(WriteStream& stream) const;
     void Deserialize(ReadStream& stream);
+
+    /// <summary>
+    /// Legacy v2/v3 layout (no contact gate, no aliases). Used only by the
+    /// database upgraders; Deserialize leaves the new fields at defaults.
+    /// </summary>
+    void SerializeV3(WriteStream& stream) const;
+    void DeserializeV3(ReadStream& stream);
 };

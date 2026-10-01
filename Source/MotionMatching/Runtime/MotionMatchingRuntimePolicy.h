@@ -50,7 +50,7 @@ struct MOTIONMATCHING_API MotionMatchingPlayerSnapshot
 /// straightness prior). Gameplay intent/settle/rest fields died here
 /// (FairFightAccum/Window, SettleToLoopDelay, RestLoopPreference): the Game
 /// selection policy owns onset/fair-fight/settle/rest and passes only the
-/// resulting LoopFilter/CandidateBand per tick (Tick params, never inferred).
+/// resulting LoopFilter/ClipGroup per tick (Tick params, never inferred).
 /// Values preserved; only the owner moved.
 /// </summary>
 API_STRUCT(Namespace="MotionMatching")
@@ -117,6 +117,12 @@ class MOTIONMATCHING_API MotionMatchingRuntimePolicy : public ScriptingObject
 
 public:
     API_FIELD() String PolicyState = TEXT("Disabled");
+    /// <summary>
+    /// Result of the bind-time checks of the last Initialize (live schema vs
+    /// baked snapshot, skeleton fingerprint vs the body's model). On a refused
+    /// binding it names the cause and the fix; empty before Initialize.
+    /// </summary>
+    API_FIELD() String BindingReport;
     API_FIELD() String ActiveTag;
     API_FIELD() int32 WinnerSample = -1;
     API_FIELD() int32 WinnerClip = -1;
@@ -166,11 +172,19 @@ public:
 
     ~MotionMatchingRuntimePolicy();
 
+    /// <summary>
+    /// Binds the database to the body. Bind-time checks: the live schema must
+    /// equal the baked snapshot (weights excepted) and the database skeleton
+    /// fingerprint must match the body's model. A mismatch logs an error and
+    /// leaves the policy not ready, unless allowBindingMismatch (explicit
+    /// opt-out, debug only) downgrades it to a warning.
+    /// </summary>
     API_FUNCTION() void Initialize(
         MotionMatchingDatabase* database,
         AnimatedModel* body,
         const PoseSearchSchema& schema,
-        float defaultInertial);
+        float defaultInertial,
+        bool allowBindingMismatch);
     API_FUNCTION() void Shutdown();
     API_FUNCTION() void ResetOnTeleport();
     API_FUNCTION() void Tick(
@@ -181,7 +195,7 @@ public:
         const Array<float>& trajectorySampleTimes,
         const MotionMatchingPolicyTuning& tuning,
         int32 callerLoopFilter,
-        int32 callerCandidateBand,
+        int32 callerClipGroup,
         float callerYawRate,
         float callerTargetSpeed,
         bool holdReseedFilter);
@@ -205,7 +219,7 @@ private:
         int32 AllowedHash = 0;
         int32 ExcludedHash = 0;
         int32 LoopFilter = 0;
-        int32 CandidateBand = 0;
+        int32 ClipGroup = 0;
         int32 Clip = -1;
         int32 ClipTime = 0;
         int32 DatabaseId = 0;
@@ -254,14 +268,13 @@ private:
     Array<float> _clipSpeeds;
     int32 _clipSpeedsDbId = 0;
     bool _warnedOnce = false;
-    bool _bindingWarned = false;
 
     bool _chooserReseed = false;
 
     // P2 caller filter (Game selection policy output, Tick params): the ONLY
-    // LoopFilter/CandidateBand/YawRate the core uses. Never inferred.
+    // LoopFilter/ClipGroup/YawRate the core uses. Never inferred.
     int32 _callerLoopFilter = 0;
-    int32 _callerCandidateBand = 0;
+    int32 _callerClipGroup = 0;
     float _callerYawRate = 0.0f;
     // Speed-matching target speed (host-supplied, world units/s, 0 = off).
     float _callerTargetSpeed = 0.0f;
@@ -331,7 +344,10 @@ private:
     // and accel log live inside the explicit static ExportClipAudit command,
     // never in Initialize/Tick.
     void EnsureClipTagCache();
-    void CheckSchemaBinding();
+    // Bind-time check (Initialize): live schema vs baked snapshot plus the
+    // skeleton fingerprint vs the model. False on any mismatch; report
+    // names every difference and the fix.
+    bool CheckSchemaBinding(SkinnedModel* model, String& report) const;
     static bool AxesNear(const Float3& a, const Float3& b);
     static bool TimesEqual(const Array<float>& a, const Array<float>& b);
     void RecordPolicyEvent(const char* kind, int32 clipIndex, const String& reason);

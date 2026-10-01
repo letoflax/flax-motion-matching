@@ -214,7 +214,7 @@ bool MotionMatchingTraceLog::ExportJson(const String& path, String& error)
         sb.Append(",\"xtags\":\"");
         EscapeInto(sb, e.ExcludedTags);
         sb.Append("\",\"band\":");
-        sb.Append(e.OneShotBand);
+        sb.Append(e.OneShotGroup);
         sb.Append(",\"retry\":");
         sb.Append(e.RetryKind);
         // P0: booleans travel packed in TraceFlags (Flax 1.12 bindings
@@ -462,7 +462,7 @@ bool MotionMatchingTraceLog::ParseEntry(const String& line, MotionMatchingTraceE
     if (isV3)
     {
         entry.ExcludedTags = GetString(text, length, "\"xtags\":\"");
-        entry.OneShotBand = (int32)GetFloat(text, length, "\"band\":");
+        entry.OneShotGroup = (int32)GetFloat(text, length, "\"band\":");
         entry.RetryKind = (int32)GetFloat(text, length, "\"retry\":");
         int32 flags = 0;
         if (GetFloat(text, length, "\"fedge\":") > 0.5f)
@@ -823,7 +823,7 @@ bool MotionMatchingTraceLog::VerifyReplay(MotionMatchingDatabase* database, int3
             settings.TwinBanWindow = e.TwinBanWindow;
             settings.LoopTailExclusion = e.LoopTailExclusion;
             settings.ExcludeNonLoopTail = (e.TraceFlags & TraceFlag_ExcludeNonLoopTail) != 0;
-            settings.OneShotBand = e.OneShotBand;
+            settings.OneShotGroup = e.OneShotGroup;
             settings.MaxCandidates = e.MaxCandidates;
             settings.QueryFrame = e.QueryFrame;
             settings.UseIndexedSearch = (e.TraceFlags & TraceFlag_UseIndexedSearch) != 0;

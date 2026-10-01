@@ -594,7 +594,7 @@ namespace
         const Array<String>& allowedTags,
         const Array<String>& excludeTags,
         MotionLoopFilter loopFilter,
-        int32 oneShotBand,
+        int32 oneShotGroup,
         float& bestLoopCost,
         int32& bestLoopSample,
         int32& bestLoopClip,
@@ -623,7 +623,7 @@ namespace
 
         int32 cachedClip = -1;
         bool cachedLoop = false;
-        int32 cachedBand = 0;
+        int32 cachedGroup = 0;
         // Tags are per-clip; samples arrive clip-ordered, so resolve the
         // tag check once per clip instead of per sample. Empty include scope
         // AND empty exclude set disable the check outright.
@@ -638,7 +638,7 @@ namespace
             {
                 cachedClip = clipIndex;
                 cachedLoop = database.GetClipLoop(clipIndex);
-                cachedBand = database.GetClipSpeedBand(clipIndex);
+                cachedGroup = database.GetClipGroup(clipIndex);
                 const Array<String>& clipTags = database.GetClipTags(clipIndex);
                 cachedTagOk = !checkTags ||
                     (TagAllowed(allowedTags, clipTags) && !TagExcluded(excludeTags, clipTags));
@@ -647,8 +647,8 @@ namespace
                 continue;
             if (loopFilter == MotionLoopFilter::OneShotOnly && cachedLoop)
                 continue;
-            if (oneShotBand != 0 && !cachedLoop && cachedBand != 0 &&
-                cachedBand != oneShotBand)
+            if (oneShotGroup != 0 && !cachedLoop && cachedGroup != 0 &&
+                cachedGroup != oneShotGroup)
                 continue;
             if (!cachedTagOk)
                 continue;
@@ -805,14 +805,14 @@ namespace
         bool cachedLoopFlag = false;
         bool cachedTagOk = true;
         float cachedTurnAngle = 0.0f;
-        int32 cachedSpeedBand = 0;
+        int32 cachedGroup = 0;
         // Start of the non-searchable tail for the cached clip (-1 = none).
         float cachedTailStart = -1.0f;
         const bool wantLoop = settings.LoopFilter == MotionLoopFilter::LoopOnly;
         const bool wantOneShot = settings.LoopFilter == MotionLoopFilter::OneShotOnly;
-        // Onset gait filter: restrict ONE-SHOTs to the intended band (loops
-        // never band-cut). 0 = Any.
-        const int32 oneShotBand = settings.OneShotBand;
+        // One-shot group filter: restrict ONE-SHOTs to the requested clip
+        // group (loops are never cut). 0 = any.
+        const int32 oneShotGroup = settings.OneShotGroup;
         // Scored-member counts per class (completed both blocks). Pruned
         // members never land here. Class MINIMA come from ComputeClassBests
         // (unpruned full scan), never from this loop.
@@ -829,7 +829,7 @@ namespace
                 cachedLoopClip = clipIndex;
                 cachedLoopFlag = database.GetClipLoop(clipIndex);
                 cachedTurnAngle = database.GetClipTurnAngle(clipIndex);
-                cachedSpeedBand = database.GetClipSpeedBand(clipIndex);
+                cachedGroup = database.GetClipGroup(clipIndex);
                 const Array<String>& clipTagSet = database.GetClipTags(clipIndex);
                 cachedTagOk = !checkTags || (TagAllowed(allowedTags, clipTagSet) && !TagExcluded(settings.ExcludeTags, clipTagSet));
                 // Loop-tail cutoff for this clip (non-loop only, runtime from
@@ -842,11 +842,11 @@ namespace
             }
             if ((wantLoop && !cachedLoopFlag) || (wantOneShot && cachedLoopFlag))
                 continue;
-            // Onset gait filter: one-shots outside the intended band never
-            // rank (at the onset instant the features carry almost no gait
-            // information, so walk/run starts would otherwise coin-flip).
-            if (oneShotBand != 0 && !cachedLoopFlag && cachedSpeedBand != 0 &&
-                cachedSpeedBand != oneShotBand)
+            // One-shot group filter: one-shots of another non-zero group
+            // never rank (the host uses it to keep onsets in the intended
+            // gait, where the features carry almost no gait information).
+            if (oneShotGroup != 0 && !cachedLoopFlag && cachedGroup != 0 &&
+                cachedGroup != oneShotGroup)
                 continue;
             if (lockSwitch && clipIndex != currentClipIndex)
                 continue;
@@ -1035,7 +1035,7 @@ namespace
                 allowedTags,
                 settings.ExcludeTags,
                 settings.LoopFilter,
-                settings.OneShotBand,
+                settings.OneShotGroup,
                 result.BestLoopCost,
                 result.BestLoopSample,
                 result.BestLoopClip,
@@ -1116,7 +1116,7 @@ namespace
         const bool excludeNonLoopTail = settings.ExcludeNonLoopTail;
         const bool wantLoop = settings.LoopFilter == MotionLoopFilter::LoopOnly;
         const bool wantOneShot = settings.LoopFilter == MotionLoopFilter::OneShotOnly;
-        const int32 oneShotBand = settings.OneShotBand;
+        const int32 oneShotGroup = settings.OneShotGroup;
 
         // Retrieval: trajectory-coarse prefilter (replaces the 74-D tree
         // query � exact trees barely prune in high dimensions, measured 1.9x
@@ -1299,7 +1299,7 @@ namespace
         int32 cachedLoopClip = -1;
         bool cachedLoopFlag = false;
         float cachedTurnAngle = 0.0f;
-        int32 cachedSpeedBand = 0;
+        int32 cachedGroup = 0;
         float cachedTailStart = -1.0f;
         // Tags resolve on the clip-change tick below (candidates arrive in
         // ascending sample order, still clip-grouped); empty scope skips it.
@@ -1319,7 +1319,7 @@ namespace
                 cachedLoopClip = clipIndex;
                 cachedLoopFlag = database.GetClipLoop(clipIndex);
                 cachedTurnAngle = database.GetClipTurnAngle(clipIndex);
-                cachedSpeedBand = database.GetClipSpeedBand(clipIndex);
+                cachedGroup = database.GetClipGroup(clipIndex);
                 const Array<String>& clipTagSet = database.GetClipTags(clipIndex);
                 cachedTagOk = !checkTags || (TagAllowed(allowedTags, clipTagSet) && !TagExcluded(settings.ExcludeTags, clipTagSet));
                 cachedTailStart = -1.0f;
@@ -1329,8 +1329,8 @@ namespace
             }
             if ((wantLoop && !cachedLoopFlag) || (wantOneShot && cachedLoopFlag))
                 continue;
-            if (oneShotBand != 0 && !cachedLoopFlag && cachedSpeedBand != 0 &&
-                cachedSpeedBand != oneShotBand)
+            if (oneShotGroup != 0 && !cachedLoopFlag && cachedGroup != 0 &&
+                cachedGroup != oneShotGroup)
                 continue;
             if (lockSwitch && clipIndex != currentClipIndex)
                 continue;
@@ -1454,7 +1454,7 @@ namespace
                 allowedTags,
                 settings.ExcludeTags,
                 settings.LoopFilter,
-                settings.OneShotBand,
+                settings.OneShotGroup,
                 result.BestLoopCost,
                 result.BestLoopSample,
                 result.BestLoopClip,
@@ -1578,12 +1578,12 @@ void MotionMatchingSearch::FindTopCandidates(
     // candidate is excluded here too.
     const float trajectoryHorizon = GetTrajectoryHorizon(*database);
     const bool excludeNonLoopTail = settings.ExcludeNonLoopTail;
-    const int32 oneShotBand = settings.OneShotBand;
+    const int32 oneShotGroup = settings.OneShotGroup;
 
     int32 cachedLoopClip = -1;
     bool cachedLoopFlag = false;
     float cachedTurnAngle = 0.0f;
-    int32 cachedSpeedBand = 0;
+    int32 cachedGroup = 0;
     float cachedTailStart = -1.0f;
     // Tooling path too: tags resolve once per clip, not per sample.
     const bool checkTags = !allowedTags.IsEmpty();
@@ -1598,7 +1598,7 @@ void MotionMatchingSearch::FindTopCandidates(
             cachedLoopClip = clipIndex;
             cachedLoopFlag = database->GetClipLoop(clipIndex);
             cachedTurnAngle = database->GetClipTurnAngle(clipIndex);
-            cachedSpeedBand = database->GetClipSpeedBand(clipIndex);
+            cachedGroup = database->GetClipGroup(clipIndex);
             const Array<String>& clipTagSet = database->GetClipTags(clipIndex);
             cachedTagOk = !checkTags || (TagAllowed(allowedTags, clipTagSet) && !TagExcluded(settings.ExcludeTags, clipTagSet));
             cachedTailStart = -1.0f;
@@ -1608,8 +1608,8 @@ void MotionMatchingSearch::FindTopCandidates(
         }
         if ((wantLoop && !cachedLoopFlag) || (wantOneShot && cachedLoopFlag))
             continue;
-        if (oneShotBand != 0 && !cachedLoopFlag && cachedSpeedBand != 0 &&
-            cachedSpeedBand != oneShotBand)
+        if (oneShotGroup != 0 && !cachedLoopFlag && cachedGroup != 0 &&
+            cachedGroup != oneShotGroup)
             continue;
         if (!cachedTagOk)
             continue;

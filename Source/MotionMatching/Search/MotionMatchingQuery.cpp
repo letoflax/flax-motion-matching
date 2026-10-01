@@ -140,12 +140,14 @@ static bool SampleFeaturesFromWorlds(
             error = TEXT("Motion matching query failed: contact feature offsets are invalid.");
             return false;
         }
+        // Contact gate from the schema the caller passes (the policy passes
+        // the baked snapshot, so live and baked contacts share one gate).
         outPose[contactL] = PoseSearchSchema::IsPlantedContact(
-            poseVelocityRootRelative[1].LengthSquared(), PoseSearchSchema::ContactMaxSpeed,
-            heightL, PoseSearchSchema::ContactMaxHeight) ? 1.0f : 0.0f;
+            poseVelocityRootRelative[1].LengthSquared(), schema.ContactMaxSpeed,
+            heightL, schema.ContactMaxHeight) ? 1.0f : 0.0f;
         outPose[contactR] = PoseSearchSchema::IsPlantedContact(
-            poseVelocityRootRelative[2].LengthSquared(), PoseSearchSchema::ContactMaxSpeed,
-            heightR, PoseSearchSchema::ContactMaxHeight) ? 1.0f : 0.0f;
+            poseVelocityRootRelative[2].LengthSquared(), schema.ContactMaxSpeed,
+            heightR, schema.ContactMaxHeight) ? 1.0f : 0.0f;
     }
 
     return true;

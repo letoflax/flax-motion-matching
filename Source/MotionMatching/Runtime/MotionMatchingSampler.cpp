@@ -1,5 +1,6 @@
 #include "MotionMatchingSampler.h"
 
+#include "MotionMatchingChannelMap.h"
 #include "Engine/Content/Assets/Animation.h"
 #include "Engine/Content/Assets/SkinnedModel.h"
 #include "Engine/Core/Math/Math.h"
@@ -24,40 +25,36 @@ namespace
                 std::isfinite(value.W);
     }
 
-    // Shared channel evaluation: animation channels override bind-pose local
-    // transforms, missing sub-tracks keep bind values. Identical to the baker.
+    // Shared channel evaluation through the one channel resolver
+    // (MotionMatchingChannelMap, also used by the baker): animation channels
+    // override bind-pose local transforms, missing sub-tracks keep bind values.
     bool SampleLocalsInternal(
         Animation* clip,
         const Array<SkeletonNode>& nodes,
+        const Array<int32>& nodeToChannel,
         float time,
         Array<Matrix>& outLocals,
         String& error)
     {
         const auto& channels = clip->Data.Channels;
         const int32 nodeCount = nodes.Count();
+        if (nodeToChannel.Count() != nodeCount)
+        {
+            error = TEXT("Motion matching playback failed: channel map does not match the skeleton.");
+            return false;
+        }
         const float framesPerSecond = static_cast<float>(clip->Data.FramesPerSecond);
         const float sampleFrame = time * framesPerSecond;
 
         outLocals.Resize(nodeCount);
+        Transform local;
         for (int32 nodeIndex = 0; nodeIndex < nodeCount; nodeIndex++)
         {
-            const auto& node = nodes[nodeIndex];
-            Transform local = node.LocalTransform;
-
-            for (int32 channelIndex = 0; channelIndex < channels.Count(); channelIndex++)
-            {
-                const auto& channel = channels[channelIndex];
-                if (channel.NodeName != node.Name)
-                    continue;
-                if (channel.Position.GetKeyframes().HasItems())
-                    channel.Position.Evaluate(local.Translation, sampleFrame, false);
-                if (channel.Rotation.GetKeyframes().HasItems())
-                    channel.Rotation.Evaluate(local.Orientation, sampleFrame, false);
-                if (channel.Scale.GetKeyframes().HasItems())
-                    channel.Scale.Evaluate(local.Scale, sampleFrame, false);
-                break;
-            }
-
+            const int32 channelIndex = nodeToChannel[nodeIndex];
+            const NodeAnimationData* channel = channelIndex >= 0 && channelIndex < channels.Count()
+                ? &channels[channelIndex]
+                : nullptr;
+            MotionMatchingChannelMap::EvaluateLocal(nodes[nodeIndex], channel, sampleFrame, local);
             local.GetWorld(outLocals[nodeIndex]);
         }
 
@@ -98,17 +95,21 @@ bool MotionMatchingSampler::SampleClipPose(
     // local transforms, missing sub-tracks keep bind values, hierarchy is
     // composed parent-first (model space == actor space for a model
     // authored at the origin).
-    // C2 note (PLAN §18.4): this block intentionally DUPLICATES the baker's
-    // channel math (game build cannot link editor-only baker code). Keep the
-    // two in sync; drift is caught by golden-vector comparison, not by eye.
+    // Channel resolution and evaluation are shared with the baker through
+    // MotionMatchingChannelMap.h (header-only, so the game build links no
+    // editor code). Hierarchy composition stays local to each side.
     // Row-vector: world = childLocal * parentWorld (parent on the RIGHT —
     // Matrix::Multiply(locals[nodeIndex], parentPose)). Reversing the operand
     // order compiles fine and silently produces garbage world poses.
     const auto& nodes = model->GetNodes();
     const int32 nodeCount = nodes.Count();
 
+    // Convenience API: builds the channel map per call with no aliases.
+    // Playback caches maps per clip and passes the database aliases.
+    Array<int32> nodeToChannel;
+    MotionMatchingChannelMap::Build(nodes, clip->Data.Channels, Array<BoneAlias>(), nodeToChannel);
     Array<Matrix> locals;
-    if (!SampleLocalsInternal(clip, nodes, time, locals, error))
+    if (!SampleLocalsInternal(clip, nodes, nodeToChannel, time, locals, error))
         return false;
 
     outPose.Resize(nodeCount);
@@ -174,7 +175,37 @@ bool MotionMatchingSampler::SampleClipLocalPose(
         return false;
     }
 
-    return SampleLocalsInternal(clip, model->GetNodes(), time, outLocals, error);
+    Array<int32> nodeToChannel;
+    MotionMatchingChannelMap::Build(model->GetNodes(), clip->Data.Channels, Array<BoneAlias>(), nodeToChannel);
+    return SampleLocalsInternal(clip, model->GetNodes(), nodeToChannel, time, outLocals, error);
+}
+
+bool MotionMatchingSampler::SampleClipLocalPoseMapped(
+    Animation* clip,
+    SkinnedModel* model,
+    const Array<int32>& nodeToChannel,
+    float time,
+    Array<Matrix>& outLocals,
+    String& error)
+{
+    outLocals.Clear();
+    error = String::Empty;
+
+    if (clip == nullptr || clip->WaitForLoaded() ||
+        model == nullptr || model->WaitForLoaded())
+    {
+        error = TEXT("Motion matching playback failed: clip or model is not loaded.");
+        return false;
+    }
+
+    const float framesPerSecond = static_cast<float>(clip->Data.FramesPerSecond);
+    if (framesPerSecond <= 0.0f)
+    {
+        error = TEXT("Motion matching playback failed: clip has no frame rate.");
+        return false;
+    }
+
+    return SampleLocalsInternal(clip, model->GetNodes(), nodeToChannel, time, outLocals, error);
 }
 
 bool MotionMatchingSampler::GetSkeletonHierarchy(

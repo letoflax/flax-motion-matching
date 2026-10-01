@@ -62,10 +62,10 @@ enum class MotionSamplingStatus : int32
 };
 
 /// <summary>
-/// Runtime clip pose sampler for motion-matching playback.
-/// Duplicates the baker's channel-evaluation math (kept separate so the game
-/// build never depends on editor-only baker code); outputs actor-space node
-/// transforms ready for AnimatedModel.SetCurrentPose(worldSpace: false).
+/// Runtime clip pose sampler for motion-matching playback. Channel lookup and
+/// evaluation go through MotionMatchingChannelMap.h, the resolver the baker
+/// uses too; outputs actor-space node transforms ready for
+/// AnimatedModel.SetCurrentPose(worldSpace: false).
 /// </summary>
 API_CLASS(Static, Namespace="MotionMatching")
 class MOTIONMATCHING_API MotionMatchingSampler
@@ -111,10 +111,8 @@ public:
     /// mutate it in place while the saved search snapshot stays intact
     /// (PLAN §16). Row-vector convention: ComposeModelPose builds
     /// childLocal * parentWorld (parent on the RIGHT).
-    /// NOTE (PLAN §18.4): channel evaluation below duplicates the baker's
-    /// math by design (game build must not depend on editor-only baker code).
-    /// The two copies must stay in sync; any change here requires the same
-    /// change in MotionMatchingBaker.cpp plus a golden-vector comparison.
+    /// Builds the channel map per call without aliases; playback uses
+    /// SampleClipLocalPoseMapped with a cached map instead.
     /// </summary>
     API_FUNCTION()
     static bool SampleClipLocalPose(
@@ -123,6 +121,19 @@ public:
         float time,
         API_PARAM(Out) Array<Matrix>& outLocals,
         API_PARAM(Out) String& error);
+
+    /// <summary>
+    /// SampleClipLocalPose with a prebuilt node-to-channel table
+    /// (MotionMatchingChannelMap::Build, one per clip/model pair, database
+    /// aliases applied). C++ only: playback caches the tables per clip.
+    /// </summary>
+    static bool SampleClipLocalPoseMapped(
+        Animation* clip,
+        SkinnedModel* model,
+        const Array<int32>& nodeToChannel,
+        float time,
+        Array<Matrix>& outLocals,
+        String& error);
 
     /// <summary>
     /// Returns the skeleton hierarchy (parent index per node, -1 for roots)

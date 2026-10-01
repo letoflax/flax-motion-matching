@@ -41,12 +41,18 @@ def main():
             1),
     )
     expect_failure(
-        "legacy asset TypeName",
+        "asset TypeName",
         "Source/MotionMatching/Database/MotionMatchingDatabase.cpp",
         lambda text: text.replace(
-            'MotionMatchingDatabase::TypeName = TEXT("Game.MotionMatchingDatabase")',
             'MotionMatchingDatabase::TypeName = TEXT("MotionMatching.MotionMatchingDatabase")',
+            'MotionMatchingDatabase::TypeName = TEXT("Game.MotionMatchingDatabase")',
             1),
+    )
+    expect_failure(
+        "legacy TypeName factory key",
+        "Source/MotionMatching/Database/MotionMatchingDatabase.cpp",
+        lambda text: text.replace(
+            "Register(MotionMatchingDatabase::LegacyTypeName);", "", 1),
     )
     expect_failure(
         "forbidden game coupling",
@@ -58,7 +64,7 @@ def main():
         "README.md",
         lambda text: text.replace("docs/LIFECYCLE.md", "docs/REMOVED.md", 1),
     )
-    print("contract audit mutation tests: PASS (5/5)")
+    print("contract audit mutation tests: PASS (6/6)")
     return 0
 
 

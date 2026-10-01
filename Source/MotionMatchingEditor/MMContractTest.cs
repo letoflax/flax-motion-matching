@@ -62,6 +62,7 @@ public static class MMContractTest
             DatabasePath = live.DatabasePath,
             Database = live.Database,
             CharacterBody = live.CharacterBody,
+            AllowBindingMismatch = live.AllowBindingMismatch,
             QueryInterval = live.QueryInterval,
             SearchEveryFrame = live.SearchEveryFrame,
             FrameSearchBudget = live.FrameSearchBudget,
@@ -371,9 +372,9 @@ public static class MMContractTest
         return new MMContractTestProvider { FrameToReturn = CannedFrame(allowed, excluded, 0, 0) };
     }
 
-    private static MMContractTestProvider NewCannedFiltered(string allowed, string excluded, int loop, int band)
+    private static MMContractTestProvider NewCannedFiltered(string allowed, string excluded, int loop, int group)
     {
-        return new MMContractTestProvider { FrameToReturn = CannedFrame(allowed, excluded, loop, band) };
+        return new MMContractTestProvider { FrameToReturn = CannedFrame(allowed, excluded, loop, group) };
     }
 
     private static void TickProvider(MotionMatchingController controller, MMContractTestProvider prov, int n)
@@ -393,7 +394,7 @@ public static class MMContractTest
         }
     }
 
-    private static MotionMatchingFrameInput CannedFrame(string allowed, string excluded, int loop, int band)
+    private static MotionMatchingFrameInput CannedFrame(string allowed, string excluded, int loop, int group)
     {
         return new MotionMatchingFrameInput
         {
@@ -401,7 +402,7 @@ public static class MMContractTest
             AllowedTagSet = allowed ?? string.Empty,
             ExcludedTagSet = excluded ?? string.Empty,
             LoopFilter = loop,
-            CandidateBand = band,
+            ClipGroup = group,
             QueryYawRate = 0.0f,
         };
     }

@@ -50,10 +50,12 @@ boundary receives only plain scope/filter data and trajectory points.
   into no-match before calling search.
 
 `LoopFilter` values are `Any = 0`, `LoopOnly = 1`, and `OneShotOnly = 2`.
-`CandidateBand` is an integer stored per clip in the database (`0` = any; the
-current format accepts `0..3`). A non-zero band restricts one-shot candidates
-to clips of the same band or band `0`; loops are never cut by it. The host
-decides what each id means.
+`ClipGroup` selects a clip group. Groups are authored per clip in the
+registry (`group`, `0` or absent = any, any non-negative integer) and baked
+into the database; the plugin never derives them from file names. A non-zero
+group restricts one-shot candidates to clips of the same group or group `0`;
+loops are never cut by it. The host decides what each id means (format v3
+called this field `CandidateBand`).
 Normal warmed queries use the caller's values verbatim after range validation;
 the core does not infer them from velocity, grounded state, gait, or intent.
 
@@ -77,8 +79,8 @@ The runtime intentionally has two structural recovery paths:
 2. If a query produces no result while playback reports `IsAtEnd`, the runtime
    retries once with temporal exclusion removed and `LoopOnly`.
 
-Both paths retain the provider's same tag scope (include and exclude sets) and candidate
-band. They do not name or invent an idle/rest tag, read gameplay intent, or
+Both paths retain the provider's same tag scope (include and exclude sets) and clip
+group. They do not name or invent an idle/rest tag, read gameplay intent, or
 widen the tag scope. Therefore a caller's `OneShotOnly` request is overridden
 for this structural recovery query; the normal caller filter is restored on
 the next ordinary query. This is an explicit neutral invariant, not a

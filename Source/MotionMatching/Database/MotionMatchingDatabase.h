@@ -7,6 +7,7 @@
 #include "Engine/Core/Math/Vector3.h"
 #include "Engine/Core/Types/String.h"
 #include "../Schema/PoseSearchSchema.h"
+#include "MotionMatchingSkeletonFingerprint.h"
 
 /// <summary>
 /// Native, persistent motion-matching database.
@@ -16,9 +17,16 @@
 API_CLASS(NoSpawn, Namespace="MotionMatching")
 class MOTIONMATCHING_API MotionMatchingDatabase : public BinaryAsset
 {
-    DECLARE_BINARY_ASSET_HEADER(MotionMatchingDatabase, 3);
+    DECLARE_BINARY_ASSET_HEADER(MotionMatchingDatabase, 4);
 
 public:
+    /// <summary>
+    /// Serialized asset type name of format v1-v3 files. The factory keeps
+    /// accepting it so the v3 -> v4 upgrader can read old databases; the
+    /// upgrade (and every save) writes TypeName instead.
+    /// </summary>
+    static const String LegacyTypeName;
+
     /// <summary>
     /// D1 §18.5 three-way validation outcome.
     /// Ok: data is usable. RegistryOnlyStale: the baked arrays cannot be
@@ -39,14 +47,17 @@ public:
     /// reserved for unknown/legacy). SchemaContractRevision: bump whenever
     /// PoseSearchSchema serialization or feature semantics change.
     /// Rev 2 adds per-clip speed bands (onset one-shot gait filter).
+    /// Rev 3 (format v4): authored clip groups replace the name-derived
+    /// speed bands, the contact gate and bone aliases move into the schema,
+    /// and a skeleton fingerprint is stored.
     /// SamplingContractRevision: mixed into ComputeSamplingContractHash; bump
     /// when the T1 sampler helper semantics change without a schema value
     /// change (the hash is otherwise derived from schema sampling values).
     /// BakeToolBuildId: bump on any bake-tool (MotionMatchingBaker) change.
     /// </summary>
-    static constexpr int32 SchemaContractRevision = 2;
+    static constexpr int32 SchemaContractRevision = 3;
     static constexpr int32 SamplingContractRevision = 1;
-    static constexpr int32 BakeToolBuildId = 1;
+    static constexpr int32 BakeToolBuildId = 2;
     /// <summary>
     /// Schema snapshot captured at bake time. Meaningful only when SampleCount > 0.
     /// </summary>
@@ -193,24 +204,14 @@ public:
     bool GetClipLoop(int32 clipIndex) const;
 
     /// <summary>
-    /// Baked turn-like flag (name keywords turn/arc/reface/pivot/spin, set
-    /// once at bake). Replaces runtime clip-name substring matching in the
-    /// policy: renaming assets no longer blinds turn hold/replay. No runtime
-    /// path fallback: a database without the baked flag is registry-only and
-    /// must be rebaked (PLAN §12 / S1 §7.2).
+    /// Clip group of a baked clip (copied at bake from the registry's
+    /// authored group). The one-shot group filter of a query
+    /// (MotionMatchingSearchSettings::OneShotGroup) skips ONE-SHOT clips of
+    /// another non-zero group; loops are never cut. 0 = any (the clip stays
+    /// eligible for every group). The host defines what the ids mean.
     /// </summary>
     API_FUNCTION()
-    bool GetClipTurnLike(int32 clipIndex) const;
-
-    /// <summary>
-    /// Baked gait speed band (Walk/Run/Sprint from the asset name, set once
-    /// at bake via MotionMatchingBakeHeuristics::BandFromClipName). Lets
-    /// onset queries restrict one-shots to the intended gait: at the onset
-    /// instant the features carry almost no gait information. Loops are
-    /// never band-cut. 0 = Any (turns and unknowns stay eligible everywhere).
-    /// </summary>
-    API_FUNCTION()
-    int32 GetClipSpeedBand(int32 clipIndex) const;
+    int32 GetClipGroup(int32 clipIndex) const;
 
     /// <summary>
     /// Measured total yaw travel (radians, SIGNED) of a clip, accumulated
@@ -287,6 +288,27 @@ public:
     API_FUNCTION() int64 ComputeClipMetadataHash() const;
 
     /// <summary>
+    /// Skeleton fingerprint hash of the baked data (0 = none).
+    /// </summary>
+    API_FUNCTION() int64 GetSkeletonFingerprintHash() const
+    {
+        return _skeletonFingerprint.ComputeHash();
+    }
+
+    /// <summary>Number of skeleton nodes in the stored fingerprint (0 = none).</summary>
+    API_PROPERTY() int32 GetSkeletonFingerprintNodeCount() const
+    {
+        return _skeletonFingerprint.NodeNames.Count();
+    }
+
+    /// <summary>
+    /// Compares the stored skeleton fingerprint with a model (node names,
+    /// parent structure, proportions of every clip-driven node and its
+    /// ancestors). False on a mismatch; report names the cause and the fix.
+    /// </summary>
+    API_FUNCTION() bool CheckSkeleton(SkinnedModel* model, API_PARAM(Out) String& report) const;
+
+    /// <summary>
     /// D1 §18.5 bake-tool build id of the loaded baked data (0 = unknown/legacy).
     /// </summary>
     API_PROPERTY() int32 GetBakeToolBuildId() const
@@ -314,6 +336,10 @@ public:
 
     API_FUNCTION()
     bool GetSourceClipLoop(int32 sourceIndex) const;
+
+    /// <summary>Authored clip group of a registered source clip (0 = any).</summary>
+    API_FUNCTION()
+    int32 GetSourceClipGroup(int32 sourceIndex) const;
 
     API_FUNCTION()
     bool ValidateData() const;
@@ -357,7 +383,8 @@ public:
         const String& databasePath,
         const Array<String>& tags,
         const Array<Animation*>& animations,
-        bool loop);
+        bool loop,
+        int32 group);
 
     API_FUNCTION()
     static bool AddClipFiles(
@@ -365,6 +392,7 @@ public:
         const Array<String>& tags,
         const Array<String>& animationPaths,
         bool loop,
+        int32 group,
         API_PARAM(Out) int32& addedCount);
 
     API_FUNCTION()
@@ -375,7 +403,8 @@ public:
         const String& databasePath,
         int32 sourceIndex,
         const Array<String>& tags,
-        bool loop);
+        bool loop,
+        int32 group);
 
     API_FUNCTION()
     static bool RemoveSourceClip(
@@ -392,6 +421,7 @@ public:
         const Array<int32>& updateIndices,
         const Array<String>& updateTagSets,
         const Array<int32>& updateLoops,
+        const Array<int32>& updateGroups,
         const Array<int32>& removeIndices);
 
     API_FUNCTION()
@@ -407,13 +437,21 @@ public:
     void GetSourceData(
         Array<Animation*>& animations,
         Array<Array<String>>& tags,
-        Array<int32>& loopingClips) const;
+        Array<int32>& loopingClips,
+        Array<int32>& groups) const;
+
+    /// <summary>Stored skeleton fingerprint (empty when not baked).</summary>
+    const MotionMatchingSkeletonFingerprint& GetSkeletonFingerprint() const
+    {
+        return _skeletonFingerprint;
+    }
 
 #if USE_EDITOR
     bool AddSourceClips(
         const Array<String>& tags,
         const Array<Animation*>& animations,
-        bool loop);
+        bool loop,
+        int32 group);
 
     void ClearSourceClips();
 
@@ -430,7 +468,8 @@ public:
         const Array<float>& poseFeatures,
         const Array<float>& trajectoryFeatures,
         const Array<float>& poseFeatureDeviations,
-        const Array<float>& trajectoryFeatureDeviations);
+        const Array<float>& trajectoryFeatureDeviations,
+        const MotionMatchingSkeletonFingerprint& skeletonFingerprint);
 
     void GetReferences(Array<Guid>& assets, Array<String>& files) const override;
     bool Save(const StringView& path = StringView::Empty) override;
@@ -450,14 +489,17 @@ private:
     Array<AssetReference<Animation>> _sourceAnimations;
     Array<Array<String>> _sourceTags;
     Array<int32> _sourceLooping;
+    // Authored clip group per source clip (format v4, appended at the tail).
+    Array<int32> _sourceGroups;
     Array<String> _tagNames;
     Array<int32> _tagClipCounts;
 
     Array<AssetReference<Animation>> _clipAnimations;
     Array<Array<String>> _clipTags;
     Array<int32> _clipLooping;
-    Array<int32> _clipTurnLike;
-    Array<int32> _clipSpeedBands;
+    // Per baked clip, copied from _sourceGroups at bake. Stored in the old
+    // speed-band slot of the byte layout (same int domain for ids 0-3).
+    Array<int32> _clipGroups;
     Array<float> _clipTurnAngles;
     Array<float> _clipLengths;
     Array<int32> _clipSampleCounts;
@@ -477,9 +519,9 @@ private:
     // trajDev) keep parsing far enough to hit the revision D1 gate; the
     // legacy means are read into a throwaway local and discarded.
     // Bake-statistics revision (Phase 3 N1): which normalization produced the
-    // baked arrays. 0 = unknown/legacy. Written as a tail int (conditional
-    // read like _clipTurnLike); a mismatch drops baked data with a loud
-    // "rebake required" instead of silently mismatching. Registry survives.
+    // baked arrays. 0 = unknown/legacy. Written as a tail int; a mismatch
+    // drops baked data with a loud "rebake required" instead of silently
+    // mismatching. Registry survives.
     int32 _normalizationRevision = 0;
     // N1 feature-layout hash, cast from PoseSearchSchema::GetFeatureLayoutHash
     // (0 = unknown/legacy). Second tail int after the revision; same
@@ -494,6 +536,8 @@ private:
     int32 _samplingContractHash = 0;
     int32 _sourceManifestHash = 0;
     int32 _bakeToolBuildId = 0;
+    // Skeleton the features were baked on (format v4 tail).
+    MotionMatchingSkeletonFingerprint _skeletonFingerprint;
 
     void ClearBakedData();
     void RebuildTagCounts();

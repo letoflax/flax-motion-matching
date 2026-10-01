@@ -38,7 +38,7 @@ constexpr int32 TraceFlag_ExcludeNonLoopTail = 1 << 6;
 /// Replay verify re-runs "search"/"fastpath", structurally checks
 /// "command"/"reset", and reports the rest as skipped with reasons.
 /// P0: the entry carries the COMPLETE effective request — every runtime
-/// input that can change the winner (OneShotBand, exclusions, retry kind,
+/// input that can change the winner (OneShotGroup, exclusions, retry kind,
 /// force/reset flags, intent windows, budget/stride, index route, tail
 /// rule, fuse threshold, frame dt, play rate, database identity,
 /// fast-path threshold, command clip/time).
@@ -99,8 +99,9 @@ struct MOTIONMATCHING_API MotionMatchingTraceEntry
     // on one API_STRUCT.
     // Controller-decided exclusions, '+'-joined (merged into search).
     API_FIELD() String ExcludedTags;
-    // Onset one-shot gait band actually applied (0 = Any).
-    API_FIELD() int32 OneShotBand = 0;
+    // One-shot clip group filter actually applied (0 = any). Trace JSON key
+    // stays "band" so trace v3 files (and the parity baselines) still load.
+    API_FIELD() int32 OneShotGroup = 0;
     // Retry path taken after the first FindBest: 0 none, 1 end-recovery
     // LoopOnly retry, 2 onset-fallback full-pool retry.
     API_FIELD() int32 RetryKind = 0;
@@ -151,7 +152,7 @@ public:
     // Ring capacity: 4096 entries ≈ 60s at 60 Hz queries. Memory stays
     // modest for one tuned character.
     static constexpr int32 Capacity = 4096;
-    // P0: v3 adds the complete effective request (exclusions, OneShotBand,
+    // P0: v3 adds the complete effective request (exclusions, OneShotGroup,
     // retry kind, force/reset flags, intent windows, budget/stride, index
     // route, tail rule, fuse threshold, frame dt, play rate, DB identity,
     // fast-path threshold, command clip/time) plus replayable fast-path

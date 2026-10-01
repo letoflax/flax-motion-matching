@@ -124,6 +124,11 @@ private:
     Array<Animation*> _clips;
     Array<float> _lengths;
     Array<bool> _loops;
+    // Baked BoneAliases and the per-clip node-to-channel tables for
+    // _channelMapModel (MotionMatchingChannelMap, built lazily per clip).
+    Array<BoneAlias> _aliases;
+    Array<Array<int32>> _channelMaps;
+    SkinnedModel* _channelMapModel = nullptr;
 
     Array<int32> _parents;
     Array<Matrix> _referenceLocals;
@@ -180,5 +185,6 @@ private:
     static float TwistAbout(const Quaternion& value, const Float3& axis);
     static bool TryDecompose(const Matrix& value, Float3& scl, Quaternion& rot, Float3& pos);
     void EnsureHierarchy(SkinnedModel* model);
+    const Array<int32>* GetChannelMap(int32 clipIndex, SkinnedModel* model);
     void WarnOnce(const String& message);
 };

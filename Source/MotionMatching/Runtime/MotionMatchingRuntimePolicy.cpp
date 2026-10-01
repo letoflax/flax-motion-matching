@@ -123,9 +123,11 @@ void MotionMatchingRuntimePolicy::Initialize(
     MotionMatchingDatabase* database,
     AnimatedModel* body,
     const PoseSearchSchema& schema,
-    float defaultInertial)
+    float defaultInertial,
+    bool allowBindingMismatch)
 {
     Shutdown();
+    BindingReport = String::Empty;
     _database = database;
     _body = body;
     _liveSchema = schema;
@@ -192,6 +194,28 @@ void MotionMatchingRuntimePolicy::Initialize(
         snprintf(message, sizeof(message), "Motion matching policy disabled: %s", errorAnsi.GetText());
         LOG(Warning, "{}", String(message));
         return;
+    }
+
+    // Bind-time checks: a database baked for another schema or skeleton must
+    // never run silently (it produces wrong poses, not errors).
+    {
+        String report;
+        const bool bound = CheckSchemaBinding(model, report);
+        BindingReport = report;
+        if (!bound)
+        {
+            if (!allowBindingMismatch)
+            {
+                LOG(Error, "Motion matching controller not ready: the database does not fit this character. {} "
+                    "(Set AllowBindingMismatch to bind anyway, debug only.)", report);
+                return;
+            }
+            LOG(Warning, "Motion matching binding mismatch ALLOWED by AllowBindingMismatch (poses may be wrong): {}", report);
+        }
+        else
+        {
+            LOG(Info, "Motion matching binding: {}", report);
+        }
     }
 
     _prevPositions.Resize(21);
@@ -449,7 +473,7 @@ bool MotionMatchingRuntimePolicy::ExportClipAudit(MotionMatchingDatabase* db, co
         // Audit file tag column is '+'-joined (tools split it back).
         const String tag = MotionMatchingDatabase::JoinTags(db->GetClipTags(c));
         const bool loop = db->GetClipLoop(c);
-        const bool turnLike = db->GetClipTurnLike(c);
+        const int32 group = db->GetClipGroup(c);
         const StringAnsi nameAnsi(name);
         const StringAnsi tagAnsi(tag);
         char fTravel[32], fNet[32], fYaw[32], fLen[32], fSpd[32];
@@ -458,9 +482,10 @@ bool MotionMatchingRuntimePolicy::ExportClipAudit(MotionMatchingDatabase* db, co
         FormatFloatText(turnAngle[c], fYaw, sizeof(fYaw));
         FormatFloatText(len, fLen, sizeof(fLen));
         FormatFloatText(spd, fSpd, sizeof(fSpd));
-        snprintf(line, sizeof(line), "%d|%s|%s|%s|%s|%s|%s|%s|%s|%s\n",
+        // Columns: index|name|tags|loop|group|travel|net|yaw|length|speed.
+        snprintf(line, sizeof(line), "%d|%s|%s|%s|%d|%s|%s|%s|%s|%s\n",
             c, nameAnsi.GetText(), tagAnsi.GetText(),
-            loop ? "loop" : "once", turnLike ? "turn" : "-",
+            loop ? "loop" : "once", group,
             fTravel, fNet, fYaw, fLen, fSpd);
         sb.Append(line);
     }
@@ -548,27 +573,51 @@ void MotionMatchingRuntimePolicy::ResetOnTeleport()
     // stripped Ã¢â‚¬â€ the picture never jumps. Only timers/locks release.
 }
 
-void MotionMatchingRuntimePolicy::CheckSchemaBinding()
+bool MotionMatchingRuntimePolicy::CheckSchemaBinding(SkinnedModel* model, String& report) const
 {
-    if (_bindingWarned || _database == nullptr || !_database->IsBaked())
-        return;
-    _bindingWarned = true;
-    // Scene weights are live tuning (allowed to differ); skeleton names,
-    // axes, sample rate and trajectory times must match the baked snapshot
-    // or the query frame silently disagrees with the database.
+    report = String::Empty;
+    if (_database == nullptr || !_database->IsBaked())
+    {
+        report = TEXT("database is not baked");
+        return false;
+    }
+    // Scene weights are live tuning (allowed to differ). Everything else of
+    // the schema shaped the baked features: a different value means the
+    // query frame or the sampled skeleton disagrees with the database.
     const PoseSearchSchema& live = _liveSchema;
     const PoseSearchSchema& baked = _database->GetSchema();
-    const bool mismatch =
-        live.Skeleton.Root != baked.Skeleton.Root ||
-        live.Skeleton.Pelvis != baked.Skeleton.Pelvis ||
-        live.Skeleton.LeftFoot != baked.Skeleton.LeftFoot ||
-        live.Skeleton.RightFoot != baked.Skeleton.RightFoot ||
-        live.SampleRate != baked.SampleRate ||
-        !AxesNear(live.RootForwardAxis, baked.RootForwardAxis) ||
-        !AxesNear(live.RootUpAxis, baked.RootUpAxis) ||
-        !TimesEqual(live.TrajectorySampleTimes, baked.TrajectorySampleTimes);
-    if (mismatch)
-        LOG(Warning, "Motion matching schema differs from the baked database snapshot (skeleton/axes/rate/times). Query uses baked axes; rebake to reconcile. Scene weights remain live.");
+    String schemaDiff;
+    auto differs = [&schemaDiff](bool different, const Char* field)
+    {
+        if (!different)
+            return;
+        if (schemaDiff.HasChars())
+            schemaDiff += TEXT(", ");
+        schemaDiff += field;
+    };
+    differs(live.SampleRate != baked.SampleRate, TEXT("SampleRate"));
+    differs(!AxesNear(live.RootForwardAxis, baked.RootForwardAxis), TEXT("RootForwardAxis"));
+    differs(!AxesNear(live.RootUpAxis, baked.RootUpAxis), TEXT("RootUpAxis"));
+    differs(!TimesEqual(live.TrajectorySampleTimes, baked.TrajectorySampleTimes), TEXT("TrajectorySampleTimes"));
+    differs(live.ContactMaxSpeed != baked.ContactMaxSpeed || live.ContactMaxHeight != baked.ContactMaxHeight, TEXT("ContactMaxSpeed/ContactMaxHeight"));
+    differs(live.Skeleton.Root != baked.Skeleton.Root || live.Skeleton.Pelvis != baked.Skeleton.Pelvis ||
+        live.Skeleton.Spine != baked.Skeleton.Spine || live.Skeleton.Head != baked.Skeleton.Head ||
+        live.Skeleton.LeftFoot != baked.Skeleton.LeftFoot || live.Skeleton.RightFoot != baked.Skeleton.RightFoot ||
+        live.Skeleton.LeftHand != baked.Skeleton.LeftHand || live.Skeleton.RightHand != baked.Skeleton.RightHand,
+        TEXT("Skeleton"));
+    bool aliasesDiffer = live.BoneAliases.Count() != baked.BoneAliases.Count();
+    for (int32 i = 0; !aliasesDiffer && i < live.BoneAliases.Count(); i++)
+        aliasesDiffer = !(live.BoneAliases[i] == baked.BoneAliases[i]);
+    differs(aliasesDiffer, TEXT("BoneAliases"));
+
+    String skeletonReport;
+    const bool skeletonOk = _database->CheckSkeleton(model, skeletonReport);
+    if (schemaDiff.HasChars())
+    {
+        report = String::Format(TEXT("schema differs from the baked snapshot ({}); rebake with this schema or restore it. "), schemaDiff);
+    }
+    report += skeletonReport;
+    return schemaDiff.IsEmpty() && skeletonOk;
 }
 
 bool MotionMatchingRuntimePolicy::AxesNear(const Float3& a, const Float3& b)
@@ -713,7 +762,7 @@ void MotionMatchingRuntimePolicy::Tick(
     const Array<float>& trajectorySampleTimes,
     const MotionMatchingPolicyTuning& tuning,
     int32 callerLoopFilter,
-    int32 callerCandidateBand,
+    int32 callerClipGroup,
     float callerYawRate,
     float callerTargetSpeed,
     bool holdReseedFilter)
@@ -734,9 +783,9 @@ void MotionMatchingRuntimePolicy::Tick(
         _snapshot.ExcludedTagSet = state.ExcludedTagSet;
     _tuning = tuning;
     // P2 caller filter (Game selection policy output): the ONLY LoopFilter /
-    // CandidateBand / YawRate the core uses. Clamped to the valid range;
+    // ClipGroup / YawRate the core uses. Clamped to the valid range;
     _callerLoopFilter = callerLoopFilter >= 0 && callerLoopFilter <= 2 ? callerLoopFilter : 0;
-    _callerCandidateBand = callerCandidateBand >= 0 && callerCandidateBand <= 3 ? callerCandidateBand : 0;
+    _callerClipGroup = callerClipGroup >= 0 ? callerClipGroup : 0;
     _callerYawRate = callerYawRate >= 0.0f && callerYawRate < 1e29f ? callerYawRate : 0.0f;
     _callerTargetSpeed = callerTargetSpeed >= 0.0f && callerTargetSpeed < 1e29f ? callerTargetSpeed : 0.0f;
     _holdReseedFilter = holdReseedFilter;
@@ -761,8 +810,6 @@ void MotionMatchingRuntimePolicy::Tick(
     }
     _lastActorPos = actorPos;
     _hasLastActorPos = true;
-
-    CheckSchemaBinding();
 
     // Sample the live pose EVERY tick. Velocity = (pos - prev) / frameDt,
     // so the time basis always matches the sampling rate. Seeding happens
@@ -979,7 +1026,7 @@ void MotionMatchingRuntimePolicy::RunQuery(const Array<TrajectoryPoint>& traject
 
     // P2: the core executes the caller filter verbatim. No airborne/policy
     // state, no speeds, no yaw gates, no intent windows here — the Game
-    // selection policy owns all of that and passes LoopFilter/CandidateBand/
+    // selection policy owns all of that and passes LoopFilter/ClipGroup/
     // YawRate per tick (Tick params). Diagnostics that used movement record
     // neutral values (speed/des 0); yaw rides the caller value for the turn
     // prior + replay.
@@ -1042,7 +1089,7 @@ void MotionMatchingRuntimePolicy::RunQuery(const Array<TrajectoryPoint>& traject
             emptySettings.ContinuityWeight = _tuning.ContinuityWeight;
             emptySettings.MinSwitchTime = _tuning.MinSwitchTime;
             emptySettings.LoopFilter = (MotionLoopFilter)_callerLoopFilter;
-            emptySettings.OneShotBand = _callerCandidateBand;
+            emptySettings.OneShotGroup = _callerClipGroup;
             emptySettings.QueryYawRate = yawRate;
             emptySettings.TurnPenaltyWeight = _tuning.TurnPenaltyWeight;
             emptySettings.TurnPenaltyYawScale = _tuning.TurnPenaltyYawScale;
@@ -1156,11 +1203,11 @@ void MotionMatchingRuntimePolicy::RunQuery(const Array<TrajectoryPoint>& traject
     // channels + feature extraction + DB stay untouched.
     // P2 caller filter (Game selection policy output): reseed forces LoopOnly
     // (neutral structural rule, no gait read); otherwise the caller filter
-    // rides verbatim. The core never derives LoopFilter/OneShotBand from
+    // rides verbatim. The core never derives LoopFilter/OneShotGroup from
     // movement, grounded, sprint or yaw.
     settings.LoopFilter = (reseeded || keepReseedArmed) ? MotionLoopFilter::LoopOnly :
         (MotionLoopFilter)_callerLoopFilter;
-    settings.OneShotBand = _callerCandidateBand;
+    settings.OneShotGroup = _callerClipGroup;
     // Controller-decided exclusions ride the snapshot (plain-String
     // transport, split here). Independent of the include scope above.
     // P5: change-only split via the shared cache (steady-state reuses).
@@ -1435,7 +1482,7 @@ bool MotionMatchingRuntimePolicy::TryFastPath(float frameDt)
 
     // §18.8 query signature: compare against the signature stored at the
     // last full scan. P2: the signature carries the full candidate-set
-    // inputs (allowed/excluded tags, loop filter, candidate band) plus
+    // inputs (allowed/excluded tags, loop filter, clip group) plus
     // clip/time/database identity. A changed filter invalidates immediately
     // — the core can never hold a continuation from a previous filter after
     // the Game changed it. A changed database identity (rebake/reload) also
@@ -1589,7 +1636,7 @@ bool MotionMatchingRuntimePolicy::TryFastPath(float frameDt)
         entry.SwitchMargin = _tuning.SwitchMargin;
         entry.LoopPreference = 0.0f;
         entry.LoopFilter = _callerLoopFilter;
-        entry.OneShotBand = _callerCandidateBand;
+        entry.OneShotGroup = _callerClipGroup;
         entry.MaxCandidates = MaxI(_tuning.FrameSearchBudget, 0);
         entry.QueryFrame = _policyFrame;
         entry.TraceFlags = PackTraceFlags(false, false, false, false,
@@ -1658,7 +1705,7 @@ MotionMatchingRuntimePolicy::FastPathSignature MotionMatchingRuntimePolicy::Capt
 {
     // P2: the signature carries every input that can change the valid
     // candidate set: allowed/excluded tags (hashed), loop filter, candidate
-    // band, current clip/time and database identity. Movement-derived bits
+    // group, current clip/time and database identity. Movement-derived bits
     // (speed/intent/yaw/contacts) died with the gameplay state — trajectory
     // drift is caught by the continuation cost check itself.
     int32 dbId = 0;
@@ -1668,7 +1715,7 @@ MotionMatchingRuntimePolicy::FastPathSignature MotionMatchingRuntimePolicy::Capt
     sig.AllowedHash = HashTagSet(_snapshot.AllowedTagSet);
     sig.ExcludedHash = HashTagSet(_snapshot.ExcludedTagSet);
     sig.LoopFilter = _callerLoopFilter;
-    sig.CandidateBand = _callerCandidateBand;
+    sig.ClipGroup = _callerClipGroup;
     sig.Clip = _currentClip;
     sig.ClipTime = Quantize(_playback != nullptr ? _playback->CurrentTime : 0.0f, 0.5f);
     sig.DatabaseId = dbId;
@@ -1678,7 +1725,7 @@ MotionMatchingRuntimePolicy::FastPathSignature MotionMatchingRuntimePolicy::Capt
 bool MotionMatchingRuntimePolicy::FastPathSignaturesDiffer(const FastPathSignature& a, const FastPathSignature& b)
 {
     return a.AllowedHash != b.AllowedHash || a.ExcludedHash != b.ExcludedHash ||
-        a.LoopFilter != b.LoopFilter || a.CandidateBand != b.CandidateBand ||
+        a.LoopFilter != b.LoopFilter || a.ClipGroup != b.ClipGroup ||
         a.Clip != b.Clip || a.ClipTime != b.ClipTime || a.DatabaseId != b.DatabaseId;
 }
 
@@ -1821,7 +1868,7 @@ void MotionMatchingRuntimePolicy::RecordTrace(float speed, float yawRate, const 
     entry.ReselectBanWindow = settings.ReselectBanWindow;
     entry.TwinBanWindow = settings.TwinBanWindow;
     entry.LoopTailExclusion = settings.LoopTailExclusion;
-    entry.OneShotBand = settings.OneShotBand;
+    entry.OneShotGroup = settings.OneShotGroup;
     entry.MaxCandidates = settings.MaxCandidates;
     entry.QueryFrame = settings.QueryFrame;
     entry.TraceFlags = PackTraceFlags(forcedEdge, reseeded, fairFight, oneshotWindow,

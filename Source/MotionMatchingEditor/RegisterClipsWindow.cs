@@ -23,8 +23,10 @@ public class RegisterClipsWindow : CustomEditorWindow
         public string Name;
         public string BaseTag;
         public bool BaseLoop;
+        public int BaseGroup;
         public string Tag;
         public bool Loop;
+        public int Group;
         public bool Removed;
         public bool Dirty;
     }
@@ -33,6 +35,7 @@ public class RegisterClipsWindow : CustomEditorWindow
     private TextBoxElement _source;
     private TextBoxElement _tag;
     private CheckBoxElement _loop;
+    private IntegerValueElement _group;
 
     private LabelElement _count;
     private TextBoxElement _filter;
@@ -40,6 +43,8 @@ public class RegisterClipsWindow : CustomEditorWindow
     private LabelElement _clipName;
     private TextBoxElement _editTag;
     private CheckBoxElement _editLoop;
+    private IntegerValueElement _editGroup;
+    private LabelElement _aliasReport;
 
     private readonly List<StagedRow> _all = new();
     private readonly List<StagedRow> _visible = new();
@@ -60,6 +65,9 @@ public class RegisterClipsWindow : CustomEditorWindow
         _tag.TextBox.Text = string.Empty;
         _loop = layout.Checkbox("Loop Clips", "Wrap samples at clip boundaries.");
         _loop.CheckBox.Checked = false;
+        _group = layout.AddPropertyItem("Group", "Clip group for the one-shot group filter (0 = any). The host defines what the ids mean.").IntegerValue();
+        _group.IntValue.MinValue = 0;
+        _group.IntValue.Value = 0;
         var buttons = layout.HorizontalPanel();
         var browseFolder = buttons.Button("Browse Folder").Button;
         browseFolder.Clicked += BrowseFolder;
@@ -95,6 +103,8 @@ public class RegisterClipsWindow : CustomEditorWindow
         _clipName = layout.Label("-");
         _editTag = layout.AddPropertyItem("Tags", "Tags for the selected clip, '+'-separated.").TextBox();
         _editLoop = layout.Checkbox("Loop", "Wrap samples at clip boundaries.");
+        _editGroup = layout.AddPropertyItem("Group", "Clip group of the selected clip (0 = any).").IntegerValue();
+        _editGroup.IntValue.MinValue = 0;
         layout.Button("Set Selected (stage)").Button.Clicked += StageSelected;
         layout.Space(4);
         layout.Button("Tick Shown Loops").Button.Clicked += () => SetShownLoops(true);
@@ -104,7 +114,25 @@ public class RegisterClipsWindow : CustomEditorWindow
         layout.Button("Revert").Button.Clicked += RebuildList;
         layout.Button("Refresh List").Button.Clicked += RebuildList;
 
+        layout.Space(8);
+        layout.Button("Suggest Bone Aliases (clips vs PlayerModel)").Button.Clicked += SuggestAliases;
+        _aliasReport = layout.Label("-");
+
         RebuildList();
+    }
+
+    private void SuggestAliases()
+    {
+        if (_controller == null)
+            return;
+        // Same report the bake logs; suggestions go to Schema.BoneAliases
+        // after review (aliases only rename, they never fix proportions).
+        string report = MotionMatchingEditorService.DescribeChannelCoverage(_controller);
+        var suggestions = MotionMatchingEditorService.SuggestBoneAliases(_controller);
+        Debug.Log("Motion matching channel coverage:\n" + report);
+        _aliasReport.Label.Text = suggestions.Length == 0
+            ? "No alias suggestions (see the log for the coverage report)."
+            : string.Join("\n", suggestions.Select(a => a.Channel + " -> " + a.Node));
     }
 
     private void BrowseFolder()
@@ -162,7 +190,7 @@ public class RegisterClipsWindow : CustomEditorWindow
 
         if (files.Count > 0 && _controller != null)
         {
-            MotionMatchingEditorService.AddClipFiles(_controller, tags, files.ToArray(), _loop?.CheckBox.Checked ?? true);
+            MotionMatchingEditorService.AddClipFiles(_controller, tags, files.ToArray(), _loop?.CheckBox.Checked ?? true, _group?.IntValue.Value ?? 0);
             RebuildList();
         }
     }
@@ -183,8 +211,10 @@ public class RegisterClipsWindow : CustomEditorWindow
                     Name = MotionMatchingEditorService.GetRegisteredClipName(clip),
                     BaseTag = clip.Tag,
                     BaseLoop = clip.Loop,
+                    BaseGroup = clip.Group,
                     Tag = clip.Tag,
                     Loop = clip.Loop,
+                    Group = clip.Group,
                 });
             }
         }
@@ -226,6 +256,7 @@ public class RegisterClipsWindow : CustomEditorWindow
                 Name = row.Name,
                 Tag = row.Tag,
                 Loop = row.Loop,
+                Group = row.Group,
                 Dirty = row.Dirty,
             });
         }
@@ -247,12 +278,14 @@ public class RegisterClipsWindow : CustomEditorWindow
             _clipName.Label.Text = row.Name;
             _editTag.TextBox.Text = row.Tag;
             _editLoop.CheckBox.Checked = row.Loop;
+            _editGroup.IntValue.Value = row.Group;
         }
         else
         {
             _clipName.Label.Text = "-";
             _editTag.TextBox.Text = string.Empty;
             _editLoop.CheckBox.Checked = false;
+            _editGroup.IntValue.Value = 0;
         }
         _refreshing = false;
     }
@@ -281,7 +314,7 @@ public class RegisterClipsWindow : CustomEditorWindow
             return;
         var row = _visible[tableRow];
         row.Loop = !row.Loop;
-        row.Dirty = row.Tag != row.BaseTag || row.Loop != row.BaseLoop;
+        row.Dirty = IsDirty(row);
         SyncTableRow(tableRow, row);
         if (_table.SelectedRow == tableRow)
             ShowSelection();
@@ -306,9 +339,15 @@ public class RegisterClipsWindow : CustomEditorWindow
             return;
         row.Tag = tag;
         row.Loop = _editLoop.CheckBox.Checked;
-        row.Dirty = row.Tag != row.BaseTag || row.Loop != row.BaseLoop;
+        row.Group = Math.Max(0, _editGroup.IntValue.Value);
+        row.Dirty = IsDirty(row);
         SyncTableRow(_table.SelectedRow, row);
         UpdateCount();
+    }
+
+    private static bool IsDirty(StagedRow row)
+    {
+        return row.Tag != row.BaseTag || row.Loop != row.BaseLoop || row.Group != row.BaseGroup;
     }
 
     private void SyncTableRow(int tableRow, StagedRow row)
@@ -317,6 +356,7 @@ public class RegisterClipsWindow : CustomEditorWindow
             return;
         _table.Rows[tableRow].Tag = row.Tag;
         _table.Rows[tableRow].Loop = row.Loop;
+        _table.Rows[tableRow].Group = row.Group;
         _table.Rows[tableRow].Dirty = row.Dirty;
     }
 
@@ -326,7 +366,7 @@ public class RegisterClipsWindow : CustomEditorWindow
         {
             var row = _visible[i];
             row.Loop = loop;
-            row.Dirty = row.Tag != row.BaseTag || row.Loop != row.BaseLoop;
+            row.Dirty = IsDirty(row);
             SyncTableRow(i, row);
         }
         ShowSelection();
@@ -338,6 +378,7 @@ public class RegisterClipsWindow : CustomEditorWindow
         var updateIndices = new List<int>();
         var updateTags = new List<string>();
         var updateLoops = new List<bool>();
+        var updateGroups = new List<int>();
         var removeIndices = new List<int>();
         foreach (var row in _all)
         {
@@ -350,6 +391,7 @@ public class RegisterClipsWindow : CustomEditorWindow
                 updateIndices.Add(row.SourceIndex);
                 updateTags.Add(row.Tag);
                 updateLoops.Add(row.Loop);
+                updateGroups.Add(row.Group);
             }
         }
 
@@ -362,6 +404,7 @@ public class RegisterClipsWindow : CustomEditorWindow
             updateIndices.ToArray(),
             updateTags.ToArray(),
             updateLoops.ToArray(),
+            updateGroups.ToArray(),
             removeIndices.ToArray());
         RebuildList();
     }

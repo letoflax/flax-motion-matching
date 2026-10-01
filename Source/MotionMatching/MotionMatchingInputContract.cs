@@ -82,11 +82,13 @@ public struct MotionMatchingFrameInput
 
     // 3. Caller filter, taken verbatim (the core never infers any of it):
     // LoopFilter mirrors MotionLoopFilter (0 Any, 1 LoopOnly, 2 OneShotOnly);
-    // CandidateBand is the per-clip band id stored in the database (0 = any;
-    // the host defines what the ids mean); QueryYawRate (rad/s, >= 0) scales
-    // the straightness prior (weight 0 turns the prior off).
+    // ClipGroup is the one-shot clip group filter: one-shot clips of another
+    // non-zero group are skipped, loops and group-0 clips never are (0 = any;
+    // groups are authored in the clip registry and the host defines what the
+    // ids mean); QueryYawRate (rad/s, >= 0) scales the straightness prior
+    // (weight 0 turns the prior off).
     public int LoopFilter;
-    public int CandidateBand;
+    public int ClipGroup;
     public float QueryYawRate;
 
     // 4. Speed matching and reseed hold, both host decisions:
@@ -106,5 +108,5 @@ public struct MotionMatchingFrameInput
 // live Game-side request is LocomotionSelectionRequest
 // (Source/Game/Player/LocomotionSelectionPolicy.cs): scope crosses into the
 // core through MotionMatchingFrameInput above (direct path), intent/loop/
-// band mirrors stay Game-side until P2. No native struct field is added
+// group mirrors stay Game-side. No native struct field is added
 // (MotionMatchingTraceEntry stays 61/64 for the Flax 1.12 bindings cap).
