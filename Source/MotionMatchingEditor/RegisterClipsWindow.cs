@@ -68,7 +68,6 @@ public class RegisterClipsWindow : CustomEditorWindow
         var register = buttons.Button("Register").Button;
         register.Clicked += Register;
         var buttonPanel = buttons.ContainerControl;
-        bool heightsLogged = false;
         void FitButtons()
         {
             // Note: HorizontalPanel forces children height = panel height on
@@ -78,12 +77,6 @@ public class RegisterClipsWindow : CustomEditorWindow
             browseFolder.Width = width;
             browseFiles.Width = width;
             register.Width = width;
-            // TEMP diagnostic: log the settled sizes once so we can see who wins.
-            if (!heightsLogged && buttonPanel.Width > 200.0f)
-            {
-                heightsLogged = true;
-                Debug.Log($"[RegisterClips] panel={buttonPanel.Size} browse={browseFolder.Size} register={register.Size}");
-            }
         }
         buttonPanel.SizeChanged += _ => FitButtons();
         FitButtons();

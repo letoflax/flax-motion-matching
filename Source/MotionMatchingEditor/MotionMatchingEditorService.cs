@@ -261,20 +261,21 @@ public static class MotionMatchingEditorService
     }
 
     /// <summary>
-    /// P3 explicit audit command: scans the baked database and writes
-    /// Cache/MMClipAudit.txt on demand. Runtime init/play never produces
-    /// this file — tools must call this first (bridge clip_audit op or the
-    /// tuning window) instead of assuming a play session wrote it.
-    /// Returns a one-line summary or error.
+    /// Explicit audit command: scans the baked database and writes the
+    /// per-clip travel/turn/speed table to <paramref name="filePath"/>
+    /// (default: MMClipAudit.txt in the trace folder). Runtime init/play never
+    /// produces this file. Returns a one-line summary or error.
     /// </summary>
-    public static string GenerateClipAudit(MotionMatchingController controller)
+    public static string GenerateClipAudit(MotionMatchingController controller, string filePath = null)
     {
+        if (string.IsNullOrEmpty(filePath))
+            filePath = Path.Combine(TraceDefaultFolder(), "MMClipAudit.txt");
         if (controller == null)
             return "Clip audit failed: no controller.";
         if (!EnsureDatabaseLoaded(controller) || !controller.Database)
             return "Clip audit failed: database is not loaded.";
-        if (controller.GenerateClipAudit(out string error))
-            return "Clip audit written: Cache/MMClipAudit.txt.";
+        if (controller.GenerateClipAudit(filePath, out string error))
+            return "Clip audit written: " + filePath + ".";
         return "Clip audit failed: " + error;
     }
 
@@ -456,49 +457,6 @@ public static class MotionMatchingEditorService
 #else
         Debug.LogWarning("Motion matching self-test stopped: editor-only test is not available in game builds.");
 #endif
-    }
-
-    // Weight presets: scene Schema weights are live tuning — never baked
-    // into features — so presets apply immediately with no rebake, even
-    // mid-play. Rebake is only needed for feature changes.
-    public static void ApplyPresetBaseline(MotionMatchingController controller, Action onEdited = null)
-    {
-        if (controller == null)
-            return;
-        controller.Schema.PoseWeight = 1.0f;
-        controller.Schema.TrajectoryWeight = 2.0f;
-        MarkTuningEdited(controller, "baseline (trajectory-heavy)", onEdited);
-    }
-
-    public static void ApplyPresetPosePrecision(MotionMatchingController controller, Action onEdited = null)
-    {
-        if (controller == null)
-            return;
-        controller.Schema.PoseWeight = 2.5f;
-        controller.Schema.TrajectoryWeight = 1.0f;
-        MarkTuningEdited(controller, "pose-heavy precision", onEdited);
-    }
-
-    public static void ApplyPresetTurnHeavy(MotionMatchingController controller, Action onEdited = null)
-    {
-        if (controller == null)
-            return;
-        controller.Schema.PoseWeight = 1.0f;
-        controller.Schema.TrajectoryWeight = 3.0f;
-        MarkTuningEdited(controller, "turn-heavy", onEdited);
-    }
-
-    private static void MarkTuningEdited(MotionMatchingController controller, string preset, Action onEdited = null)
-    {
-        Debug.Log($"Motion matching weights preset applied: {preset} " +
-            $"(pose={controller.Schema.PoseWeight}, trajectory={controller.Schema.TrajectoryWeight}). No rebake needed.");
-        try
-        {
-            onEdited?.Invoke();
-        }
-        catch
-        {
-        }
     }
 
     /// <summary>

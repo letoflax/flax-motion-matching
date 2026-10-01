@@ -322,8 +322,8 @@ public:
         String& error);
 
     /// <summary>
-    /// Converts 6 actor-local trajectory points (X = right, Z = forward, as produced
-    /// by MotionMatchingTrajectory) into 30 raw trajectory features in the root
+    /// Converts 6 actor-local trajectory points (X = right, Z = forward, as predicted
+    /// by the host) into 30 raw trajectory features in the root
     /// node's local frame, mirroring the baker's planar projection exactly
     /// (plus the yaw-rate channel derived from facing deltas).
     /// </summary>

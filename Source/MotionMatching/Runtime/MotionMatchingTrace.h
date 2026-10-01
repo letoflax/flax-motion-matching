@@ -176,7 +176,7 @@ private:
 
 public:
     // Debug-only gate: recording costs a pose+trajectory clone per query.
-    // The policy enables this only from EffectiveTelemetry.
+    // The controller enables this only from Diagnostics.
     API_FIELD() bool Enabled = true;
 
     API_PROPERTY() int32 GetCount() const;

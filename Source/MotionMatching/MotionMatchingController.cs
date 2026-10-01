@@ -39,16 +39,11 @@ public class MotionMatchingController : IDisposable
 
     public int[] AnimationClipCountsByTag = Array.Empty<int>();
 
-    // Host-assigned session config (set by the game facade, e.g. from
-    // automation flags — this class never reads automation itself).
-    public string CacheFolder = string.Empty;
-    public bool TelemetryOverride = false;
-    public bool IndexedVerifyAuto = false;
-    // P4: trace override for test runs (auto_test/auto_demo need replay
-    // trace even when telemetry file is off, so on/off search equivalence
-    // can be proven by comparing winners). Shipping play (no flags) leaves
-    // both false → no per-query allocations beyond the fixed rings.
-    public bool TraceOverride = false;
+    // Diagnostics (debug only, off by default): records every query into the
+    // bounded trace ring (Trace) and collects per-class search diagnostics.
+    // Never changes which clip wins. Export the trace with Trace.ExportJson /
+    // ExportCsv to a path the host chooses.
+    public bool Diagnostics = false;
 
     public AnimatedModel CharacterBody;
 
@@ -170,15 +165,8 @@ public class MotionMatchingController : IDisposable
     // single path, no parallel blend modes).
     public float InertializationDuration = 0.25f;
 
-    public bool TelemetryLog = false;
-
-    // Effective switch: the host field above never changes at runtime —
-    // the host flips TelemetryOverride (e.g. from file-driven automation),
-    // so the scene is never dirtied by a play session.
-    public bool EffectiveTelemetry => TelemetryLog || TelemetryOverride;
-
-    // Telemetry mirrors (getters: written only by Update below, read by the
-    // game facade / editor service / bridge).
+    // Observation mirrors (written only by Update below, read by the host,
+    // editor service and tools).
     public string PolicyState { get; private set; } = "Disabled";
     public int WinnerSample { get; private set; } = -1;
     public int WinnerClip { get; private set; } = -1;
@@ -211,31 +199,20 @@ public class MotionMatchingController : IDisposable
     public string LastSwitchReason { get; private set; } = string.Empty;
     public string ChooserStatus { get; private set; } = string.Empty;
     public int TraceEntries { get; private set; }
-    // P0 additive profiling mirrors (record-only; copied from the native
-    // policy after each Update, never steer anything).
-    // P4: LastTelemetryMs now measures bounded-ring enqueue (ns), not file
-    // I/O — Tick never does file I/O; FlushTelemetry (explicit, session end)
-    // is the only file writer. TelemetryCount/Dropped mirror the ring.
+    // Profiling mirrors (record-only; copied from the native policy after
+    // each Update, never steer anything).
     public float LastTickMs { get; private set; }
     public float LastFastPathMs { get; private set; }
-    public float LastTelemetryMs { get; private set; }
     public int TickCount { get; private set; }
     public int FullSearchCount { get; private set; }
     public float TotalTickMs { get; private set; }
     public float TotalFullSearchMs { get; private set; }
     public float TotalFastPathMs { get; private set; }
-    public float TotalTelemetryMs { get; private set; }
-    public int TelemetryCount { get; private set; }
-    public int TelemetryDropped { get; private set; }
 
-    // P2: machine/overlay/IK telemetry deleted with their producers
-    // (HoldCount, TurnReplayCount, SettleCount, RecoveryCount, JumpCount,
-    // LayerAngle/Primary/Secondary/GateApplied, FootLockL/R, FootCorrL/R).
-    // Search telemetry above (switches, seeks, query ms, fast path) stays.
     public int FastPathHits { get; private set; }
 
     private MotionMatchingRuntimePolicy _policy;
-    private bool _telemetryWarned;
+    private bool _diagnosticsWarned;
     private MotionMatchingDatabase _boundDatabase;
     private AnimatedModel _boundBody;
     private SkinnedModel _boundModel;
@@ -340,59 +317,12 @@ public class MotionMatchingController : IDisposable
     }
 
     /// <summary>
-    /// P4 explicit telemetry flush (the ONLY writer of MMTelemetry.jsonl).
-    /// Formats the bounded native ring as JSONL + writes the file. Host
-    /// session-end only (export path), never per-tick. Returns false with a
-    /// visible error when the ring is empty, the cache folder is unset, or
-    /// the file cannot be written. Overwritten drops are counted in
-    /// TelemetryDropped.
+    /// Explicit audit command: writes the per-clip travel/turn/speed table
+    /// to <paramref name="filePath"/>. Static native export: runs in edit
+    /// mode with no play/policy instance. Runtime init/play never scans the
+    /// database or writes files.
     /// </summary>
-    public bool FlushTelemetry(out string error)
-    {
-        error = string.Empty;
-        if (!IsReady)
-        {
-            error = "Telemetry flush stopped: policy is not ready.";
-            return false;
-        }
-        try
-        {
-            return _policy.FlushTelemetry(out error);
-        }
-        catch (System.Exception ex)
-        {
-            error = "Telemetry flush stopped: " + ex.Message;
-            return false;
-        }
-    }
-
-    /// <summary>
-    /// P4 explicit telemetry clear (no file deletion: init never touches
-    /// MMTelemetry.jsonl; tools read whatever the last flush left behind).
-    /// Resets the ring head/count/dropped to the bounded disabled state.
-    /// </summary>
-    public void ClearTelemetry()
-    {
-        ReleaseStaleBinding();
-        if (_policy == null)
-            return;
-        try
-        {
-            _policy.ClearTelemetry();
-        }
-        catch
-        {
-        }
-    }
-
-    /// <summary>
-    /// P3 explicit audit command (the ONLY writer of MMClipAudit.txt).
-    /// Static native export: runs in edit mode with no play/policy instance.
-    /// Runtime init/play never scans the database or writes the file — call
-    /// this from the editor service / bridge clip_audit op when tools need
-    /// per-clip travel/turn/speed data.
-    /// </summary>
-    public bool GenerateClipAudit(out string error)
+    public bool GenerateClipAudit(string filePath, out string error)
     {
         error = string.Empty;
         if (Database == null || !Database.IsBaked)
@@ -403,7 +333,7 @@ public class MotionMatchingController : IDisposable
         try
         {
             return MotionMatchingRuntimePolicy.ExportClipAudit(
-                Database, CacheFolder ?? string.Empty, Schema.SampleRate, out error);
+                Database, filePath ?? string.Empty, Schema.SampleRate, out error);
         }
         catch (System.Exception ex)
         {
@@ -431,7 +361,7 @@ public class MotionMatchingController : IDisposable
     /// <summary>
     /// Releases the owned native policy, playback and trace immediately, then
     /// schedules destruction of the policy object. Idempotent; call on the
-    /// Flax main thread on host disable/destroy. Export traces/telemetry first.
+    /// Flax main thread on host disable/destroy. Export the trace first.
     /// Configuration and host-owned assets are retained for editor tooling and
     /// reuse: a subsequent Update starts a fresh session without requiring Initialize.
     /// Previously borrowed Playback/Trace handles are invalid after this call.
@@ -446,7 +376,6 @@ public class MotionMatchingController : IDisposable
         _boundSchema = default;
         _sampleTimesDb = null;
         _sampleTimesCache = Array.Empty<float>();
-        _telemetryWarned = false;
         ResetRuntimeStatus();
         if (policy)
         {
@@ -501,9 +430,9 @@ public class MotionMatchingController : IDisposable
         WinnerIsLoop = false;
         SwitchCount = SeekCount = LoopScoredCount = OneShotScoredCount = 0;
         LoopTotalCount = OneShotTotalCount = TraceEntries = FastPathHits = 0;
-        LastQueryMs = LastTickMs = LastFastPathMs = LastTelemetryMs = 0.0f;
-        TickCount = FullSearchCount = TelemetryCount = TelemetryDropped = 0;
-        TotalTickMs = TotalFullSearchMs = TotalFastPathMs = TotalTelemetryMs = 0.0f;
+        LastQueryMs = LastTickMs = LastFastPathMs = 0.0f;
+        TickCount = FullSearchCount = 0;
+        TotalTickMs = TotalFullSearchMs = TotalFastPathMs = 0.0f;
     }
 
     // P3: the P2 rebuild-compat reflection shim for the legacy native scope
@@ -538,13 +467,7 @@ public class MotionMatchingController : IDisposable
             if (!Database || !Database.IsBaked || !CharacterBody.SkinnedModel)
                 return;
             _policy = new MotionMatchingRuntimePolicy();
-            // P4: no file deletion in init/update (gate: no del-file in core
-            // path). The native Initialize clears the bounded telemetry ring
-            // to the disabled state; FlushTelemetry (explicit, session end)
-            // is the only file writer. Tools read whatever the last flush
-            // left behind — init never touches MMTelemetry.jsonl.
-            _policy.Initialize(Database, CharacterBody, Schema,
-                CacheFolder ?? string.Empty, InertializationDuration);
+            _policy.Initialize(Database, CharacterBody, Schema, InertializationDuration);
             if (!_policy.IsReady)
             {
                 Shutdown();
@@ -561,20 +484,12 @@ public class MotionMatchingController : IDisposable
         if (!_policy.IsReady)
             return;
 
-        // Debug-only trace gate with a visible warning (codex review): the
-        // host TelemetryLog field is never written at runtime; the host
-        // flips only TelemetryOverride above.
-        // P4: trace stays on for test runs (TraceOverride from auto_test/
-        // auto_demo) even when the telemetry file is off, so on/off search
-        // equivalence can be proven by comparing trace winners. Shipping
-        // play (no flags) leaves both false → no per-query allocations
-        // beyond the fixed rings.
         if (_policy.GetTrace() != null)
-            _policy.GetTrace().Enabled = EffectiveTelemetry || TraceOverride;
-        if (EffectiveTelemetry && !_telemetryWarned)
+            _policy.GetTrace().Enabled = Diagnostics;
+        if (Diagnostics && !_diagnosticsWarned)
         {
-            _telemetryWarned = true;
-            Debug.LogWarning("Motion matching telemetry/trace is ACTIVE (debug-only: per-query clones + bounded-ring enqueue, file flush at session end only). Turn off TelemetryLog for shipping builds.");
+            _diagnosticsWarned = true;
+            Debug.LogWarning("Motion matching diagnostics are ACTIVE (debug only: every query is recorded into the trace ring). Turn off MotionMatchingController.Diagnostics for shipping builds.");
         }
 
         // P2: the snapshot carries the caller scope only (movement fields
@@ -603,8 +518,7 @@ public class MotionMatchingController : IDisposable
             UseIndexedSearch = UseIndexedSearch,
             TopKCandidates = TopKCandidates,
             VerifyIndexedSearch = VerifyIndexedSearch,
-            IndexedVerifyAuto = IndexedVerifyAuto,
-            EffectiveTelemetry = EffectiveTelemetry,
+            Diagnostics = Diagnostics,
             ContinuityWeight = ContinuityWeight,
             CostFuseThreshold = CostFuseThreshold,
             TurnPenaltyWeight = TurnPenaltyWeight,
@@ -661,15 +575,11 @@ public class MotionMatchingController : IDisposable
         // P0 profiling mirrors (record-only).
         LastTickMs = _policy.LastTickMs;
         LastFastPathMs = _policy.LastFastPathMs;
-        LastTelemetryMs = _policy.LastTelemetryMs;
         TickCount = _policy.TickCount;
         FullSearchCount = _policy.FullSearchCount;
         TotalTickMs = _policy.TotalTickMs;
         TotalFullSearchMs = _policy.TotalFullSearchMs;
         TotalFastPathMs = _policy.TotalFastPathMs;
-        TotalTelemetryMs = _policy.TotalTelemetryMs;
-        TelemetryCount = _policy.GetTelemetryCount();
-        TelemetryDropped = _policy.GetTelemetryDropped();
     }
 
     // M6: the policy's query trace (null until the first play tick). The

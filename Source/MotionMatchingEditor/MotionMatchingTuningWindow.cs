@@ -9,8 +9,8 @@ namespace MotionMatching;
 
 /// <summary>
 /// M6 tuning window (plan Milestone 6): database validity, live query
-/// telemetry, top-N cost ranking for the last recorded query, trace
-/// export/import/replay, and weight presets. Top-N and replay run on
+/// query stats, top-N cost ranking for the last recorded query, trace
+/// export/import/replay. Top-N and replay run on
 /// recorded inputs, so they work paused in the editor with no play input.
 /// Text rows (no owner-drawn table): 8 fixed labels, updated on demand.
 /// </summary>
@@ -55,16 +55,6 @@ public class MotionMatchingTuningWindow : CustomEditorWindow
         topButton.Clicked += QueryTop;
         layout.Space(4);
 
-        layout.Label("Weight Presets (live, no rebake)", TextAlignment.Near);
-        var presets = layout.HorizontalPanel();
-        var baseline = presets.Button("Baseline").Button;
-        baseline.Clicked += () => { if (_controller != null) { MotionMatchingEditorService.ApplyPresetBaseline(_controller, _onEdited); ApplyPresetDone("baseline"); } };
-        var precision = presets.Button("Pose Precision").Button;
-        precision.Clicked += () => { if (_controller != null) { MotionMatchingEditorService.ApplyPresetPosePrecision(_controller, _onEdited); ApplyPresetDone("pose precision"); } };
-        var turn = presets.Button("Turn Heavy").Button;
-        turn.Clicked += () => { if (_controller != null) { MotionMatchingEditorService.ApplyPresetTurnHeavy(_controller, _onEdited); ApplyPresetDone("turn heavy"); } };
-        layout.Space(4);
-
         layout.Label("Trace (Cache/MMTrace.jsonl, Cache/MMTrace.csv)", TextAlignment.Near);
         var traceRow = layout.HorizontalPanel();
         var exportJson = traceRow.Button("Export JSON").Button;
@@ -80,12 +70,6 @@ public class MotionMatchingTuningWindow : CustomEditorWindow
         clear.Clicked += ClearTrace;
         _status = layout.Label("trace: -");
 
-        RefreshAll();
-    }
-
-    private void ApplyPresetDone(string name)
-    {
-        _status.Label.Text = "preset: " + name + " applied (live, no rebake).";
         RefreshAll();
     }
 

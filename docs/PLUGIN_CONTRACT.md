@@ -25,6 +25,10 @@ boundary receives only plain scope/filter data and trajectory points.
 - `TrajectoryPoint.Position` and `Facing` are character-local samples. Their
   interpretation uses the schema root forward/up axes; do not assume a global
   world axis in a host integration.
+- The plugin does not predict trajectories. The host produces one point per
+  `SampleTimes` entry (past from its own history, future from its own motion
+  model) in the actor frame, X = right and Z = forward. The flax-test game does
+  this in `Source/Game/Animation/Trajectory/TrajectoryPredictor.cs`.
 - `SampleTimes` must contain the six strictly ascending times used by the
   schema, spanning negative and positive time around zero.
 - A host tick updates its provider state, calls `BuildInput(context)`, then
@@ -85,9 +89,10 @@ behavior.
 
 `Playback`, `Trace`, and similar native handles are borrowed. `Shutdown` is
 public and idempotent; it releases policy/playback/trace state and leaves host
-configuration reusable. Call it on host disable/destroy. Export trace and
-telemetry before shutdown when those diagnostics are enabled.
+configuration reusable. Call it on host disable/destroy. Export the trace
+before shutdown when `Diagnostics` is enabled.
 
-`FlushTelemetry` is an explicit session-end operation. Runtime ticks do not
-write telemetry files. `GenerateClipAudit` is also explicit and editor/tool
-driven; initialization and play do not scan the database to create an audit.
+The runtime never writes files. `Trace.ExportJson`/`ExportCsv` and
+`GenerateClipAudit(filePath, ...)` are explicit host/tool operations that take
+the destination path from the caller; initialization and play do not scan the
+database to create an audit.

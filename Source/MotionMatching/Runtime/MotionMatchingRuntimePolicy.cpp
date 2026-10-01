@@ -123,14 +123,12 @@ void MotionMatchingRuntimePolicy::Initialize(
     MotionMatchingDatabase* database,
     AnimatedModel* body,
     const PoseSearchSchema& schema,
-    const String& cacheFolder,
     float defaultInertial)
 {
     Shutdown();
     _database = database;
     _body = body;
     _liveSchema = schema;
-    _cacheFolder = cacheFolder;
     _playback = New<MotionMatchingPlayback>();
     _playback->InertializationDuration = defaultInertial > 0.01f ? defaultInertial : 0.25f;
     _trace = New<MotionMatchingTraceLog>();
@@ -214,9 +212,6 @@ void MotionMatchingRuntimePolicy::Initialize(
     _samplingReady = true;
     PolicyState = String(TEXT("Active"));
     _trace->Clear();
-    _telemetryHead = 0;
-    _telemetryCount = 0;
-    _telemetryDropped = 0;
     _lastEntry = MotionMatchingTraceEntry();
     LastSwitchReason = String(TEXT("init"));
     ChooserStatusText = String::Empty;
@@ -228,7 +223,6 @@ void MotionMatchingRuntimePolicy::Shutdown()
     _database = nullptr;
     _body = nullptr;
     _liveSchema = PoseSearchSchema();
-    _cacheFolder = String::Empty;
     _nodes = NodeIndices();
     _prevPositions.Clear();
     _packedTrajectory.Clear();
@@ -259,9 +253,6 @@ void MotionMatchingRuntimePolicy::Shutdown()
     _clipTags.Clear();
     _clipSpeeds.Clear();
     _clipSpeedsDbId = 0;
-    _telemetryHead = 0;
-    _telemetryCount = 0;
-    _telemetryDropped = 0;
     _queryTagsKey = String::Empty;
     _queryTagsCache.Clear();
     _queryExcludedKey = String::Empty;
@@ -291,23 +282,21 @@ void MotionMatchingRuntimePolicy::EnsureClipTagCache()
         _clipTags[c] = db->GetClipTags(c);
 }
 
-bool MotionMatchingRuntimePolicy::ExportClipAudit(MotionMatchingDatabase* db, const String& cacheFolder, float sampleRate, String& error)
+bool MotionMatchingRuntimePolicy::ExportClipAudit(MotionMatchingDatabase* db, const String& filePath, float sampleRate, String& error)
 {
-    // P3 explicit editor/tool command (the ONLY writer of MMClipAudit.txt).
+    // Explicit editor/tool command: writes the audit table to filePath.
     // Static: runs in edit mode with no policy/playback instance. Init/play
-    // never call this — tools run it on demand (editor service / bridge
-    // clip_audit op). Same file format as the old init-time write
-    // (index|name|tags|loop|turn|travel|net|yaw|len|speed), computed into
-    // locals — no scan arrays survive on the runtime.
+    // never call this. Columns: index|name|tags|loop|turn|travel|net|yaw|len|speed,
+    // computed into locals (no scan arrays survive on the runtime).
     error = String::Empty;
     if (db == nullptr || !db->IsBaked())
     {
         error = String(TEXT("Clip audit stopped: database is not baked."));
         return false;
     }
-    if (cacheFolder.IsEmpty())
+    if (filePath.IsEmpty())
     {
-        error = String(TEXT("Clip audit stopped: cache folder is not set."));
+        error = String(TEXT("Clip audit stopped: no output file path."));
         return false;
     }
     const int32 clipCount = db->GetClipCount();
@@ -477,14 +466,12 @@ bool MotionMatchingRuntimePolicy::ExportClipAudit(MotionMatchingDatabase* db, co
     }
     String text;
     sb.ToString(text);
-    const StringAnsi folderAnsi(cacheFolder);
-    char path[1024];
-    snprintf(path, sizeof(path), "%s/MMClipAudit.txt", folderAnsi.GetText());
+    const StringAnsi pathAnsi(filePath);
     const StringAnsi bodyAnsi(text);
-    FILE* file = fopen(path, "wb");
+    FILE* file = fopen(pathAnsi.GetText(), "wb");
     if (file == nullptr)
     {
-        error = String(TEXT("Clip audit stopped: cannot write MMClipAudit.txt."));
+        error = String(TEXT("Clip audit stopped: cannot write ")) + filePath + String(TEXT("."));
         return false;
     }
     fwrite(bodyAnsi.GetText(), 1, (size_t)bodyAnsi.Length(), file);
@@ -1158,12 +1145,9 @@ void MotionMatchingRuntimePolicy::RunQuery(const Array<TrajectoryPoint>& traject
     // caller filter; the core budgets uniformly.
     settings.MaxCandidates = MaxI(_tuning.FrameSearchBudget, 0);
     settings.QueryFrame = _policyFrame;
-    // Phase 1 indexed search (default off; brute force reference).
-    // Phase 2 audit file-harness also forces both flags (no default
-    // or scene change needed to measure divergence).
-    settings.UseIndexedSearch = _tuning.UseIndexedSearch || _tuning.IndexedVerifyAuto;
+    settings.UseIndexedSearch = _tuning.UseIndexedSearch;
     settings.TopKCandidates = MaxI(1, _tuning.TopKCandidates);
-    settings.VerifyIndexedSearch = _tuning.VerifyIndexedSearch || _tuning.IndexedVerifyAuto;
+    settings.VerifyIndexedSearch = _tuning.VerifyIndexedSearch;
     settings.QueryYawRate = yawRate;
     settings.TurnPenaltyWeight = _tuning.TurnPenaltyWeight;
     settings.TurnPenaltyYawScale = _tuning.TurnPenaltyYawScale;
@@ -1182,7 +1166,7 @@ void MotionMatchingRuntimePolicy::RunQuery(const Array<TrajectoryPoint>& traject
     // P5: change-only split via the shared cache (steady-state reuses).
     if (!_snapshot.ExcludedTagSet.IsEmpty())
         settings.ExcludeTags = GetCachedExcluded();
-    settings.CollectClassDiagnostics = _tuning.EffectiveTelemetry;
+    settings.CollectClassDiagnostics = _tuning.Diagnostics;
 
     // §18.8: capture the query signature this full scan anchors the fast
     // path against (clip/time cannot change until Play below).
@@ -1317,8 +1301,6 @@ void MotionMatchingRuntimePolicy::RunQuery(const Array<TrajectoryPoint>& traject
         timeError = diff;
     }
     LastTimeError = timeError;
-    RecordTelemetry(yawRate, tags, result,
-        Float3(actorWorld.M41, actorWorld.M42, actorWorld.M43), timeError);
 
     const bool didSwitch = result.ClipIndex != _currentClip;
     // Cost fuse: one absurd-cost winner never overturns steady tracking.
@@ -1907,194 +1889,3 @@ float MotionMatchingRuntimePolicy::Wrap180(float a)
 
 
 // P2: legacy unconstrained chooser deleted (was here).
-
-void MotionMatchingRuntimePolicy::RecordTelemetry(float yawRate, const Array<String>& tags,
-    const MotionMatchingResult& result, const Float3& actorPos, float timeError)
-{
-    // P4 bounded enqueue only: no JSON formatting, no file I/O in Tick.
-    // Gated by EffectiveTelemetry (caller checks before calling? No — check
-    // here so off-ticks are a single branch with zero allocation).
-    if (!_tuning.EffectiveTelemetry)
-        return;
-    // P5: tags rides ActiveTag now (see below); the array param is kept for
-    // signature stability (bridge/tools call sites + header decl).
-    (void)tags;
-    const auto ioStart = std::chrono::high_resolution_clock::now();
-    TelemetryRecord rec;
-    rec.Time = Time::GetGameTime();
-    rec.YawRate = yawRate;
-    rec.ClipIndex = result.ClipIndex;
-    rec.SampleIndex = result.SampleIndex;
-    rec.Cost = result.Cost;
-    rec.PoseCost = result.PoseCost;
-    rec.TrajectoryCost = result.TrajectoryCost;
-    rec.ContinuityCost = result.ContinuityCost;
-    rec.LoopCost = result.LoopCost;
-    rec.SecondBestCost = result.SecondBestCost;
-    rec.QueryMs = LastQueryMs;
-    rec.SwitchCount = SwitchCount;
-    rec.SeekCount = SeekCount;
-    rec.CurrentClip = _currentClip;
-    rec.PlaybackTime = _playback != nullptr ? _playback->CurrentTime : -1.0f;
-    rec.PlayRate = _playback != nullptr ? _playback->GetPlayRateAfter() : 1.0f;
-    rec.EffectiveDt = _playback != nullptr ? _playback->LastEffectiveDt : 0.0f;
-    rec.Cycle = _playback != nullptr ? _playback->ClipCycle : 0;
-    rec.TimeError = timeError;
-    rec.BestLoopClip = result.BestLoopClip;
-    rec.BestLoopCost = result.BestLoopCost;
-    rec.BestOneShotClip = result.BestOneShotClip;
-    rec.BestOneShotCost = result.BestOneShotCost;
-    rec.LoopScored = result.LoopScoredCount;
-    rec.OneShotScored = result.OneShotScoredCount;
-    rec.LoopTotal = result.LoopTotalCount;
-    rec.OneShotTotal = result.OneShotTotalCount;
-    rec.LoopPreference = LoopPreferenceApplied;
-    rec.ActorPos = actorPos;
-    // P5: single copy of the already-joined scope instead of a per-tag
-    // concat loop. Content-identical: the only RecordTelemetry call site
-    // passes the allowed-tags array whose Join is ActiveTag (non-empty
-    // valid-result path; ActiveTag is rebuilt on every scope change).
-    rec.Tags = ActiveTag;
-    _telemetryRing[_telemetryHead] = rec;
-    _telemetryHead = (_telemetryHead + 1) % TelemetryCapacity;
-    if (_telemetryCount < TelemetryCapacity)
-        _telemetryCount++;
-    else
-        _telemetryDropped++;
-    {
-        const auto ioEnd = std::chrono::high_resolution_clock::now();
-        const float ioMs = (float)std::chrono::duration<double, std::milli>(ioEnd - ioStart).count();
-        LastTelemetryMs = ioMs;
-        TotalTelemetryMs += ioMs;
-    }
-    // Telemetry must never break gameplay: enqueue above cannot fail
-    // (fixed ring, no file I/O). No silent file errors anymore — export
-    // failures surface via FlushTelemetry (explicit tooling).
-}
-
-int32 MotionMatchingRuntimePolicy::GetTelemetryCount() const
-{
-    return _telemetryCount;
-}
-
-int32 MotionMatchingRuntimePolicy::GetTelemetryDropped() const
-{
-    return _telemetryDropped;
-}
-
-void MotionMatchingRuntimePolicy::ClearTelemetry()
-{
-    _telemetryHead = 0;
-    _telemetryCount = 0;
-    _telemetryDropped = 0;
-    LastTelemetryMs = 0.0f;
-}
-
-bool MotionMatchingRuntimePolicy::FlushTelemetry(String& error)
-{
-    // P4 explicit tooling flush (the ONLY writer of MMTelemetry.jsonl).
-    // Formats the bounded ring as JSONL + writes the file. Never called
-    // from Tick/RunQuery/TryFastPath/Initialize — only from the C#
-    // controller FlushTelemetry at session end (or bridge/tooling).
-    // P4 path fix: CacheFolder already IS the Cache dir (project/Cache),
-    // so the file is CacheFolder/MMTelemetry.jsonl (single). The old
-    // per-tick writer used CacheFolder/Cache/... (double Cache bug).
-    error = String::Empty;
-    if (_telemetryCount == 0)
-    {
-        error = String(TEXT("Telemetry flush skipped: no records (telemetry was off or no queries ran)."));
-        return false;
-    }
-    if (_cacheFolder.IsEmpty())
-    {
-        error = String(TEXT("Telemetry flush stopped: cache folder is not set."));
-        return false;
-    }
-    const auto flushStart = std::chrono::high_resolution_clock::now();
-    StringBuilder sb;
-    char line[2048];
-    char tagBuf[128];
-    for (int32 n = 0; n < _telemetryCount; n++)
-    {
-        const TelemetryRecord& r = _telemetryRing[(_telemetryHead - _telemetryCount + n + TelemetryCapacity * 2) % TelemetryCapacity];
-        tagBuf[0] = '\0';
-        if (!r.Tags.IsEmpty())
-        {
-            const StringAnsi tagsAnsi(r.Tags);
-            strncpy(tagBuf, tagsAnsi.GetText(), sizeof(tagBuf) - 1);
-            tagBuf[sizeof(tagBuf) - 1] = '\0';
-        }
-        const String clipName = GetClipName(r.ClipIndex);
-        const String bestLoopName = GetClipName(r.BestLoopClip);
-        const String bestOneName = GetClipName(r.BestOneShotClip);
-        const StringAnsi clipAnsi(clipName);
-        const StringAnsi loopAnsi(bestLoopName);
-        const StringAnsi oneAnsi(bestOneName);
-        char fCost[32], fPose[32], fTraj[32], fCont[32], fLoop[32], fSecond[32];
-        char fBl[32], fBo[32], fQms[32], fPt[32], fRate[32], fDt[32], fErr[32];
-        char fYaw[32], fT[32], fPx[32], fPy[32], fPz[32], fPref[32];
-        FormatFloatText(r.Cost, fCost, sizeof(fCost));
-        FormatFloatText(r.PoseCost, fPose, sizeof(fPose));
-        FormatFloatText(r.TrajectoryCost, fTraj, sizeof(fTraj));
-        FormatFloatText(r.ContinuityCost, fCont, sizeof(fCont));
-        FormatFloatText(r.LoopCost, fLoop, sizeof(fLoop));
-        FormatFloatText(r.SecondBestCost, fSecond, sizeof(fSecond));
-        FormatFloatText(r.BestLoopCost, fBl, sizeof(fBl));
-        FormatFloatText(r.BestOneShotCost, fBo, sizeof(fBo));
-        FormatFloatText(r.QueryMs, fQms, sizeof(fQms));
-        FormatFloatText(r.PlaybackTime, fPt, sizeof(fPt));
-        FormatFloatText(r.PlayRate, fRate, sizeof(fRate));
-        FormatFloatText(r.EffectiveDt, fDt, sizeof(fDt));
-        FormatFloatText(r.TimeError, fErr, sizeof(fErr));
-        FormatFloatText(r.YawRate, fYaw, sizeof(fYaw));
-        FormatFloatText(r.Time, fT, sizeof(fT));
-        FormatFloatText(r.ActorPos.X, fPx, sizeof(fPx));
-        FormatFloatText(r.ActorPos.Y, fPy, sizeof(fPy));
-        FormatFloatText(r.ActorPos.Z, fPz, sizeof(fPz));
-        FormatFloatText(r.LoopPreference, fPref, sizeof(fPref));
-        snprintf(line, sizeof(line),
-            "{\"t\":%s,\"state\":\"Locomotion\",\"tags\":\"%s\",\"speed\":0.0,\"yaw\":%s,\"grounded\":1,"
-            "\"clip\":%d,\"name\":\"%s\",\"sample\":%d,\"cost\":%s,\"pose\":%s,\"traj\":%s,\"cont\":%s,\"loop\":%s,"
-            "\"second\":%s,\"bestLoop\":\"%s:%s\",\"bestOne\":\"%s:%s\",\"loopN\":%d,\"oneN\":%d,"
-            "\"loopT\":%d,\"oneT\":%d,"
-            "\"pref\":%s,\"switches\":%d,\"seeks\":%d,\"cur\":%d,\"ptime\":%s,\"atEnd\":0,"
-            "\"px\":%s,\"py\":%s,\"pz\":%s,\"des\":0.0,"
-            "\"rateB\":1.000,\"rateA\":%s,\"effDt\":%s,\"cycle\":%d,\"tErr\":%s}\n",
-            fT, tagBuf, fYaw,
-            r.ClipIndex, clipAnsi.GetText(), r.SampleIndex, fCost, fPose, fTraj, fCont, fLoop,
-            fSecond, loopAnsi.GetText(), fBl, oneAnsi.GetText(), fBo,
-            r.LoopScored, r.OneShotScored,
-            r.LoopTotal, r.OneShotTotal,
-            fPref, r.SwitchCount, r.SeekCount, r.CurrentClip, fPt,
-            fPx, fPy, fPz,
-            fRate, fDt, r.Cycle, fErr);
-        sb.Append(line);
-    }
-    String text;
-    sb.ToString(text);
-    const StringAnsi folderAnsi(_cacheFolder);
-    char path[1024];
-    snprintf(path, sizeof(path), "%s/MMTelemetry.jsonl", folderAnsi.GetText());
-    const StringAnsi bodyAnsi(text);
-    FILE* file = fopen(path, "wb");
-    if (file == nullptr)
-    {
-        error = String(TEXT("Telemetry flush stopped: cannot write MMTelemetry.jsonl."));
-        LOG(Warning, "Motion matching telemetry flush failed: cannot write MMTelemetry.jsonl ({} records, {} dropped).", _telemetryCount, _telemetryDropped);
-        return false;
-    }
-    const size_t written = fwrite(bodyAnsi.GetText(), 1, (size_t)bodyAnsi.Length(), file);
-    fclose(file);
-    if ((int32)written != bodyAnsi.Length())
-    {
-        error = String(TEXT("Telemetry flush incomplete: file write truncated."));
-        LOG(Warning, "Motion matching telemetry flush incomplete: {}/{} bytes ({} records, {} dropped).", (int32)written, bodyAnsi.Length(), _telemetryCount, _telemetryDropped);
-        return false;
-    }
-    {
-        const auto flushEnd = std::chrono::high_resolution_clock::now();
-        const double flushMs = std::chrono::duration<double, std::milli>(flushEnd - flushStart).count();
-        LOG(Info, "Motion matching telemetry flushed: {} records, {} dropped, {:.1f} ms -> MMTelemetry.jsonl.", _telemetryCount, _telemetryDropped, flushMs);
-    }
-    return true;
-}

@@ -73,8 +73,8 @@ struct MOTIONMATCHING_API MotionMatchingPolicyTuning
     API_FIELD() bool UseIndexedSearch = true;
     API_FIELD() int32 TopKCandidates = 16;
     API_FIELD() bool VerifyIndexedSearch = false;
-    API_FIELD() bool IndexedVerifyAuto = false;
-    API_FIELD() bool EffectiveTelemetry = false;
+    /// <summary>Collect per-class search diagnostics (best loop / one-shot cost, counts) for the trace.</summary>
+    API_FIELD() bool Diagnostics = false;
     API_FIELD() float ContinuityWeight = 0.0025f;
     API_FIELD() float CostFuseThreshold = 2.0f;
     API_FIELD() float TurnPenaltyWeight = 0.03f;
@@ -156,22 +156,11 @@ public:
     API_FIELD() float LastTickMs = 0.0f;
     // Continuation SampleCost block inside TryFastPath (hit path only).
     API_FIELD() float LastFastPathMs = 0.0f;
-    // Synchronous telemetry file I/O (LogTelemetryLine per query).
-    // P4: per-tick file I/O deleted. Runtime query only enqueues a
-    // structured record into a bounded in-memory ring (below); JSON
-    // formatting + file write happen ONLY in the explicit FlushTelemetry
-    // tooling call (session end, never in Tick/RunQuery). Telemetry-off
-    // ticks record nothing (single branch, no allocation beyond the fixed
-    // ring). Telemetry on/off never steers search (enqueue is record-only
-    // after the winner is decided; CollectClassDiagnostics only fills
-    // diagnostics, never changes the winner).
-    API_FIELD() float LastTelemetryMs = 0.0f;
     API_FIELD() int32 TickCount = 0;
     API_FIELD() int32 FullSearchCount = 0;
     API_FIELD() float TotalTickMs = 0.0f;
     API_FIELD() float TotalFullSearchMs = 0.0f;
     API_FIELD() float TotalFastPathMs = 0.0f;
-    API_FIELD() float TotalTelemetryMs = 0.0f;
 
     API_PROPERTY() bool GetIsReady() const;
 
@@ -181,7 +170,6 @@ public:
         MotionMatchingDatabase* database,
         AnimatedModel* body,
         const PoseSearchSchema& schema,
-        const String& cacheFolder,
         float defaultInertial);
     API_FUNCTION() void Shutdown();
     API_FUNCTION() void ResetOnTeleport();
@@ -209,24 +197,7 @@ public:
     /// folder is unset, or the file cannot be written.
     /// </summary>
     API_FUNCTION() static bool ExportClipAudit(MotionMatchingDatabase* database,
-        const String& cacheFolder, float sampleRate, API_PARAM(Out) String& error);
-    /// <summary>
-    /// P4 explicit telemetry flush (the ONLY writer of MMTelemetry.jsonl).
-    /// Formats the bounded in-memory ring as JSONL + writes the file.
-    /// Tooling/session-end only: Tick/RunQuery never do file I/O, they only
-    /// RecordTelemetry (enqueue). Returns false with a visible error when
-    /// the ring is empty, the cache folder is unset, or the file cannot be
-    /// written. Overwritten drops are counted in GetTelemetryDropped.
-    /// </summary>
-    API_FUNCTION() bool FlushTelemetry(API_PARAM(Out) String& error);
-    /// <summary>
-    /// P4 explicit telemetry clear (no file deletion: init never touches
-    /// MMTelemetry.jsonl; tools read whatever the last flush left behind).
-    /// Resets the ring head/count/dropped to the bounded disabled state.
-    /// </summary>
-    API_FUNCTION() void ClearTelemetry();
-    API_FUNCTION() int32 GetTelemetryCount() const;
-    API_FUNCTION() int32 GetTelemetryDropped() const;
+        const String& filePath, float sampleRate, API_PARAM(Out) String& error);
 
 private:
     struct FastPathSignature
@@ -245,7 +216,6 @@ private:
     MotionMatchingPlayback* _playback = nullptr;
     MotionMatchingTraceLog* _trace = nullptr;
     PoseSearchSchema _liveSchema;
-    String _cacheFolder;
     NodeIndices _nodes;
 
     bool _samplingReady = false;
@@ -393,51 +363,6 @@ private:
         bool valid, const MotionMatchingResult& result, const String& reason);
     static float Wrap180(float a);
     void WarnOnce(const String& message);
-    // P4 bounded telemetry ring (replaces per-query LogTelemetryLine file
-    // I/O). Runtime query only copies numbers + one Tags string into the
-    // fixed ring (no JSON formatting, no file I/O in Tick). FlushTelemetry
-    // (explicit tooling) formats + writes. Overflow overwrites the oldest
-    // and counts drops (visible via GetTelemetryDropped + flush log).
-    struct TelemetryRecord
-    {
-        float Time = 0.0f;
-        float YawRate = 0.0f;
-        int32 ClipIndex = -1;
-        int32 SampleIndex = -1;
-        float Cost = MAX_float;
-        float PoseCost = MAX_float;
-        float TrajectoryCost = MAX_float;
-        float ContinuityCost = 0.0f;
-        float LoopCost = 0.0f;
-        float SecondBestCost = MAX_float;
-        float QueryMs = 0.0f;
-        int32 SwitchCount = 0;
-        int32 SeekCount = 0;
-        int32 CurrentClip = -1;
-        float PlaybackTime = -1.0f;
-        float PlayRate = 1.0f;
-        float EffectiveDt = 0.0f;
-        int32 Cycle = 0;
-        float TimeError = 0.0f;
-        int32 BestLoopClip = -1;
-        float BestLoopCost = MAX_float;
-        int32 BestOneShotClip = -1;
-        float BestOneShotCost = MAX_float;
-        int32 LoopScored = 0;
-        int32 OneShotScored = 0;
-        int32 LoopTotal = 0;
-        int32 OneShotTotal = 0;
-        float LoopPreference = 0.0f;
-        Float3 ActorPos = Float3::Zero;
-        String Tags;
-    };
-    static constexpr int32 TelemetryCapacity = 4096;
-    TelemetryRecord _telemetryRing[TelemetryCapacity];
-    int32 _telemetryHead = 0;
-    int32 _telemetryCount = 0;
-    int32 _telemetryDropped = 0;
-    void RecordTelemetry(float yawRate, const Array<String>& tags,
-        const MotionMatchingResult& result, const Float3& actorPos, float timeError);
     String GetClipName(int32 clipIndex);
     // Normalized tag SET snapshot (EnsureClipTagCache at init) with DB fallback.
     const Array<String>& ClipTags(int32 clipIndex);
