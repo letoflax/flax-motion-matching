@@ -271,6 +271,22 @@ public:
     }
 
     /// <summary>
+    /// 64-bit FNV-1a over the baked feature data: clip lengths, sample counts,
+    /// sample clip indices/times, pose and trajectory features and their
+    /// deviations, bit-exact. Excludes per-clip metadata (tags, loop, groups),
+    /// so a metadata-only change keeps it. 0 when nothing is baked. Use it to
+    /// prove a refactor or rebake left the features unchanged.
+    /// </summary>
+    API_FUNCTION() int64 ComputeFeaturesHash() const;
+
+    /// <summary>
+    /// 64-bit FNV-1a over the per-clip metadata of the baked data (loop flags,
+    /// tags, per-clip search metadata). Complements ComputeFeaturesHash.
+    /// 0 when nothing is baked.
+    /// </summary>
+    API_FUNCTION() int64 ComputeClipMetadataHash() const;
+
+    /// <summary>
     /// D1 §18.5 bake-tool build id of the loaded baked data (0 = unknown/legacy).
     /// </summary>
     API_PROPERTY() int32 GetBakeToolBuildId() const

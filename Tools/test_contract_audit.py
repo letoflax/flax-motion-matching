@@ -13,18 +13,23 @@ spec.loader.exec_module(gate)
 def expect_failure(label, rel, mutate):
     original = (gate.ROOT / rel).read_text(encoding="utf-8")
     mutated = mutate(original)
+    if mutated == original:
+        raise AssertionError("mutation did not change the source (stale marker): " + label)
     failures = gate.audit(overrides={rel: mutated})
     if not failures:
         raise AssertionError("mutation was not rejected: " + label)
 
 
 def main():
+    baseline = gate.audit()
+    if baseline:
+        raise AssertionError("baseline audit must be clean before mutating: " + "; ".join(baseline))
     expect_failure(
         "caller loop filter recovery assignment",
         "Source/MotionMatching/Runtime/MotionMatchingRuntimePolicy.cpp",
         lambda text: text.replace(
-            "settings.LoopFilter = reseeded ? MotionLoopFilter::LoopOnly :",
-            "settings.LoopFilter = reseeded ? MotionLoopFilter::Any :",
+            "settings.LoopFilter = (reseeded || keepReseedArmed) ? MotionLoopFilter::LoopOnly :",
+            "settings.LoopFilter = (reseeded || keepReseedArmed) ? MotionLoopFilter::Any :",
             1),
     )
     expect_failure(

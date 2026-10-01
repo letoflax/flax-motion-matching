@@ -115,7 +115,7 @@ def audit(root=ROOT, overrides=None):
     for marker in (
         'ChooserStatusText = String(TEXT("ext:empty (no-match)"))',
         'LastSwitchReason = String(TEXT("no-result:empty-scope"))',
-        "settings.LoopFilter = reseeded ? MotionLoopFilter::LoopOnly",
+        "settings.LoopFilter = (reseeded || keepReseedArmed) ? MotionLoopFilter::LoopOnly",
         "retry.LoopFilter = MotionLoopFilter::LoopOnly",
         "if (!result.IsValid && _playback != nullptr && _playback->IsAtEnd)",
         "retry.ReselectClip = -1",

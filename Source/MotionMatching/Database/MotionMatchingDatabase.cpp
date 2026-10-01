@@ -535,6 +535,81 @@ int32 MotionMatchingDatabase::ComputeSamplingContractHash() const
     return FinishHash(hash);
 }
 
+namespace
+{
+    constexpr uint64 Fnv64Offset = 14695981039346656037ull;
+    constexpr uint64 Fnv64Prime = 1099511628211ull;
+
+    void Mix64(uint64& hash, const void* data, size_t size)
+    {
+        const uint8* bytes = static_cast<const uint8*>(data);
+        for (size_t i = 0; i < size; i++)
+        {
+            hash ^= bytes[i];
+            hash *= Fnv64Prime;
+        }
+    }
+
+    template<typename T>
+    void Mix64Array(uint64& hash, const Array<T>& values)
+    {
+        const int32 count = values.Count();
+        Mix64(hash, &count, sizeof(count));
+        if (count > 0)
+            Mix64(hash, values.Get(), sizeof(T) * static_cast<size_t>(count));
+    }
+
+    int64 FinishHash64(uint64 hash)
+    {
+        if (hash == 0ull)
+            hash = 1ull;
+        return static_cast<int64>(hash);
+    }
+}
+
+int64 MotionMatchingDatabase::ComputeFeaturesHash() const
+{
+    if (_poseFeatures.IsEmpty() && _trajectoryFeatures.IsEmpty())
+        return 0;
+    uint64 hash = Fnv64Offset;
+    Mix64Array(hash, _clipLengths);
+    Mix64Array(hash, _clipSampleCounts);
+    Mix64Array(hash, _sampleClipIndices);
+    Mix64Array(hash, _sampleTimes);
+    Mix64Array(hash, _poseFeatures);
+    Mix64Array(hash, _trajectoryFeatures);
+    Mix64Array(hash, _poseFeatureDeviations);
+    Mix64Array(hash, _trajectoryFeatureDeviations);
+    return FinishHash64(hash);
+}
+
+int64 MotionMatchingDatabase::ComputeClipMetadataHash() const
+{
+    if (_poseFeatures.IsEmpty() && _trajectoryFeatures.IsEmpty())
+        return 0;
+    uint64 hash = Fnv64Offset;
+    Mix64Array(hash, _clipLooping);
+    Mix64Array(hash, _clipTurnLike);
+    Mix64Array(hash, _clipSpeedBands);
+    Mix64Array(hash, _clipTurnAngles);
+    const int32 clipCount = _clipTags.Count();
+    Mix64(hash, &clipCount, sizeof(clipCount));
+    for (int32 i = 0; i < clipCount; i++)
+    {
+        const Array<String>& tags = _clipTags[i];
+        const int32 tagCount = tags.Count();
+        Mix64(hash, &tagCount, sizeof(tagCount));
+        for (const String& tag : tags)
+        {
+            const int32 length = tag.Length();
+            Mix64(hash, &length, sizeof(length));
+            if (length > 0)
+                Mix64(hash, tag.Get(), sizeof(Char) * static_cast<size_t>(length));
+        }
+    }
+    return FinishHash64(hash);
+}
+
 int32 MotionMatchingDatabase::ComputeSourceManifestHash() const
 {
     // Source manifest identity: every registered source asset's 16-byte ID
