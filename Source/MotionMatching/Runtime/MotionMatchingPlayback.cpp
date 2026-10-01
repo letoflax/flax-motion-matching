@@ -283,7 +283,7 @@ bool MotionMatchingPlayback::GetSearchLocal(int32 index, Matrix& outLocal) const
 
 void MotionMatchingPlayback::AssertTickOrder()
 {
-    // P2 intra-tick invariant: sample -> save, with the policy search
+    // Intra-tick invariant: sample -> save, with the policy search
     // stamped between (NotifySearchExecuted). No layer/IK stages exist.
     bool ok = SampleFrameId == _tickFrameId &&
         SaveSearchPoseFrameId == _tickFrameId;
@@ -384,7 +384,7 @@ void MotionMatchingPlayback::Tick(float deltaTime, AnimatedModel* body)
     ApplyInertialization(blendedLocals, model, MaxF(deltaTime, 0.000001f));
 
     // Search-pose save: snapshot AFTER inertial. Deep copy (not an alias)
-    // so later game-side post passes cannot mutate the saved snapshot.
+    // so later host post passes cannot mutate the saved snapshot.
     if (_searchLocals.Count() == blendedLocals.Count() && blendedLocals.Count() > 0)
     {
         if (_prevSearchLocals.Count() != _searchLocals.Count())
@@ -400,7 +400,7 @@ void MotionMatchingPlayback::Tick(float deltaTime, AnimatedModel* body)
     for (int32 i = 0; i < blendedLocals.Count(); i++)
         _searchLocals[i] = blendedLocals[i];
     SaveSearchPoseFrameId = _tickFrameId;
-    // P2: no overlay / compose / IK / pose write here. The game reads
+    // No overlay / compose / IK / pose write here. The game reads
     // the search locals above via GetSearchLocals, applies its own post
     // passes, composes and writes the final pose itself.
     AssertTickOrder();

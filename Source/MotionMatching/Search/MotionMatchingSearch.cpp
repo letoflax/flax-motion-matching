@@ -19,8 +19,7 @@ namespace
     constexpr float MinimumStandardDeviation = 0.000001f;
     constexpr float SelfTestMaxCost = 0.0001f;
 
-    // Straightness prior (P2: Game-owned tuning via settings, values preserved
-    // from the 0.03/4.0 calibration): penalty = |clipTurnAngle| * Weight /
+    // Straightness prior (host-owned tuning via settings): penalty = |clipTurnAngle| * Weight /
     // (1 + yawRate * YawScale). Recorded in the trace; brute-force, indexed
     // and replay share this one definition.
     // Phase 2 UE-parity verdict (measured): grouped L/R normalization did
@@ -35,7 +34,7 @@ namespace
     // Straightness prior, SINGLE definition shared by the hot loop, the
     // bit-exact verifier and the test gate below. Always >= 0 (fabs), so
     // block pruning stays valid with no extra headroom anywhere it is used.
-    // P2: weight/scale ride the per-query settings (Game tuning, trace-
+    // Weight/scale ride the per-query settings (host tuning, trace-
     // recorded); callers pass settings fields verbatim, never literals.
     float TurnPenalty(float clipAngle, float queryYawRate, float weight, float yawScale)
     {
@@ -45,11 +44,8 @@ namespace
         return a * w / (1.0f + Math::Max(queryYawRate, 0.0f) * s);
     }
 
-    // P3: foot-lock search prior deleted (FootLockCost + FootLockL/R +
-    // FirmLockL/R). The runtime always fed it zero (verified: 4004/4004
-    // trace entries flock=(0,0) firm=(0,0)), so removal is query-identical.
-    // Baked contact channels + feature extraction + DB stay untouched;
-    // Game-side IK owns its own contact state.
+    // The search has no foot-lock prior. Baked contact channels are plain
+    // features; the host IK owns its own contact state.
 
     // N1 weight contract: schema weights are stored, never baked. The search
     // applies each block weight exactly ONCE. Negative inputs clamp to 0;
@@ -366,7 +362,7 @@ namespace
     // One definition per term. SearchPass (FindBest), FindTopCandidates,
     // FullSampleCost (SampleCost + the brute-force verifier) all build their
     // costs from these helpers, so no path can drift from another. The turn
-    // term is the existing TurnPenalty above (P3: foot-lock prior deleted).
+    // term is the existing TurnPenalty above.
     //
     // Pruning invariant kept: every prior is non-negative (turn +
     // continuity switch penalty) so a pruned candidate can never earn cost
@@ -1940,8 +1936,7 @@ bool MotionMatchingSearch::SampleCost(
     // S1 term parity: the fast-path estimate uses the same FullSampleCost term
     // definitions as the hot pass, with no playback context (continuity/loop
     // disabled exactly as before: raw pose + trajectory + straightness).
-    // P2: turn prior weights ride explicit params (trace-recorded tuning).
-    // P3: foot-lock prior deleted (was zero here too).
+    // Turn prior weights ride explicit params (trace-recorded tuning).
     MotionMatchingSearchSettings costSettings;
     costSettings.PoseWeight = poseWeight;
     costSettings.TrajectoryWeight = trajectoryWeight;
@@ -1961,7 +1956,7 @@ bool MotionMatchingSearch::SampleCost(
     return true;
 }
 
-// P4: RunSelfTest implementation moved to MotionMatchingSearch.SelfTest.cpp
-// (editor-only, #if USE_EDITOR guarded header + impl). Game Release contains
-// no self-test code or strings. This translation unit keeps only the live
+// RunSelfTest lives in MotionMatchingSearch.SelfTest.cpp (editor-only,
+// #if USE_EDITOR guarded header + impl). Release builds contain no self-test
+// code or strings. This translation unit keeps only the live
 // search (FindBest/SampleCost/FindTopCandidates + indexed/scratch/verify).

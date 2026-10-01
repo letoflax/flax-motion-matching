@@ -217,7 +217,7 @@ bool MotionMatchingTraceLog::ExportJson(const String& path, String& error)
         sb.Append(e.OneShotGroup);
         sb.Append(",\"retry\":");
         sb.Append(e.RetryKind);
-        // P0: booleans travel packed in TraceFlags (Flax 1.12 bindings
+        // Booleans travel packed in TraceFlags (Flax 1.12 bindings
         // cannot handle >64 struct fields); the JSON keys stay expanded so
         // tools never see the packing.
         sb.Append(",\"fedge\":");
@@ -456,7 +456,7 @@ bool MotionMatchingTraceLog::ParseEntry(const String& line, MotionMatchingTraceE
     entry.Reason = GetString(text, length, "\"reason\":\"");
     entry.Chooser = GetString(text, length, "\"chooser\":\"");
     entry.QueryMs = GetFloat(text, length, "\"qms\":");
-    // P0 v3 fields: present only in v3 lines; every lookup is guarded so
+    // V3 fields: present only in v3 lines; every lookup is guarded so
     // v1/v2 lines import with documented defaults. Booleans pack into
     // TraceFlags (see bit constants in the header).
     if (isV3)
@@ -479,8 +479,8 @@ bool MotionMatchingTraceLog::ParseEntry(const String& line, MotionMatchingTraceE
             flags |= TraceFlag_VerifyIndexedSearch;
         if (GetFloat(text, length, "\"excltail\":") > 0.5f)
             flags |= TraceFlag_ExcludeNonLoopTail;
-        // P3: pre-P3 firm-lock trace keys are ignored — the foot-lock
-        // search prior is deleted and every post-P2 entry recorded 0.
+        // Older traces carry firm-lock keys; they are ignored (the plugin has
+        // no foot-lock prior).
         entry.TraceFlags = flags;
         entry.MaxCandidates = (int32)GetFloat(text, length, "\"maxcand\":");
         entry.QueryFrame = (int32)GetFloat(text, length, "\"qframe\":");
@@ -493,7 +493,7 @@ bool MotionMatchingTraceLog::ParseEntry(const String& line, MotionMatchingTraceE
         entry.FastThreshold = GetFloat(text, length, "\"fthresh\":");
         entry.CommandClip = (int32)GetFloat(text, length, "\"cmdclip\":");
         entry.CommandTime = GetFloat(text, length, "\"cmdtime\":");
-        // P2 turn-prior tuning: missing keys (pre-P2 traces) fall back to
+        // Turn-prior tuning: missing keys (pre-traces) fall back to
         // the preserved 0.03/4.0 calibration so old files still import.
         if (FindKey(text, length, "\"tpw\":") >= 0)
         {
@@ -508,7 +508,7 @@ bool MotionMatchingTraceLog::ParseEntry(const String& line, MotionMatchingTraceE
     }
     // "search" needs feature vectors to re-run FindBest; "fastpath" needs
     // them to re-run SampleCost. "command"/"reset" are structural (no
-    // vectors by design). Legacy "hold"/"replay" policy events carry none.
+    // vectors by design). Old "hold"/"replay" policy events carry none.
     // A vector-less search/fastpath line is REJECTED here (it can never be
     // checked) — the old silent skip is what hid incomplete replay.
     const bool isSearch = entry.Kind == String(TEXT("search"));
@@ -739,10 +739,10 @@ bool MotionMatchingTraceLog::VerifyReplay(MotionMatchingDatabase* database, int3
         report = String(TEXT("Replay stopped: trace is empty."));
         return false;
     }
-    // P0: every entry is either CHECKED (search via FindBest, fastpath via
+    // Every entry is either CHECKED (search via FindBest, fastpath via
     // SampleCost, command/reset structurally) or SKIPPED with an explicit
     // reason. A vector-less search/fastpath line can never be checked and
-    // is rejected at import; legacy hold/replay policy events carry no
+    // is rejected at import; old hold/replay policy events carry no
     // vectors by design. PASS requires zero mismatches, at least one
     // checked entry, and no skipped entry that carried checkable input.
     const int32 start = snap.Count() - total;
@@ -896,7 +896,7 @@ bool MotionMatchingTraceLog::VerifyReplay(MotionMatchingDatabase* database, int3
         else if (e.Kind == kindFast)
         {
             // Continuation hold: re-score the recorded sample with the
-            // recorded weights (incl. the P2 turn-prior tuning) and require
+            // recorded weights (incl. the turn-prior tuning) and require
             // the recorded cost (text round-trip tolerance) plus the recorded
             // threshold to hold.
             float cost = 0.0f;
@@ -932,10 +932,10 @@ bool MotionMatchingTraceLog::VerifyReplay(MotionMatchingDatabase* database, int3
         }
         else if (e.Kind == kindCommand || e.Kind == kindReset)
         {
-            // Force-clip / teleport-reset: no search ran, so the check is
+            // Command / teleport-reset: no search ran, so the check is
             // structural — the command must name a clip that exists (reset
             // records the surviving clip, which may be -1 = none) and must
-            // carry the reason that future P2 sync work will reconcile.
+            // carry a reason string.
             const bool isCommand = e.Kind == kindCommand;
             bool structural = !e.Reason.IsEmpty();
             if (isCommand)
@@ -958,7 +958,7 @@ bool MotionMatchingTraceLog::VerifyReplay(MotionMatchingDatabase* database, int3
         }
         else
         {
-            // Legacy hold/replay policy events: no vectors by design, never
+            // Old hold/replay policy events: no vectors by design, never
             // re-runnable. Counted as skipped with an explicit reason.
             skippedLegacy++;
         }

@@ -156,10 +156,10 @@ struct MOTIONMATCHING_API MotionMatchingSearchSettings
     API_FIELD() float QueryYawRate = 0.0f;
 
     /// <summary>
-    /// P2 straightness prior (was hardcoded 0.03/4.0 in MotionMatchingSearch):
+    /// Straightness prior:
     /// penalty = |clipTurnAngle| * TurnPenaltyWeight /
-    /// (1 + QueryYawRate * TurnPenaltyYawScale). Game-owned tuning (values
-    /// preserved from the hardcoded calibration); recorded in the trace so
+    /// (1 + QueryYawRate * TurnPenaltyYawScale). Host-owned tuning;
+    /// recorded in the trace so
     /// brute-force, indexed and replay share one formula.
     /// </summary>
     API_FIELD() float TurnPenaltyWeight = 0.03f;

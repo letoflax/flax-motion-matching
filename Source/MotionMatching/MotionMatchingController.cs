@@ -7,14 +7,12 @@ namespace MotionMatching;
 /// <summary>
 /// Scene-detached runtime for the native motion-matching system.
 ///
-/// P3: plain C# class, zero scene presence. The game-side facade
-/// (MotionMatchingPlayer) owns this object, feeds it a prebuilt
-/// <see cref="MotionMatchingFrameInput"/> every tick (it calls the provider's
-/// BuildInput itself) and drives the overlay post-pass + pose write. This
-/// class owns the database, policy/playback lifecycle and core-only tuning.
-/// Everything locomotion (gait scope, trajectory prediction, gait speeds)
-/// arrives through the frame argument. This file must never reference game
-/// types (PlayerState, coordinators, automation, overlays).
+/// Plain C# class, zero scene presence. The host owns this object, feeds it a
+/// prebuilt <see cref="MotionMatchingFrameInput"/> every tick and does its own
+/// post-pass and pose write. This class owns the database, policy/playback
+/// lifecycle and core-only tuning. Everything locomotion (gait scope,
+/// trajectory prediction, gait speeds) arrives through the frame argument.
+/// This file must never reference host types.
 /// </summary>
 public class MotionMatchingController : IDisposable
 {
@@ -81,15 +79,8 @@ public class MotionMatchingController : IDisposable
     // count divergences, keep the brute-force winner. Permanent debug harness.
     public bool VerifyIndexedSearch = false;
 
-    // P2: foot-IK solver deleted with the plugin lock machine (field died
-    // with it). Game-side FootIKEngine (no separate script) owns all foot
-    // solving via the facade single-publish pipeline; search contact
-    // features (bake + query) are untouched.
-
-    // NOTE: layer decisions (procedural angle, bone gate) live
-    // game-side now (P2 post-pass in the game facade): the provider
-    // snapshot still carries the host-authored angle/gate for the game
-    // pass, but nothing is forwarded into the core anymore.
+    // The plugin does no foot IK or pose layering: the host owns the post-pass.
+    // Contact features (bake + query) are search inputs only.
 
     // Switch penalty added to any different-clip winner (continuity block).
     // Rev-3 cost units (N1b shrank dissimilarity ~100x): 0.0025 restores the
@@ -110,26 +101,13 @@ public class MotionMatchingController : IDisposable
 
     public float SwitchMargin = 0.008f;
 
-    // foot-ik branch flip work: P2 DELETED (FairFightAccum/Window died with
-    // the native intent accumulator; the Game selection policy owns onset/
-    // fair-fight and passes only the resulting filter per tick). Values
-    // preserved Game-side in LocomotionSelectionConfig (40/0.25).
-
-    // Heuristic thresholds below were hardcoded constants (codex review):
-    // exposed live so tuning moves numbers instead of code. No rebake needed.
-    // P2: SettleToLoopDelay died with the native settle branch (Game policy
-    // owns settle; value preserved Game-side in LocomotionSelectionConfig).
+    // Heuristic thresholds below are exposed live so tuning moves numbers
+    // instead of code. No rebake needed. Onset and settle decisions belong to
+    // the host, which passes only the resulting filter per tick.
 
     public float SameClipExclusion = 0.25f;
 
     public float SameClipSeekThreshold = 0.25f;
-
-    // P3: Turn* game-driver config moved to the game facade
-    // (MotionMatchingPlayer.TurnDriveAngle/Lookahead/SettleRate/PatientAngle/
-    // PatientTime). The native turn machine is deleted and never read these;
-    // the game-side TurnDriver is the only reader. TurnMinSwitchTime died
-    // with them: it was never pushed into the native tuning (no reader in
-    // the P2 headers) and no driver reads it.
 
     // Cost fuse: a switched winner above this is treated as a corrupted query
     // (observed: single-query pose spike mid steady walk, self-heals next
@@ -137,9 +115,8 @@ public class MotionMatchingController : IDisposable
     // peak ~0.9 measured, so 2.0 keeps headroom without ever firing legally.
     public float CostFuseThreshold = 2.0f;
 
-    // P2 straightness prior (was hardcoded 0.03/4.0 in MotionMatchingSearch):
-    // Game-owned tuning, values preserved from the calibration. Recorded in
-    // the trace so brute-force, indexed and replay share one formula.
+    // Straightness prior: host-owned tuning. Recorded in the trace so
+    // brute-force, indexed and replay share one formula.
     public float TurnPenaltyWeight = 0.03f;
     public float TurnPenaltyYawScale = 4.0f;
 
@@ -189,10 +166,6 @@ public class MotionMatchingController : IDisposable
     public int SeekCount { get; private set; }
     public float LastQueryMs { get; private set; }
     public string ActiveTag { get; private set; } = string.Empty;
-
-    // P2: TurnDriveActive/Yaw mirrors deleted with the native turn machine.
-    // Committed-turn facing is owned game-side (facade driver facing); the
-    // core never steers facing anymore.
 
     public bool WinnerIsLoop { get; private set; }
     public float LoopPreferenceApplied { get; private set; }
@@ -245,7 +218,7 @@ public class MotionMatchingController : IDisposable
         get
         {
             ReleaseStaleBinding();
-            // P5: the Database getter is a native binding that allocates a
+            // The Database getter is a native binding that allocates a
             // managed float[] per call; the baked times never change under a
             // loaded database in play, so cache the array and refresh only
             // when the database reference changes. Callers (facade tick +
@@ -276,14 +249,13 @@ public class MotionMatchingController : IDisposable
     }
 
     /// <summary>
-    /// Live playback handle for game-side integrations (e.g. pose overlays
-    /// attach here). Null until the first update initializes the policy.
+    /// Live playback handle for host integrations. Null until the first update initializes the policy.
     /// Borrowed handle: reacquire after every rebind/shutdown; never destroy it.
     /// </summary>
     public MotionMatchingPlayback Playback => IsReady ? _policy.GetPlayback() : null;
 
     /// <summary>
-    /// P0 additive-only: publish the existing search-pose path without
+    /// Additive-only: publish the existing search-pose path without
     /// touching Update. Returns the playback's current search locals plus the
     /// current winner (false + defaults when the policy is not ready).
     /// </summary>
@@ -304,7 +276,7 @@ public class MotionMatchingController : IDisposable
     }
 
     /// <summary>
-    /// P5 zero-alloc base-pose read: copies the playback search locals into
+    /// Zero-alloc base-pose read: copies the playback search locals into
     /// the caller-owned buffer (no managed array allocation, unlike
     /// TryGetBasePose which allocates via GetSearchLocals). The caller
     /// reuses its buffer and resizes only when the bone count changes
@@ -364,7 +336,7 @@ public class MotionMatchingController : IDisposable
     }
 
     /// <summary>
-    /// P3 explicit init (replaces the Script OnEnable): the game facade
+    /// Explicit init (replaces the Script OnEnable): the game facade
     /// assigns Schema/PlayerModel/DatabasePath/CharacterBody + session
     /// config first, then calls this. Content.Load works outside Scripts —
     /// Globals remain usable here.
@@ -461,13 +433,9 @@ public class MotionMatchingController : IDisposable
         TotalTickMs = TotalFullSearchMs = TotalFastPathMs = 0.0f;
     }
 
-    // P3: the P2 rebuild-compat reflection shim for the legacy native scope
-    // gate is deleted with the facade (the P2 headers no longer carry it).
-
     /// <summary>
-    /// Clears native playback state. The game facade resets its provider
-    /// (scope + predictor) and drivers separately — this class no longer
-    /// owns any provider reference. Call after teleport/respawn.
+    /// Clears native playback state. The host resets its own scope and
+    /// predictor state separately. Call after teleport/respawn.
     /// </summary>
     public void ResetPlayback()
     {
@@ -476,7 +444,7 @@ public class MotionMatchingController : IDisposable
     }
 
     /// <summary>
-    /// P3 policy + playback tick. The game facade builds the provider frame
+    /// Policy + playback tick. The game facade builds the provider frame
     /// itself (provider.BuildInput) and passes it in with the actor world
     /// transform — this class never calls a provider. Loads the database on
     /// first tick if Initialize found none.
@@ -532,10 +500,9 @@ public class MotionMatchingController : IDisposable
             Debug.LogWarning("Motion matching diagnostics are ACTIVE (debug only: every query is recorded into the trace ring). Turn off MotionMatchingController.Diagnostics for shipping builds.");
         }
 
-        // P2: the snapshot carries the caller scope only (movement fields
-        // died with the native gameplay state). LoopFilter/ClipGroup/
-        // YawRate ride explicit Tick params (never inferred); the core uses
-        // them verbatim. No new native struct field (bindings cap 64).
+        // The snapshot carries the caller scope only. LoopFilter/ClipGroup
+        // ride explicit Tick params (never inferred); the core uses them
+        // verbatim. No new native struct field (bindings cap 64).
         var snapshot = new MotionMatchingPlayerSnapshot
         {
             AllowedTagSet = input.AllowedTagSet ?? string.Empty,
@@ -612,7 +579,7 @@ public class MotionMatchingController : IDisposable
         ChooserStatus = _policy.ChooserStatusText;
         TraceEntries = _policy.GetTrace() != null ? _policy.GetTrace().Count : 0;
         FastPathHits = _policy.FastPathHits;
-        // P0 profiling mirrors (record-only).
+        // Profiling mirrors (record-only).
         LastTickMs = _policy.LastTickMs;
         LastFastPathMs = _policy.LastFastPathMs;
         TickCount = _policy.TickCount;
@@ -664,7 +631,7 @@ public class MotionMatchingController : IDisposable
 
     public static PoseSearchSchema CreateDefaultSchema()
     {
-        // Skeleton ships EMPTY on purpose (no mannequin names): the host
+        // Skeleton ships EMPTY on purpose (no rig-specific names): the host
         // owning this scene overrides every bone name for its own rig
         // (Schema → Skeleton). PoseSearchSchema.Default already carries the
         // empty profile, so nothing is filled in here.

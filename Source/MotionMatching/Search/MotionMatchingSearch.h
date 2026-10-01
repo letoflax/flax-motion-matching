@@ -49,7 +49,7 @@ public:
         API_PARAM(Out) String& error);
 
     /// <summary>
-    /// P4 editor-only self-test without playback: rebuilds raw queries from
+    /// Editor-only self-test without playback: rebuilds raw queries from
     /// baked samples (a straight copy, since rev-3 stores raw values) and
     /// requires the search to return the source sample with ~zero cost.
     /// Proves the weight pipeline, cost math and tie-breaks.
@@ -73,7 +73,7 @@ public:
     /// weights plus the straightness prior, no continuity/loop terms). The
     /// policy scores the expected next sample of the playing clip every tick
     /// and skips the full scan while it stays within threshold.
-    /// P2: turn prior weights ride explicit params (Game tuning, trace-
+    /// Turn prior weights ride explicit params (host tuning, trace-
     /// recorded); callers pass them verbatim, never literals.
     /// </summary>
     /// <returns>False with an actionable error on bad database, sizes or index.</returns>

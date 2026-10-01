@@ -14,8 +14,7 @@ class Animation;
 class MotionMatchingDatabase;
 
 
-/// P2: generic pose-overlay seam deleted (was the fn-pointer seam).
-/// The game applies its own post passes onto TryGetBasePose locals, then
+/// The host applies its own post passes onto TryGetBasePose locals, then
 /// composes and writes the final pose itself. Playback never calls out.
 
 
@@ -27,7 +26,7 @@ class MotionMatchingDatabase;
 /// CalcInertialFloat): offset = oldPose - newPose decayed per bone with zero
 /// end value/velocity/acceleration, so phase-mismatched switches settle
 /// without the foot-skate of linear crossfade. Root motion stays Disabled:
-/// CharacterController owns movement. P2: playback advances time and holds
+/// CharacterController owns movement. Playback advances time and holds
 /// the inertial search pose only — it never overlays, solves IK, composes
 /// or writes the final pose (the game owns all post passes).
 /// Requires the body to have NO AnimGraph assigned — the graph would
@@ -36,7 +35,7 @@ class MotionMatchingDatabase;
 /// Hierarchy correctness: stripping and blending MUST happen in bone-LOCAL
 /// space before forward kinematics. This class therefore samples locals,
 /// strips the root local to its bind reference, blends locals (native TRS
-/// blend) and snapshots the result as the search pose. P2: no overlay, no
+/// blend) and snapshots the result as the search pose. No overlay, no
 /// IK, no compose, no pose write here — the game owns all post passes.
 /// </summary>
 API_CLASS(Namespace="MotionMatching")
@@ -63,9 +62,8 @@ public:
     API_PROPERTY() bool GetInertialActive() const;
 
 
-    // P2: foot-IK solver + lock machine deleted (was here). Game-side
-    // FootIKEngine (no separate script) owns all foot solving via the facade
-    // single-publish pipeline; search contact features (bake + query) are untouched.
+    // No foot IK here: the host owns foot solving; contact features (bake +
+    // query) are search inputs only.
 
 
 
@@ -89,13 +87,13 @@ public:
     API_FUNCTION() void NotifySearchExecuted(int64 tickFrameId);
     API_FUNCTION() Array<Matrix> GetSearchLocals() const;
     /// <summary>
-    /// P5 zero-alloc pose read: bone count for the copy API below. Returns 0
+    /// Zero-alloc pose read: bone count for the copy API below. Returns 0
     /// when no search pose is available. Bound: model bone count (91 on the
     /// reference rig, reuse buffers cap 512).
     /// </summary>
     API_FUNCTION() int32 GetSearchLocalsCount() const;
     /// <summary>
-    /// P5 zero-alloc pose read: copies one bone local into the caller struct
+    /// Zero-alloc pose read: copies one bone local into the caller struct
     /// (no managed array allocation, unlike GetSearchLocals). Returns false
     /// when the index is out of range (outLocal set to identity). The caller
     /// reuses its own buffers and resizes only when GetSearchLocalsCount
@@ -104,7 +102,7 @@ public:
     /// </summary>
     API_FUNCTION() bool GetSearchLocal(int32 index, API_PARAM(Out) Matrix& outLocal) const;
     /// <summary>
-    /// P5 internal fast path (no bindings): const reference to the search
+    /// Internal fast path (no bindings): const reference to the search
     /// snapshot for the policy Tick sampler. Avoids the Array-by-value copy
     /// in GetSearchLocals (which stays for diagnostics/tools). Not exposed
     /// to scripting (no API_FUNCTION) so it needs no binding regen.

@@ -15,8 +15,8 @@ namespace MotionMatching;
 // MotionMatchingPolicyTuning cross into C++.
 
 /// <summary>
-/// The single call the motion-matching side needs from game-side code,
-/// once per tick. The provider owns the player snapshot (pushed game-side
+/// The single call the motion-matching side needs from the host,
+/// once per tick. The provider owns the player snapshot (pushed host-side
 /// via its own Update method), all hysteresis/latch state, and the
 /// trajectory predictor. ctx carries only what the MM side provides:
 /// time, world transform, schema inventory and database inventory.
@@ -37,7 +37,7 @@ public interface IMotionMatchingInputProvider
 
 /// <summary>
 /// MM-side input to the provider. No raw movement here on purpose (R5):
-/// movement arrives game-side through the provider's own Update method,
+/// movement arrives host-side through the provider's own Update method,
 /// so there is exactly one writer and no push-then-tick staleness.
 /// </summary>
 public struct MotionMatchingInputContext
@@ -57,10 +57,10 @@ public struct MotionMatchingInputContext
 
 /// <summary>
 /// Everything motion matching needs for one tick, produced in one call.
-/// P2: trajectory + scope + caller filter only. All gameplay decisions (gait
-/// roles, speed ceilings, yaw/direction thresholds, driver flags, overlay
-/// angles/gates, velocities, grounded/sprint) live game-side in the provider/
-/// selection policy and never cross into the core. Includes use tag overlap;
+/// Trajectory + scope + caller filter only. All gameplay decisions (gait
+/// roles, speed ceilings, yaw/direction thresholds, overlay angles/gates,
+/// velocities, grounded/sprint) live host-side in the provider/selection
+/// policy and never cross into the core. Includes use tag overlap;
 /// exclusions veto any overlap. Empty AllowedTagSet = explicit no-match.
 /// Normal queries use the caller filter. Structural reseed/end-recovery
 /// searches override LoopFilter to LoopOnly within the same tag scope and
@@ -75,8 +75,7 @@ public struct MotionMatchingFrameInput
 
     // 2. Scope: '+'-joined include/exclude tag sets decided provider-side.
     // Empty AllowedTagSet = explicit no-match (hold current, never fall
-    // back to any pool). The native legacy chooser is deleted, so every
-    // query is provider-scoped.
+    // back to any pool). Every query is provider-scoped.
     public string AllowedTagSet;
     public string ExcludedTagSet;
 
@@ -103,10 +102,7 @@ public struct MotionMatchingFrameInput
     public bool HoldReseedFilter;
 }
 
-// P1: the P0 additive-only DTOs (MotionMatchingQueryFilter,
-// MotionMatchingSearchTuning) were never read by Tick and are deleted. The
-// live Game-side request is LocomotionSelectionRequest
-// (Source/Game/Player/LocomotionSelectionPolicy.cs): scope crosses into the
-// core through MotionMatchingFrameInput above (direct path), intent/loop/
-// group mirrors stay Game-side. No native struct field is added
-// (MotionMatchingTraceEntry stays 61/64 for the Flax 1.12 bindings cap).
+// Scope crosses into the core only through MotionMatchingFrameInput above;
+// intent, loop and group mirrors stay host-side. No native struct field is
+// added for them (MotionMatchingTraceEntry stays under the Flax 1.12 bindings
+// cap of 64).

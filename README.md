@@ -13,6 +13,14 @@ input-provider contract. References the engine only — never a game.
   `ClipRegistryImportOptions`. The plugin never reads file names and ships no
   project naming conventions (flax-test keeps its GASP rules game-side).
 
+## Platform support
+
+Only Windows x64 (Flax 1.12, Development configuration, installed binary
+engine) has been built and tested. The sources avoid platform-specific code,
+but Linux, macOS, consoles, mobile, other architectures and other
+configurations are **unverified**: treat them as unsupported until someone
+builds and runs the plugin there.
+
 ## Host documentation
 
 - [Integration](docs/INTEGRATION.md): reference the project/modules and drive a
@@ -24,6 +32,9 @@ input-provider contract. References the engine only — never a game.
   baking, skeletons, bone aliases and retargeting.
 - [Migration and asset identity](docs/MIGRATION.md): database TypeName, the
   format v4 upgrade and the bind-time checks.
+- [Changelog and version table](docs/CHANGELOG.md): release notes, plugin
+  version, database `SerializedVersion`, `SchemaContractRevision` and
+  `NormalizationRevision`.
 
 ## Offline contract gate
 
@@ -32,6 +43,7 @@ From this plugin directory, with Python 3.10+ (standard library only):
 ```text
 python Tools/check_contract.py
 python Tools/test_contract_audit.py
+python Tools/run_gates.py        # runs both, plus the repo gates when inside flax-test
 ```
 
 The [gate](Tools/check_contract.py) checks documentation links/public declarations,

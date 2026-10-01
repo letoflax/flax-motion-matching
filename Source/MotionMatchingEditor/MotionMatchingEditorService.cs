@@ -49,11 +49,10 @@ public sealed class ClipRegistryImportOptions
 /// <summary>
 /// Editor operations for <see cref="MotionMatchingController"/>.
 ///
-/// P3: the controller is a plain C# class owned by the game-side facade
-/// (MotionMatchingPlayer). This service keeps operating on the controller
-/// object the facade hands over (game -> plugin direction stays legal; the
-/// plugin never names game types). Scene-dirty marking arrives as an
-/// optional callback because the controller no longer has an Actor.
+/// The controller is a plain C# class owned by the host. This service keeps
+/// operating on the controller object the host hands over (host -> plugin
+/// direction only; the plugin never names host types). Scene-dirty marking
+/// arrives as an optional callback because the controller has no Actor.
 /// </summary>
 public static class MotionMatchingEditorService
 {
@@ -492,7 +491,7 @@ public static class MotionMatchingEditorService
     /// <summary>
     /// Runs the native search self-test (exact queries must return their own
     /// sample with ~zero cost) and prints the per-probe report.
-    /// P4: calls the editor-only native RunSelfTest (USE_EDITOR-guarded C++,
+    /// Calls the editor-only native RunSelfTest (USE_EDITOR-guarded C++,
     /// FLAX_EDITOR-guarded binding). This service lives in the editor module,
     /// so it only ever compiles in editor builds where the native exists.
     /// </summary>

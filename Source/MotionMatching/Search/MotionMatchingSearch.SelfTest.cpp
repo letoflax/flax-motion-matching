@@ -12,15 +12,14 @@
 
 #if USE_EDITOR
 
-// P4 editor-only self-test. Live search helpers (TurnPenalty/FullSampleCost/
+// Editor-only self-test. Live search helpers (TurnPenalty/FullSampleCost/
 // Horizon + cost terms) are duplicated here as file-local test reference
 // (anonymous namespace, no ODR issue). The live definitions in
 // MotionMatchingSearch.cpp are untouched (zero search behavior change).
 // Phase K (prior term parity) compares FindBest (live) against this
 // reference every run — if the two ever drift, the test fails loudly.
-// New P4 phases M-Q replace the deleted FootLock probes with
-// filter/empty-scope/contact/fastpath/replay probes (counts reported real,
-// never forced to 1357).
+// Phases M-Q cover filter/empty-scope/contact/fastpath/replay probes (counts
+// are reported as measured, never forced).
 
 namespace
 {
@@ -31,8 +30,7 @@ namespace
     constexpr float MinimumStandardDeviation = 0.000001f;
     constexpr float SelfTestMaxCost = 0.0001f;
 
-    // Straightness prior (P2: Game-owned tuning via settings, values preserved
-    // from the 0.03/4.0 calibration): penalty = |clipTurnAngle| * Weight /
+    // Straightness prior (host-owned tuning via settings): penalty = |clipTurnAngle| * Weight /
     // (1 + yawRate * YawScale). Recorded in the trace; brute-force, indexed
     // and replay share this one definition.
     // Phase 2 UE-parity verdict (measured): grouped L/R normalization did
@@ -47,7 +45,7 @@ namespace
     // Straightness prior, SINGLE definition shared by the hot loop, the
     // bit-exact verifier and the test gate below. Always >= 0 (fabs), so
     // block pruning stays valid with no extra headroom anywhere it is used.
-    // P2: weight/scale ride the per-query settings (Game tuning, trace-
+    // Weight/scale ride the per-query settings (Game tuning, trace-
     // recorded); callers pass settings fields verbatim, never literals.
     float TurnPenalty(float clipAngle, float queryYawRate, float weight, float yawScale)
     {
@@ -57,11 +55,8 @@ namespace
         return a * w / (1.0f + Math::Max(queryYawRate, 0.0f) * s);
     }
 
-    // P3: foot-lock search prior deleted (FootLockCost + FootLockL/R +
-    // FirmLockL/R). The runtime always fed it zero (verified: 4004/4004
-    // trace entries flock=(0,0) firm=(0,0)), so removal is query-identical.
-    // Baked contact channels + feature extraction + DB stay untouched;
-    // Game-side IK owns its own contact state.
+    // The search has no foot-lock prior. Baked contact channels are plain
+    // features; the host IK owns its own contact state.
 
     // N1 weight contract: schema weights are stored, never baked. The search
     // applies each block weight exactly ONCE. Negative inputs clamp to 0;
@@ -148,7 +143,7 @@ namespace
     // One definition per term. SearchPass (FindBest), FindTopCandidates,
     // FullSampleCost (SampleCost + the brute-force verifier) all build their
     // costs from these helpers, so no path can drift from another. The turn
-    // term is the existing TurnPenalty above (P3: foot-lock prior deleted).
+    // term is the existing TurnPenalty above.
     //
     // Pruning invariant kept: every prior is non-negative (turn +
     // continuity switch penalty) so a pruned candidate can never earn cost
@@ -1446,8 +1441,6 @@ bool MotionMatchingSearch::RunSelfTest(
     // FullSampleCost all-terms function as the hot pass, so it covers
     // continuity/bias and loop preference — the cases the old raw-block
     // reference could not see (PLAN §7.2/§18.7).
-    // P3: the footlock case died with the foot-lock search prior (it always
-    // ran at zero at runtime; contact features stay in the DB untouched).
     int32 phaseKTest = 0;
     int32 phaseKPass = 0;
     {
@@ -1596,8 +1589,7 @@ bool MotionMatchingSearch::RunSelfTest(
     }
     log += String::Format(TEXT("Phase L (non-loop tail validity): {}/{} passed.\n"), phaseLPass, phaseLTest);
 
-    // Phase M: filter respect (P4: replaces deleted FootLock probes with
-    // caller-filter probes). Exact queries with include/exclude filters.
+    // Phase M: filter respect (caller-filter probes). Exact queries with include/exclude filters.
     int32 phaseMTest = 0;
     int32 phaseMPass = 0;
     {
@@ -1715,7 +1707,7 @@ bool MotionMatchingSearch::RunSelfTest(
     }
     log += String::Format(TEXT("Phase M (filter respect): {}/{} passed.\n"), phaseMPass, phaseMTest);
 
-    // Phase N: empty-scope / unconstrained edge (P4).
+    // Phase N: empty-scope / unconstrained edge.
     int32 phaseNTest = 0;
     int32 phaseNPass = 0;
     {
@@ -1766,8 +1758,8 @@ bool MotionMatchingSearch::RunSelfTest(
     }
     log += String::Format(TEXT("Phase N (empty-scope/unconstrained): {}/{} passed.\n"), phaseNPass, phaseNTest);
 
-    // Phase O: contact preservation (P4: baked contact channels stay in the
-    // DB + participate in search; the foot-lock prior is deleted, features kept).
+    // Phase O: contact preservation (baked contact channels stay in the
+    // DB + participate in search as plain features).
     int32 phaseOTest = 0;
     int32 phaseOPass = 0;
     {
@@ -1857,7 +1849,7 @@ bool MotionMatchingSearch::RunSelfTest(
     }
     log += String::Format(TEXT("Phase O (contact preservation): {}/{} passed.\n"), phaseOPass, phaseOTest);
 
-    // Phase P: fastpath scoring determinism (P4: SampleCost is the
+    // Phase P: fastpath scoring determinism (SampleCost is the
     // continuation scorer; must be deterministic + weight-sensitive, with
     // graceful failures. Fastpath-invalidate itself is policy-level and is
     // covered by the contract filter-change test + auto_test replay gate.)
@@ -1891,7 +1883,7 @@ bool MotionMatchingSearch::RunSelfTest(
                 c1,
                 c2);
         }
-        // P2 weight sensitivity on an off-exact query (exact cost ~0 stays ~0
+        // Weight sensitivity on an off-exact query (exact cost ~0 stays ~0
         // under any weight, so offset pose[0] first).
         Array<float> offPose;
         offPose.Resize(poseFeatureSize);
@@ -1924,7 +1916,7 @@ bool MotionMatchingSearch::RunSelfTest(
                 cw1,
                 cw2);
         }
-        // P3 invalid index fails gracefully.
+        // Invalid index fails gracefully.
         {
             float badCost = 0.0f;
             String badError;
@@ -1944,7 +1936,7 @@ bool MotionMatchingSearch::RunSelfTest(
                 log += String(TEXT("SampleCost-badindex FAIL: expected graceful failure.\n"));
             }
         }
-        // P4 non-finite query fails gracefully.
+        // Non-finite query fails gracefully.
         {
             Array<float> nanPose;
             nanPose.Resize(poseFeatureSize);
@@ -1972,9 +1964,9 @@ bool MotionMatchingSearch::RunSelfTest(
     }
     log += String::Format(TEXT("Phase P (fastpath scoring): {}/{} passed.\n"), phasePPass, phasePTest);
 
-    // Phase Q: replay determinism (P4: same query twice -> same winner.
-    // Force-sync is policy-level and is covered by the contract force-hatch
-    // test + auto_test replay gate, not by this search-only self-test.)
+    // Phase Q: replay determinism (same query twice -> same winner). Policy
+    // level replay is covered by the trace replay verifier, not by this
+    // search-only self-test.
     int32 phaseQTest = 0;
     int32 phaseQPass = 0;
     {

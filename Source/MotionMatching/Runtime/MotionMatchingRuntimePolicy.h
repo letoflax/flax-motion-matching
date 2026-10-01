@@ -16,12 +16,11 @@ class AnimatedModel;
 class MotionMatchingDatabase;
 
 /// <summary>
-/// Per-tick caller scope for the policy (plain data, supplied by the Game
-/// selection policy through the C# frame). P2: the core executes the caller
+/// Per-tick caller scope for the policy (plain data, supplied by the host
+/// selection policy through the C# frame). The core executes the caller
 /// filter verbatim — it never infers locomotion, gait, intent, rest, or
-/// airborne meaning. Movement/velocity/yaw/grounded/sprint fields died here:
-/// the Game computes the trajectory before the call and owns all gameplay
-/// interpretation. Only the tag scope crosses.
+/// airborne meaning. The host computes the trajectory before the call and owns
+/// all gameplay interpretation. Only the tag scope crosses.
 /// </summary>
 API_STRUCT(Namespace="MotionMatching")
 struct MOTIONMATCHING_API MotionMatchingPlayerSnapshot
@@ -30,7 +29,7 @@ struct MOTIONMATCHING_API MotionMatchingPlayerSnapshot
 
     /// <summary>
     /// Provider-decided tag scope, '+'-joined (e.g. "run+turn_travel").
-    /// P2: always read (native legacy chooser deleted). An EMPTY set is
+    /// Always read. An EMPTY set is
     /// an explicit no-match: no candidate may win and the current clip
     /// holds (never fall back to the full pool). Plain String transport:
     /// the scripting marshaller cannot marshal Array&lt;String&gt; struct
@@ -45,13 +44,11 @@ struct MOTIONMATCHING_API MotionMatchingPlayerSnapshot
 };
 
 /// <summary>
-/// Live tunables pushed by the C# controller every tick (plain data). P2:
-/// neutral search/playback tuning only (weights, budgets, anti-flicker,
-/// straightness prior). Gameplay intent/settle/rest fields died here
-/// (FairFightAccum/Window, SettleToLoopDelay, RestLoopPreference): the Game
-/// selection policy owns onset/fair-fight/settle/rest and passes only the
-/// resulting LoopFilter/ClipGroup per tick (Tick params, never inferred).
-/// Values preserved; only the owner moved.
+/// Live tunables pushed by the C# controller every tick (plain data). 
+/// Neutral search/playback tuning only (weights, budgets, anti-flicker,
+/// straightness prior). Onset/settle/rest decisions belong to the host
+/// selection policy, which passes only the resulting LoopFilter/ClipGroup per
+/// tick (Tick params, never inferred).
 /// </summary>
 API_STRUCT(Namespace="MotionMatching")
 struct MOTIONMATCHING_API MotionMatchingPolicyTuning
@@ -154,7 +151,7 @@ public:
     API_FIELD() float LastFastPathAge = 0.0f;
     API_FIELD() String ForcedReason;
     API_FIELD() float LastTimeError = 0.0f;
-    // P0 additive profiling counters (record-only; never steer search or
+    // Additive profiling counters (record-only; never steer search or
     // playback). LastQueryMs above already measures the full-scan block
     // (FindBest + retries); the fields below split the remaining phases so
     // before/after runs can compare update/search/fast-path/I-O cost.
@@ -203,7 +200,7 @@ public:
     API_FUNCTION() MotionMatchingTraceLog* GetTrace();
     API_FUNCTION() MotionMatchingTraceEntry GetLastEntry() const;
     /// <summary>
-    /// P3 explicit editor/tool command: scans the baked database and writes
+    /// Explicit editor/tool command: scans the baked database and writes
     /// Cache/MMClipAudit.txt on demand (index|name|tags|loop|turn|travel|net|
     /// yaw|len|speed). Static so it runs in edit mode with no policy/playback
     /// instance: init/play never call this and never produce the file.
@@ -271,7 +268,7 @@ private:
 
     bool _chooserReseed = false;
 
-    // P2 caller filter (Game selection policy output, Tick params): the ONLY
+    // Caller filter (Game selection policy output, Tick params): the ONLY
     // LoopFilter/ClipGroup/YawRate the core uses. Never inferred.
     int32 _callerLoopFilter = 0;
     int32 _callerClipGroup = 0;
@@ -281,7 +278,7 @@ private:
     // Host asks to keep the structural reseed LoopOnly filter armed.
     bool _holdReseedFilter = false;
 
-    // P3: init-time tag cache only (no motion scan, no audit file).
+    // Init-time tag cache only (no motion scan, no audit file).
     Array<Array<String>> _clipTags;
 
     float _lastSpikeWarn = -99.0f;
@@ -293,7 +290,7 @@ private:
     MotionMatchingPlayerSnapshot _snapshot;
     MotionMatchingPolicyTuning _tuning;
     MotionMatchingTraceEntry _lastEntry;
-    // P5 steady-state reuse (all bounded, all record-only, never steer search):
+    // Steady-state reuse (all bounded, all record-only, never steer search):
     // - _queryTagsKey/_queryTagsCache: last AllowedTagSet split for RunQuery
     //   only (TryFastPath uses its own _fastAllowedKey/_fastAllowedCache
     //   below, never this pair). Bound: tag count per query
@@ -308,16 +305,15 @@ private:
     //   Passed to the samplers instead of per-tick locals; Resize only when
     //   the feature size changes (schema-fixed sizes).
     // - _tickTrajScratch: BuildLiveTrajectory scratch (30 floats). Same rule.
-    // P5: the per-tick _trajectoryPoints/_sampleTimes member copies are
-    // deleted (they were written every Tick but never read; RunQuery uses
-    // its params + _tickTrajectory). _snapshot itself is assigned field-wise
+    // RunQuery uses its params + _tickTrajectory (no per-tick member copies).
+    // _snapshot itself is assigned field-wise
     // only on change (Tick) so steady-state copies no native Strings.
     String _queryTagsKey;
     Array<String> _queryTagsCache;
     String _queryExcludedKey;
     Array<String> _queryExcludedCache;
     String _queryExcludedJoin;
-    // P5 TryFastPath incumbent-check caches: SEPARATE keys from the RunQuery
+    // TryFastPath incumbent-check caches: SEPARATE keys from the RunQuery
     // pair above on purpose. The fast path runs before RunQuery on the same
     // tick; sharing one key would let the incumbent check consume the
     // scope-change signal, so RunQuery would then see a false cache hit and
@@ -340,7 +336,7 @@ private:
 
     float SelectPlayRate(float targetSpeed);
     void EnsureClipSpeedCache();
-    // P3: init caches tag SETS only (EnsureClipTagCache) — the motion scan
+    // Init caches tag SETS only (EnsureClipTagCache) — the motion scan
     // and accel log live inside the explicit static ExportClipAudit command,
     // never in Initialize/Tick.
     void EnsureClipTagCache();
@@ -358,14 +354,14 @@ private:
     static int32 HashTagSet(const String& tagSet);
     FastPathSignature CaptureFastPathSignature() const;
     static bool FastPathSignaturesDiffer(const FastPathSignature& a, const FastPathSignature& b);
-    // P5 change-only scope caches (RunQuery pair + fast-path-only twins +
+    // Change-only scope caches (RunQuery pair + fast-path-only twins +
     // record paths): Split/Join run only when the joined snapshot string changes.
     // Returned references stay valid until the next scope change; callers
     // must not hold them across a Tick that can change the scope.
     const Array<String>& GetCachedAllowed();
     const Array<String>& GetCachedExcluded();
     const String& GetCachedExcludedJoin();
-    // P5 fast-path-only twins (see the member comment above): the incumbent
+    // Fast-path-only twins (see the member comment above): the incumbent
     // eligibility check must never consume RunQuery's change signal.
     const Array<String>& GetFastAllowed();
     const Array<String>& GetFastExcluded();
