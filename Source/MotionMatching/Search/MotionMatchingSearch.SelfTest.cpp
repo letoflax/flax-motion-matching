@@ -267,17 +267,17 @@ namespace
 
         // One scale pass per reference call: weight pipeline is O(dims) and
         // this path is used by the exact verifier/SampleCost only.
-        float stackPoseScale[PoseSearchSchema::GetPoseFeatureSize()];
-        float stackTrajectoryScale[PoseSearchSchema::GetTrajectoryFeatureSize()];
+        float stackPoseScale[FeatureLayout::ReferencePoseFeatureSize];
+        float stackTrajectoryScale[FeatureLayout::ReferenceTrajectoryFeatureSize];
         Array<float> heapPoseScale, heapTrajectoryScale;
         float* poseScale = stackPoseScale;
         float* trajectoryScale = stackTrajectoryScale;
-        if (poseFeatureSize > PoseSearchSchema::GetPoseFeatureSize())
+        if (poseFeatureSize > FeatureLayout::ReferencePoseFeatureSize)
         {
             heapPoseScale.Resize(poseFeatureSize);
             poseScale = heapPoseScale.Get();
         }
-        if (trajectoryFeatureSize > PoseSearchSchema::GetTrajectoryFeatureSize())
+        if (trajectoryFeatureSize > FeatureLayout::ReferenceTrajectoryFeatureSize)
         {
             heapTrajectoryScale.Resize(trajectoryFeatureSize);
             trajectoryScale = heapTrajectoryScale.Get();
@@ -749,8 +749,9 @@ bool MotionMatchingSearch::RunSelfTest(
         }
         // Synthetic actor-local walk line with a large constant offset,
         // simulating a mesh mount 100 units right / 50 forward of the actor.
-        TrajectoryPoint synth[PoseSearchSchema::TrajectoryPointCount];
-        for (int32 i = 0; i < PoseSearchSchema::TrajectoryPointCount; i++)
+        const int32 pointCount = Math::Min(bakedSchema.TrajectorySampleTimes.Count(), FeatureLayout::MaxTrajectoryPoints);
+        TrajectoryPoint synth[FeatureLayout::MaxTrajectoryPoints];
+        for (int32 i = 0; i < pointCount; i++)
         {
             synth[i].Position = Float3(100.0f + i * 20.0f, 0.0f, 50.0f + i * 30.0f);
             synth[i].Facing = Float3(0.0f, 0.0f, 1.0f);
@@ -758,20 +759,20 @@ bool MotionMatchingSearch::RunSelfTest(
         Matrix actorWorld = Matrix::Identity;
         Matrix rootWorld = Matrix::Identity;
         rootWorld.SetTranslation(Float3(100.0f, 0.0f, 50.0f)); // root sits at the offset origin
-        float raw[PoseSearchSchema::GetTrajectoryFeatureSize()];
+        float raw[FeatureLayout::MaxTrajectoryFeatureSize];
         String trajError;
         phaseETest++;
         tested++;
-        if (MotionMatchingQuery::BuildRawTrajectory(synth, actorWorld, rootWorld, bakedSchema, raw, trajError))
+        if (MotionMatchingQuery::BuildRawTrajectory(synth, pointCount, actorWorld, rootWorld, bakedSchema, raw, trajError))
         {
-            const int32 zi = (zeroIdx >= 0 ? zeroIdx : PoseSearchSchema::TrajectoryPointCount / 2) *
-                PoseSearchSchema::TrajectoryFloatsPerPoint;
+            const int32 zi = (zeroIdx >= 0 ? zeroIdx : pointCount / 2) *
+                FeatureLayout::TrajectoryFloatsPerPoint;
             const bool zeroOk = std::fabs(raw[zi]) <= 0.0001f &&
                 std::fabs(raw[zi + 1]) <= 0.0001f &&
                 std::fabs(raw[zi + 2]) <= 0.0001f &&
                 std::fabs(raw[zi + 3] - 1.0f) <= 0.0001f;
             bool allFinite = true;
-            for (int32 i = 0; i < PoseSearchSchema::GetTrajectoryFeatureSize(); i++)
+            for (int32 i = 0; i < pointCount * FeatureLayout::TrajectoryFloatsPerPoint; i++)
                 allFinite &= std::isfinite(raw[i]);
             if (zeroOk && allFinite)
             {
@@ -1763,10 +1764,14 @@ bool MotionMatchingSearch::RunSelfTest(
     int32 phaseOTest = 0;
     int32 phaseOPass = 0;
     {
-        // O1: feature sizes (pose 44 = 7 bones * 6 + 2 contacts, traj 30).
+        // O1: feature sizes follow the declared layout (pose = bones * 6 +
+        // contacts, trajectory = points * 5; 44/30 for the reference biped).
+        const FeatureLayout& layout = database->GetLayout();
+        const int32 wantPose = layout.PoseBoneCount * FeatureLayout::PoseFloatsPerBone + layout.ContactCount;
+        const int32 wantTrajectory = layout.TrajectoryPointCount * FeatureLayout::TrajectoryFloatsPerPoint;
         phaseOTest++;
         tested++;
-        bool sizeOk = poseFeatureSize == 44 && trajectoryFeatureSize == 30;
+        bool sizeOk = layout.IsValid() && poseFeatureSize == wantPose && trajectoryFeatureSize == wantTrajectory;
         if (sizeOk)
         {
             phaseOPass++;
@@ -1775,9 +1780,11 @@ bool MotionMatchingSearch::RunSelfTest(
         else
         {
             log += String::Format(
-                TEXT("Contact-size FAIL: pose={} traj={} (want 44/30).\n"),
+                TEXT("Contact-size FAIL: pose={} traj={} (want {}/{}).\n"),
                 poseFeatureSize,
-                trajectoryFeatureSize);
+                trajectoryFeatureSize,
+                wantPose,
+                wantTrajectory);
         }
         // O2: deviations finite and positive (contact dims included).
         phaseOTest++;
@@ -1802,48 +1809,36 @@ bool MotionMatchingSearch::RunSelfTest(
         {
             log += String(TEXT("Contact-deviation FAIL: non-finite/non-positive deviation.\n"));
         }
-        // O3/O4: flipping contact bits (42/43) must change the reference cost
-        // (proves they participate; exact cost ~0, flipped clearly > 0).
-        const int32 contactL = 42;
-        const int32 contactR = 43;
-        if (poseFeatureSize > contactR && sampleCount > 0)
+        // O3..: flipping each declared contact bit must change the reference
+        // cost (proves it participates; exact cost ~0, flipped clearly > 0).
+        if (layout.IsValid() && sampleCount > 0)
         {
             buildExactQuery(0, queryPose, queryTrajectory);
             const float base = FullSampleCost(*database, queryPose, queryTrajectory, settings, -1, 0, false);
-            queryPose[contactL] += 1.0f;
-            const float flipL = FullSampleCost(*database, queryPose, queryTrajectory, settings, -1, 0, false);
-            phaseOTest++;
-            tested++;
-            bool okL = std::isfinite(flipL) && flipL > base + 0.00001f;
-            if (okL)
+            for (int32 contact = 0; contact < layout.ContactCount; contact++)
             {
-                phaseOPass++;
-                passed++;
-            }
-            else
-            {
-                log += String::Format(
-                    TEXT("Contact-L FAIL: base={:.6f} flipped={:.6f}.\n"),
-                    base,
-                    flipL);
-            }
-            queryPose[contactL] -= 1.0f;
-            queryPose[contactR] += 1.0f;
-            const float flipR = FullSampleCost(*database, queryPose, queryTrajectory, settings, -1, 0, false);
-            phaseOTest++;
-            tested++;
-            bool okR = std::isfinite(flipR) && flipR > base + 0.00001f;
-            if (okR)
-            {
-                phaseOPass++;
-                passed++;
-            }
-            else
-            {
-                log += String::Format(
-                    TEXT("Contact-R FAIL: base={:.6f} flipped={:.6f}.\n"),
-                    base,
-                    flipR);
+                const int32 offset = layout.GetContactFeatureOffset(contact);
+                if (offset < 0 || offset >= poseFeatureSize)
+                    continue;
+                queryPose[offset] += 1.0f;
+                const float flipped = FullSampleCost(*database, queryPose, queryTrajectory, settings, -1, 0, false);
+                queryPose[offset] -= 1.0f;
+                phaseOTest++;
+                tested++;
+                const bool ok = std::isfinite(flipped) && flipped > base + 0.00001f;
+                if (ok)
+                {
+                    phaseOPass++;
+                    passed++;
+                }
+                else
+                {
+                    log += String::Format(
+                        TEXT("Contact {} FAIL: base={:.6f} flipped={:.6f}.\n"),
+                        contact,
+                        base,
+                        flipped);
+                }
             }
         }
     }

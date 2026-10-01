@@ -5,7 +5,9 @@ input-provider contract. References the engine only — never a game.
 
 - `Source/MotionMatching` — runtime module (native search/query/policy/
   playback/database/baker + C# shell and contract DTOs + trajectory math
-  helper). No locomotion policy: gait/scope decisions live in the host.
+  helper). No locomotion policy: gait/scope decisions live in the host. The
+  feature layout (pose bones, contacts, trajectory points) is declared by the
+  host's schema; no rig or biped roles are built in.
 - `Source/MotionMatchingEditor` — editor module (services, baker/tuning/
   registry windows, generic registry import/export, baker/tuning, and contract
   tests). Registry entries carry their own asset paths, tags, loop flags and
@@ -28,10 +30,11 @@ builds and runs the plugin there.
 - [Public contract](docs/PLUGIN_CONTRACT.md): input/output ownership, coordinates,
   tag/filter semantics, and the explicit LoopOnly recovery invariant.
 - [Lifecycle](docs/LIFECYCLE.md): initialization, reset, rebind, and cleanup.
-- [Authoring](docs/AUTHORING.md): rig/schema setup, registry import/export,
-  baking, skeletons, bone aliases and retargeting.
+- [Authoring](docs/AUTHORING.md): rig/schema setup, declaring the feature
+  layout (pose bones, normalization groups, contacts, trajectory points),
+  registry import/export, baking, skeletons, bone aliases and retargeting.
 - [Migration and asset identity](docs/MIGRATION.md): database TypeName, the
-  format v4 upgrade and the bind-time checks.
+  format v4 and v5 upgrades and the bind-time checks.
 - [Changelog and version table](docs/CHANGELOG.md): release notes, plugin
   version, database `SerializedVersion`, `SchemaContractRevision` and
   `NormalizationRevision`.

@@ -33,13 +33,23 @@ PUBLIC_REFERENCES = {
         "API_FUNCTION() void Play(", "API_FUNCTION() Array<Matrix> GetSearchLocals() const",
     ),
     "Source/MotionMatching/Schema/PoseSearchSchema.h": (
-        "struct MOTIONMATCHING_API PoseSearchSchema", "API_FIELD() SkeletonProfile Skeleton;",
+        "struct MOTIONMATCHING_API PoseSearchSchema", "API_FIELD() String RootBone;",
+        "API_FIELD() Array<PoseFeatureBone> PoseBones;",
+        "API_FIELD() Array<ContactFeatureBone> ContactBones;",
+        "bool TryBuildLayout(FeatureLayout& layout, String& error) const",
+        "bool TryResolveNodes(SkinnedModel* model, NodeIndices& result, String& error) const",
         "TrajectorySampleTimes", "bool TryValidate(String& error) const",
         "float ContactMaxSpeed", "float ContactMaxHeight", "Array<BoneAlias> BoneAliases;",
     ),
     "Source/MotionMatching/Database/MotionMatchingDatabase.h": (
         "class MOTIONMATCHING_API MotionMatchingDatabase", "GetClipTags",
         "GetClipLoop", "GetClipGroup", "ValidateSavedDatabase", "CheckSkeleton",
+        "GetPoseBoneCount()", "GetContactCount()", "GetTrajectoryPointCount()",
+        "GetPlanarUpAxis()", "GetFeatureLayoutHash()",
+    ),
+    "Source/MotionMatching/Schema/FeatureLayout.h": (
+        "struct MOTIONMATCHING_API FeatureLayout", "PoseFloatsPerBone = 6",
+        "TrajectoryFloatsPerPoint = 5", "Array<int32> PoseGroups;",
     ),
     "Source/MotionMatchingEditor/MotionMatchingEditorService.cs": (
         "class ClipRegistryImportOptions", "ExportClipRegistry",
@@ -128,7 +138,8 @@ def audit(root=ROOT, overrides=None):
         if marker not in _text(root, "docs/PLUGIN_CONTRACT.md", overrides):
             failures.append("contract docs omit recovery/filter term: %s" % marker)
 
-    # Asset identity is intentionally a raw-source check (M3, format v4): new
+    # Asset identity is intentionally a raw-source check (M3, format v4; M5,
+    # format v5 adds the declared layout and keeps the upgrade chain): new
     # files carry the scripting type name; the legacy key stays registered so
     # v1-v3 files still load and upgrade.
     database_cpp = _text(root, "Source/MotionMatching/Database/MotionMatchingDatabase.cpp", overrides)
@@ -140,14 +151,15 @@ def audit(root=ROOT, overrides=None):
     for marker in ("Register(MotionMatchingDatabase::TypeName);",
                    "Register(MotionMatchingDatabase::LegacyTypeName);",
                    "context.Output.Header.TypeName = MotionMatchingDatabase::TypeName;",
-                   "{ 3, 4, &Upgrade_3_To_4 }"):
+                   "{ 3, 4, &Upgrade_3_To_4 }",
+                   "{ 4, 5, &Upgrade_4_To_5 }"):
         if marker not in database_cpp:
             failures.append("database migration marker missing: %s" % marker)
-    if "DECLARE_BINARY_ASSET_HEADER(MotionMatchingDatabase, 4)" not in database_h:
-        failures.append("database format version is not 4")
+    if "DECLARE_BINARY_ASSET_HEADER(MotionMatchingDatabase, 5)" not in database_h:
+        failures.append("database format version is not 5")
     migration = _text(root, "docs/MIGRATION.md", overrides)
     for marker in ("Game.MotionMatchingDatabase", "MotionMatching.MotionMatchingDatabase",
-                   "Upgrade_3_To_4", "rebake"):
+                   "Upgrade_3_To_4", "Upgrade_4_To_5", "rebake"):
         if marker not in migration:
             failures.append("migration docs omit TypeName/upgrade policy: %s" % marker)
     if "frozen" in migration:

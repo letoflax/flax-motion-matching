@@ -6,19 +6,54 @@ The public scripting namespace is `MotionMatching`. Since database format v4
 the serialized binary identity matches it:
 
 ```text
-MotionMatching.MotionMatchingDatabase   (format v4, written by every save)
+MotionMatching.MotionMatchingDatabase   (format v4 and v5, written by every save)
 Game.MotionMatchingDatabase             (legacy key of format v1-v3 files)
 ```
 
 The asset factory registers both keys, so a v1-v3 file still loads. In the
 editor the asset upgrader converts it in place (`Upgrade_1_To_2`,
-`Upgrade_2_To_3`, `Upgrade_3_To_4`, chained) and `Upgrade_3_To_4` rewrites the
-header TypeName to `MotionMatching.MotionMatchingDatabase`. Do not hand-edit
+`Upgrade_2_To_3`, `Upgrade_3_To_4`, `Upgrade_4_To_5`, chained) and
+`Upgrade_3_To_4` rewrites the header TypeName to
+`MotionMatching.MotionMatchingDatabase`. Do not hand-edit
 asset headers, database JSON or scene text to change the key; let the
 upgrader (or a save from the editor) do it.
 
 The legacy key does not mean the plugin runtime depends on a game assembly. It
 is only a binary asset factory key that stays registered for old files.
+
+## Format v5 upgrade (v4 -> v5): declared feature layout
+
+Format v5 replaces the eight named skeleton roles of the schema (`Skeleton`:
+Root, Pelvis, Spine, Head, LeftFoot, RightFoot, LeftHand, RightHand) with a
+declared layout (`RootBone`, `PoseBones`, `ContactBones`; see `AUTHORING.md`).
+
+What `Upgrade_4_To_5` does:
+
+- Converts the v4 roles into the equivalent declaration
+  (`PoseSearchSchema::ApplyLegacySkeleton`): `RootBone` = Root; `PoseBones` =
+  Pelvis, LeftFoot (`Foot`), RightFoot (`Foot`), Spine, Head, LeftHand
+  (`Hand`), RightHand (`Hand`), skipping empty names; `ContactBones` = the two
+  feet. This is exactly the v4 fixed layout: same bone order, same
+  normalization groups, same contact offsets.
+- Copies everything after the schema unchanged (registry, groups, baked
+  arrays, fingerprint).
+- `SchemaContractRevision` is now 4 and `BakeToolBuildId` 3, so the baked
+  arrays load as stale and are dropped (registry kept, REBAKE REQUIRED).
+
+After the rebake, a database of the converted declaration has the same
+`featuresHash` as before the upgrade: the features are bit-identical. The
+`FeatureLayoutHash` value changes (it now hashes the declared channel names),
+which is expected.
+
+Scenes and prefabs that stored a `Schema.Skeleton` block must be migrated by
+the host: write the same declaration (`RootBone`, `PoseBones`,
+`ContactBones`). Flax drops the unknown `Skeleton` key on load, so an
+unmigrated host schema has an empty layout and the controller refuses to
+bind with a validation error. flax-test ships `Tools/migrate_scene_schema.py`
+as an example of a text-only scene migration.
+
+Also new in v5: the database stores `PlanarUpAxis`, the bake model's ground
+plane normal (+Y when the file has no stored value).
 
 ## Format v4 upgrade (v3 -> v4)
 
@@ -82,7 +117,7 @@ controller stays not ready and `BindingReport` names the cause and the fix.
    `INTEGRATION.md`.
 2. Copy the database asset into the new project's Content tree or update the
    host's `DatabasePath` to its new Content-relative location.
-3. Open the project in the editor once so older databases upgrade to v4, then
+3. Open the project in the editor once so older databases upgrade to v5, then
    check that the asset loads as `MotionMatchingDatabase`.
 4. Recreate the host schema for the destination rig; do not assume a schema
    snapshot from another rig is compatible. Renamed bones go in

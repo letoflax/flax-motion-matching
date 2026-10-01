@@ -13,6 +13,7 @@
 
 #include "Engine/Content/Factories/BinaryAssetFactory.h"
 #include "Engine/Serialization/MemoryReadStream.h"
+#include "../Schema/PlanarFrame.h"
 
 #include <cmath>
 #include <cstring>
@@ -38,6 +39,7 @@ namespace
                 { 1, 2, &Upgrade_1_To_2 },
                 { 2, 3, &Upgrade_2_To_3 },
                 { 3, 4, &Upgrade_3_To_4 },
+                { 4, 5, &Upgrade_4_To_5 },
             };
             setup(upgraders, ARRAY_COUNT(upgraders));
         }
@@ -96,7 +98,7 @@ namespace
                 schema.TrajectorySampleTimes = trajectorySampleTimes;
 
             MemoryWriteStream output(4096);
-            schema.SerializeV3(output);
+            schema.SerializeV3(output, LegacySkeletonNames());
             output.Write(sourceAnimations);
             output.Write(sourceTags);
             output.Write(sourceLooping);
@@ -136,7 +138,8 @@ namespace
 
             MemoryReadStream input(chunk->Get(), chunk->Size());
             PoseSearchSchema schema;
-            schema.DeserializeV3(input);
+            LegacySkeletonNames legacy;
+            schema.DeserializeV3(input, legacy);
             Array<Guid> sourceAnimations;
             Array<String> sourceTagsFlat;
             Array<int32> sourceLooping;
@@ -169,7 +172,7 @@ namespace
             }
 
             MemoryWriteStream output(4096);
-            schema.SerializeV3(output);
+            schema.SerializeV3(output, legacy);
             output.Write(sourceAnimations);
             output.Write(sourceTags);
             output.Write(sourceLooping);
@@ -210,7 +213,8 @@ namespace
 
             MemoryReadStream input(chunk->Get(), chunk->Size());
             PoseSearchSchema schema;
-            schema.DeserializeV3(input);
+            LegacySkeletonNames legacy;
+            schema.DeserializeV3(input, legacy);
             Array<Guid> sourceAnimations;
             Array<Array<String>> sourceTags;
             Array<int32> sourceLooping;
@@ -296,7 +300,7 @@ namespace
             }
 
             MemoryWriteStream output(4096);
-            schema.Serialize(output);
+            schema.SerializeV4(output, legacy);
             output.Write(sourceAnimations);
             output.Write(sourceTags);
             output.Write(sourceLooping);
@@ -324,6 +328,57 @@ namespace
                 "Motion matching database upgraded to v4: kept {} registered clips ({} groups recovered from the v3 baked bands), baked data cleared (re-bake required).",
                 sourceAnimations.Count(),
                 recovered);
+            return false;
+        }
+
+        /// <summary>
+        /// v4 -> v5 (format v5: the schema declares the feature layout with
+        /// RootBone, PoseBones and ContactBones instead of eight named
+        /// skeleton roles). The v4 roles convert to the equivalent
+        /// declaration (PoseSearchSchema::ApplyLegacySkeleton: same bone
+        /// order, groups and contacts as the v4 fixed layout). Everything
+        /// after the schema is copied unchanged; the bumped schema contract
+        /// revision then drops the baked arrays on load (registry kept,
+        /// REBAKE REQUIRED).
+        /// </summary>
+        static bool Upgrade_4_To_5(AssetMigrationContext& context)
+        {
+            const FlaxChunk* chunk = context.Input.Header.Chunks[0];
+            if (chunk == nullptr || !chunk->IsLoaded())
+            {
+                LOG(Warning, "Motion matching database upgrade failed: missing data chunk.");
+                return true;
+            }
+
+            MemoryReadStream input(chunk->Get(), chunk->Size());
+            PoseSearchSchema schema;
+            LegacySkeletonNames legacy;
+            schema.DeserializeV4(input, legacy);
+            if (input.HasError())
+            {
+                LOG(Warning, "Motion matching database upgrade failed: corrupted v4 schema.");
+                return true;
+            }
+            schema.ApplyLegacySkeleton(legacy);
+            const uint32 schemaEnd = input.GetPosition();
+
+            MemoryWriteStream output(4096 + chunk->Size());
+            schema.Serialize(output);
+            const uint32 restLength = chunk->Size() - schemaEnd;
+            if (restLength > 0)
+                output.WriteBytes(static_cast<const byte*>(chunk->Get()) + schemaEnd, restLength);
+
+            if (context.AllocateChunk(0))
+                return true;
+            context.Output.Header.Chunks[0]->Data.Copy(ToSpan(output));
+            context.Output.Header.TypeName = MotionMatchingDatabase::TypeName;
+
+            LOG(
+                Info,
+                "Motion matching database upgraded to v5: schema layout declared from the v4 skeleton roles (root '{}', {} pose bones, {} contacts); baked data must be rebaked.",
+                schema.RootBone,
+                schema.PoseBones.Count(),
+                schema.ContactBones.Count());
             return false;
         }
 
@@ -548,9 +603,9 @@ float MotionMatchingDatabase::GetClipTurnAngle(int32 clipIndex) const
 }
 
 // One-time per load/bake: signed total yaw travel per clip from baked root
-// forwards (same atan2(x, z) convention as the C# audit, so bucket matching
-// and native penalties agree). Derived data — never serialized, recomputed
-// here, so old .flax files need no migration.
+// forwards, projected on the stored ground plane (PlanarFrame; a Y-up model
+// keeps the atan2(x, z) convention exactly). Derived data, never
+// serialized, recomputed here, so old .flax files need no migration.
 void MotionMatchingDatabase::ComputeClipTurnAngles()
 {
     _clipTurnAngles.Clear();
@@ -566,13 +621,13 @@ void MotionMatchingDatabase::ComputeClipTurnAngles()
         const int32 n = _clipSampleCounts[c];
         for (int32 i = 1; i < n && cursor + i < _rootForwards.Count(); i++)
         {
-            const Float3& a = _rootForwards[cursor + i - 1];
-            const Float3& b = _rootForwards[cursor + i];
-            const float aLenSq = a.X * a.X + a.Z * a.Z;
-            const float bLenSq = b.X * b.X + b.Z * b.Z;
+            const Float2 a = PlanarFrame::Project(_rootForwards[cursor + i - 1], _planarUpAxis);
+            const Float2 b = PlanarFrame::Project(_rootForwards[cursor + i], _planarUpAxis);
+            const float aLenSq = a.X * a.X + a.Y * a.Y;
+            const float bLenSq = b.X * b.X + b.Y * b.Y;
             if (aLenSq > 0.000001f && bLenSq > 0.000001f)
             {
-                float dy = Math::Atan2(b.X, b.Z) - Math::Atan2(a.X, a.Z);
+                float dy = Math::Atan2(b.X, b.Y) - Math::Atan2(a.X, a.Y);
                 while (dy > PI)
                     dy -= twoPi;
                 while (dy < -PI)
@@ -1156,7 +1211,10 @@ MotionMatchingDatabase::ValidationStatus MotionMatchingDatabase::ValidateDataSta
         _trajectoryFeatureDeviations.Count() != trajectoryFeatureSize;
     const int32 samplingHash = ComputeSamplingContractHash();
     const int32 sourceHash = ComputeSourceManifestHash();
-    const int32 currentLayoutHash = static_cast<int32>(PoseSearchSchema::GetFeatureLayoutHash());
+    // The layout this build derives from the stored schema. A schema that no
+    // longer derives a valid layout cannot be interpreted: registry-only.
+    const bool layoutInvalid = !_layout.IsValid();
+    const int32 currentLayoutHash = _currentLayoutHash;
     const bool statsStale = _normalizationRevision != PoseSearchSchema::NormalizationRevision;
     const bool layoutHashStale = _featureLayoutHash != currentLayoutHash;
     // 0 is never a valid stamped value (unknown/legacy), so equality alone is
@@ -1169,12 +1227,13 @@ MotionMatchingDatabase::ValidationStatus MotionMatchingDatabase::ValidateDataSta
         _sourceManifestHash == 0 || _sourceManifestHash != sourceHash;
     const bool bakeToolStale =
         _bakeToolBuildId == 0 || _bakeToolBuildId != BakeToolBuildId;
-    if (legacyLayout || statsStale || layoutHashStale || schemaStale ||
+    if (layoutInvalid || legacyLayout || statsStale || layoutHashStale || schemaStale ||
         samplingStale || sourceStale || bakeToolStale)
     {
         reason = String::Format(
             TEXT("{} (statsRev {} vs {}, layoutHash {} vs {}, schemaRev {} vs {}, samplingHash {} vs {}, sourceHash {} vs {}, bakeTool {} vs {}). REBAKE REQUIRED: rebake from the Motion Matching bake panel."),
-            String(legacyLayout ? TEXT("legacy feature layout") : TEXT("provenance mismatch")),
+            String(layoutInvalid ? TEXT("baked schema declares no valid feature layout")
+                : legacyLayout ? TEXT("legacy feature layout") : TEXT("provenance mismatch")),
             _normalizationRevision,
             PoseSearchSchema::NormalizationRevision,
             _featureLayoutHash,
@@ -1377,6 +1436,8 @@ void MotionMatchingDatabase::ClearBakedData()
     _sourceManifestHash = 0;
     _bakeToolBuildId = 0;
     _schema = PoseSearchSchema();
+    RebuildLayout();
+    _planarUpAxis = Float3(0.0f, 1.0f, 0.0f);
     _clipAnimations.Clear();
     _clipTags.Clear();
     _clipLooping.Clear();
@@ -1394,6 +1455,14 @@ void MotionMatchingDatabase::ClearBakedData()
     _poseFeatureDeviations.Clear();
     _trajectoryFeatureDeviations.Clear();
     _skeletonFingerprint.Clear();
+}
+
+void MotionMatchingDatabase::RebuildLayout()
+{
+    String error;
+    if (!_schema.TryBuildLayout(_layout, error))
+        _layout.Clear();
+    _currentLayoutHash = _layout.IsValid() ? static_cast<int32>(_layout.ComputeHash()) : 0;
 }
 
 void MotionMatchingDatabase::RebuildTagCounts()
@@ -1470,6 +1539,7 @@ Asset::LoadResult MotionMatchingDatabase::load()
 
     MemoryReadStream stream(chunk->Get(), chunk->Size());
     _schema.Deserialize(stream);
+    RebuildLayout();
     stream.Read(_sourceAnimations);
     stream.Read(_sourceTags);
     stream.Read(_sourceLooping);
@@ -1543,6 +1613,10 @@ Asset::LoadResult MotionMatchingDatabase::load()
         stream.Read(_sourceGroups);
     if (!stream.HasError() && stream.GetPosition() < stream.GetLength())
         _skeletonFingerprint.Deserialize(stream);
+    // v5 tail: model-space planar up axis (absent = Y-up).
+    _planarUpAxis = Float3(0.0f, 1.0f, 0.0f);
+    if (!stream.HasError() && stream.GetPosition() < stream.GetLength())
+        stream.Read(_planarUpAxis);
     // A registry written without groups reads as all-any.
     if (!stream.HasError() && _sourceGroups.IsEmpty() && _sourceAnimations.HasItems())
     {

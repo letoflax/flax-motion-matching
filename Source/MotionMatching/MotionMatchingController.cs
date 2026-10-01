@@ -631,10 +631,10 @@ public class MotionMatchingController : IDisposable
 
     public static PoseSearchSchema CreateDefaultSchema()
     {
-        // Skeleton ships EMPTY on purpose (no rig-specific names): the host
-        // owning this scene overrides every bone name for its own rig
-        // (Schema → Skeleton). PoseSearchSchema.Default already carries the
-        // empty profile, so nothing is filled in here.
+        // The feature layout ships EMPTY on purpose (no rig-specific names):
+        // the host owning this scene declares RootBone, PoseBones and
+        // ContactBones for its own rig. PoseSearchSchema.Default already
+        // carries the empty declaration, so nothing is filled in here.
         var schema = PoseSearchSchema.Default;
         schema.TrajectorySampleTimes = new float[]{ -0.4f, -0.2f, 0.0f, 0.2f, 0.4f, 0.6f};
         return schema;
@@ -649,6 +649,10 @@ public class MotionMatchingController : IDisposable
             ? (float[])schema.TrajectorySampleTimes.Clone() : Array.Empty<float>();
         copy.BoneAliases = schema.BoneAliases != null
             ? (BoneAlias[])schema.BoneAliases.Clone() : Array.Empty<BoneAlias>();
+        copy.PoseBones = schema.PoseBones != null
+            ? (PoseFeatureBone[])schema.PoseBones.Clone() : Array.Empty<PoseFeatureBone>();
+        copy.ContactBones = schema.ContactBones != null
+            ? (ContactFeatureBone[])schema.ContactBones.Clone() : Array.Empty<ContactFeatureBone>();
         return copy;
     }
 
@@ -678,15 +682,27 @@ public class MotionMatchingController : IDisposable
                 return false;
         }
 
-        if (a.Skeleton.Root != b.Skeleton.Root ||
-            a.Skeleton.Pelvis != b.Skeleton.Pelvis ||
-            a.Skeleton.Spine != b.Skeleton.Spine ||
-            a.Skeleton.Head != b.Skeleton.Head ||
-            a.Skeleton.LeftFoot != b.Skeleton.LeftFoot ||
-            a.Skeleton.RightFoot != b.Skeleton.RightFoot ||
-            a.Skeleton.LeftHand != b.Skeleton.LeftHand ||
-            a.Skeleton.RightHand != b.Skeleton.RightHand)
+        if (!string.Equals(a.RootBone ?? string.Empty, b.RootBone ?? string.Empty, StringComparison.Ordinal))
             return false;
+        var pa = a.PoseBones ?? Array.Empty<PoseFeatureBone>();
+        var pb = b.PoseBones ?? Array.Empty<PoseFeatureBone>();
+        if (pa.Length != pb.Length)
+            return false;
+        for (int i = 0; i < pa.Length; i++)
+        {
+            if (!string.Equals(pa[i].Node ?? string.Empty, pb[i].Node ?? string.Empty, StringComparison.Ordinal) ||
+                !string.Equals(pa[i].Group ?? string.Empty, pb[i].Group ?? string.Empty, StringComparison.Ordinal))
+                return false;
+        }
+        var ca = a.ContactBones ?? Array.Empty<ContactFeatureBone>();
+        var cb = b.ContactBones ?? Array.Empty<ContactFeatureBone>();
+        if (ca.Length != cb.Length)
+            return false;
+        for (int i = 0; i < ca.Length; i++)
+        {
+            if (!string.Equals(ca[i].Node ?? string.Empty, cb[i].Node ?? string.Empty, StringComparison.Ordinal))
+                return false;
+        }
 
         var ta = a.TrajectorySampleTimes ?? Array.Empty<float>();
         var tb = b.TrajectorySampleTimes ?? Array.Empty<float>();

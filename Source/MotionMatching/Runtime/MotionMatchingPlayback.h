@@ -77,10 +77,15 @@ public:
     API_FIELD() int64 SaveSearchPoseFrameId = -1;
 
 public:
+    /// <summary>
+    /// Binds the baked clips. rootBone (Schema.RootBone) names the node whose
+    /// baked translation carries the clip travel; playback strips it every
+    /// frame.
+    /// </summary>
     API_FUNCTION() void Setup(
         MotionMatchingDatabase* database,
         SkinnedModel* fallbackModel,
-        const SkeletonProfile& skeleton);
+        const String& rootBone);
     API_FUNCTION() void Stop();
     API_FUNCTION() void Play(int32 clipIndex, float startTime, bool forceSeek);
     API_FUNCTION() void ResetOnTeleport();

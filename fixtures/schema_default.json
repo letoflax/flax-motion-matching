@@ -1,0 +1,27 @@
+{
+  "contract": "PoseSearchSchema/v5",
+  "note": "Reference schema declaration used by the offline tests (mm_tests.py, mm_manifest.py). It is the flax-test PlayerTestScene schema: the 7-bone / 2-contact / 6-point biped layout whose baked featuresHash is the parity target. Field names follow PoseSearchSchema (snake_case). Keep it equal to the scene; mm_tests.py test 4 checks that.",
+  "normalization_revision": 3,
+  "schema": {
+    "sample_rate": 30,
+    "root_forward_axis": [0.0, 0.0, -1.0],
+    "root_up_axis": [0.0, 1.0, 0.0],
+    "pose_weight": 1.0,
+    "trajectory_weight": 2.0,
+    "root_bone": "RL_BoneRoot",
+    "pose_bones": [
+      {"node": "CC_Base_Hip", "group": ""},
+      {"node": "CC_Base_L_Foot", "group": "Foot"},
+      {"node": "CC_Base_R_Foot", "group": "Foot"},
+      {"node": "CC_Base_Waist", "group": ""},
+      {"node": "CC_Base_Head", "group": ""},
+      {"node": "CC_Base_L_Hand", "group": "Hand"},
+      {"node": "CC_Base_R_Hand", "group": "Hand"}
+    ],
+    "contact_bones": ["CC_Base_L_Foot", "CC_Base_R_Foot"],
+    "trajectory_sample_times": [-0.4, -0.2, 0.0, 0.2, 0.4, 0.6],
+    "contact_max_speed": 300.0,
+    "contact_max_height": 12.0,
+    "bone_aliases": []
+  }
+}

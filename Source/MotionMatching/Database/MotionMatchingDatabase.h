@@ -17,7 +17,7 @@
 API_CLASS(NoSpawn, Namespace="MotionMatching")
 class MOTIONMATCHING_API MotionMatchingDatabase : public BinaryAsset
 {
-    DECLARE_BINARY_ASSET_HEADER(MotionMatchingDatabase, 4);
+    DECLARE_BINARY_ASSET_HEADER(MotionMatchingDatabase, 5);
 
 public:
     /// <summary>
@@ -50,14 +50,18 @@ public:
     /// Rev 3 (format v4): authored clip groups replace the name-derived
     /// speed bands, the contact gate and bone aliases move into the schema,
     /// and a skeleton fingerprint is stored.
+    /// Rev 4 (format v5): the schema declares the feature layout (RootBone,
+    /// PoseBones, ContactBones, trajectory points from TrajectorySampleTimes)
+    /// instead of eight named skeleton roles, and the database stores the
+    /// model-space planar up axis.
     /// SamplingContractRevision: mixed into ComputeSamplingContractHash; bump
     /// when the T1 sampler helper semantics change without a schema value
     /// change (the hash is otherwise derived from schema sampling values).
     /// BakeToolBuildId: bump on any bake-tool (MotionMatchingBaker) change.
     /// </summary>
-    static constexpr int32 SchemaContractRevision = 3;
+    static constexpr int32 SchemaContractRevision = 4;
     static constexpr int32 SamplingContractRevision = 1;
-    static constexpr int32 BakeToolBuildId = 2;
+    static constexpr int32 BakeToolBuildId = 3;
     /// <summary>
     /// Schema snapshot captured at bake time. Meaningful only when SampleCount > 0.
     /// </summary>
@@ -71,14 +75,59 @@ public:
         return _schema.SampleRate;
     }
 
+    /// <summary>
+    /// Floats per pose feature row, from the baked schema layout (0 when the
+    /// database holds no valid layout).
+    /// </summary>
     API_PROPERTY() int32 GetPoseFeatureSize() const
     {
-        return PoseSearchSchema::GetPoseFeatureSize();
+        return _layout.PoseFeatureSize;
     }
 
+    /// <summary>
+    /// Floats per trajectory feature row, from the baked schema layout.
+    /// </summary>
     API_PROPERTY() int32 GetTrajectoryFeatureSize() const
     {
-        return PoseSearchSchema::GetTrajectoryFeatureSize();
+        return _layout.TrajectoryFeatureSize;
+    }
+
+    /// <summary>Pose bones of the baked layout.</summary>
+    API_PROPERTY() int32 GetPoseBoneCount() const
+    {
+        return _layout.PoseBoneCount;
+    }
+
+    /// <summary>Contact flags of the baked layout.</summary>
+    API_PROPERTY() int32 GetContactCount() const
+    {
+        return _layout.ContactCount;
+    }
+
+    /// <summary>Trajectory points of the baked layout (one per sample time).</summary>
+    API_PROPERTY() int32 GetTrajectoryPointCount() const
+    {
+        return _layout.TrajectoryPointCount;
+    }
+
+    /// <summary>
+    /// Runtime feature layout of the baked schema (rebuilt on load and bake).
+    /// </summary>
+    const FeatureLayout& GetLayout() const
+    {
+        return _layout;
+    }
+
+    /// <summary>
+    /// Model-space normal of the ground plane the baked root motion is read
+    /// in (yaw-rate channel, clip turn angles, clip travel): the image of the
+    /// schema RootUpAxis under the root's bind pose, snapped to a cardinal
+    /// axis. (0, 1, 0) for a Y-up model and for databases baked before it
+    /// was stored.
+    /// </summary>
+    API_PROPERTY() Float3 GetPlanarUpAxis() const
+    {
+        return _planarUpAxis;
     }
 
     /// <summary>
@@ -232,12 +281,12 @@ public:
     }
 
     /// <summary>
-    /// N1 feature-layout hash of the loaded baked data, cast from
-    /// PoseSearchSchema::GetFeatureLayoutHash (0 = unknown/legacy). A
-    /// mismatch against the current layout drops baked arrays to
-    /// registry-only with REBAKE REQUIRED, same as a revision mismatch.
+    /// Feature-layout hash of the loaded baked data, cast from
+    /// FeatureLayout::ComputeHash of the baked schema (0 = unknown/legacy).
+    /// A mismatch against the layout this build derives from the stored
+    /// schema drops baked arrays to registry-only with REBAKE REQUIRED.
     /// </summary>
-    int32 GetFeatureLayoutHash() const
+    API_PROPERTY() int32 GetFeatureLayoutHash() const
     {
         return _featureLayoutHash;
     }
@@ -469,7 +518,8 @@ public:
         const Array<float>& trajectoryFeatures,
         const Array<float>& poseFeatureDeviations,
         const Array<float>& trajectoryFeatureDeviations,
-        const MotionMatchingSkeletonFingerprint& skeletonFingerprint);
+        const MotionMatchingSkeletonFingerprint& skeletonFingerprint,
+        const Float3& planarUpAxis);
 
     void GetReferences(Array<Guid>& assets, Array<String>& files) const override;
     bool Save(const StringView& path = StringView::Empty) override;
@@ -485,6 +535,9 @@ protected:
 
 private:
     PoseSearchSchema _schema;
+    // Derived from _schema (RebuildLayout); never serialized.
+    FeatureLayout _layout;
+    int32 _currentLayoutHash = 0;
 
     Array<AssetReference<Animation>> _sourceAnimations;
     Array<Array<String>> _sourceTags;
@@ -523,7 +576,7 @@ private:
     // drops baked data with a loud "rebake required" instead of silently
     // mismatching. Registry survives.
     int32 _normalizationRevision = 0;
-    // N1 feature-layout hash, cast from PoseSearchSchema::GetFeatureLayoutHash
+    // Feature-layout hash, cast from FeatureLayout::ComputeHash
     // (0 = unknown/legacy). Second tail int after the revision; same
     // registry-only stale handling. SetBakedData stamps the current hash,
     // ClearBakedData resets it.
@@ -538,8 +591,11 @@ private:
     int32 _bakeToolBuildId = 0;
     // Skeleton the features were baked on (format v4 tail).
     MotionMatchingSkeletonFingerprint _skeletonFingerprint;
+    // Model-space planar up axis (format v5 tail, after the fingerprint).
+    Float3 _planarUpAxis = Float3(0.0f, 1.0f, 0.0f);
 
     void ClearBakedData();
+    void RebuildLayout();
     void RebuildTagCounts();
     void ComputeClipTurnAngles();
 

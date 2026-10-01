@@ -373,13 +373,37 @@ namespace
     // alone already exceeds the bound (remaining terms are >= 0). The scale
     // array already folds in sqrt(sum-normalized weight)/deviation, so the raw
     // query/baked delta is squared directly.
-    float PoseBlockCost(
+    // The block size comes from the database layout at runtime. The
+    // reference biped size (44) dispatches to a copy with a compile-time trip
+    // count, the code the fixed-layout builds produced; the arithmetic and
+    // the summation order are identical in both paths.
+    template<int32 Size>
+    FORCE_INLINE float PoseBlockCostFixed(
+        const float* queryPose,
+        const float* bakedPose,
+        const float* poseScale,
+        float pruneLimit)
+    {
+        float poseCost = 0.0f;
+        for (int32 i = 0; i < Size; i++)
+        {
+            const float delta = poseScale[i] * (queryPose[i] - bakedPose[i]);
+            poseCost += delta * delta;
+            if (poseCost > pruneLimit)
+                return poseCost;
+        }
+        return poseCost;
+    }
+
+    FORCE_INLINE float PoseBlockCost(
         const float* queryPose,
         const float* bakedPose,
         const float* poseScale,
         int32 poseFeatureSize,
         float pruneLimit)
     {
+        if (poseFeatureSize == FeatureLayout::ReferencePoseFeatureSize)
+            return PoseBlockCostFixed<FeatureLayout::ReferencePoseFeatureSize>(queryPose, bakedPose, poseScale, pruneLimit);
         float poseCost = 0.0f;
         for (int32 i = 0; i < poseFeatureSize; i++)
         {
@@ -391,8 +415,28 @@ namespace
         return poseCost;
     }
 
-    // Trajectory block, pruned against spentPoseCost + the bound.
-    float TrajectoryBlockCost(
+    // Trajectory block, pruned against spentPoseCost + the bound. Same
+    // reference-size dispatch as the pose block (30 floats for the reference layout).
+    template<int32 Size>
+    FORCE_INLINE float TrajectoryBlockCostFixed(
+        const float* queryTrajectory,
+        const float* bakedTrajectory,
+        const float* trajectoryScale,
+        float spentPoseCost,
+        float pruneLimit)
+    {
+        float trajectoryCost = 0.0f;
+        for (int32 i = 0; i < Size; i++)
+        {
+            const float delta = trajectoryScale[i] * (queryTrajectory[i] - bakedTrajectory[i]);
+            trajectoryCost += delta * delta;
+            if (spentPoseCost + trajectoryCost > pruneLimit)
+                return trajectoryCost;
+        }
+        return trajectoryCost;
+    }
+
+    FORCE_INLINE float TrajectoryBlockCost(
         const float* queryTrajectory,
         const float* bakedTrajectory,
         const float* trajectoryScale,
@@ -400,6 +444,11 @@ namespace
         float spentPoseCost,
         float pruneLimit)
     {
+        if (trajectoryFeatureSize == FeatureLayout::ReferenceTrajectoryFeatureSize)
+        {
+            return TrajectoryBlockCostFixed<FeatureLayout::ReferenceTrajectoryFeatureSize>(
+                queryTrajectory, bakedTrajectory, trajectoryScale, spentPoseCost, pruneLimit);
+        }
         float trajectoryCost = 0.0f;
         for (int32 i = 0; i < trajectoryFeatureSize; i++)
         {
@@ -512,17 +561,17 @@ namespace
 
         // One scale pass per reference call: weight pipeline is O(dims) and
         // this path is used by the exact verifier/SampleCost only.
-        float stackPoseScale[PoseSearchSchema::GetPoseFeatureSize()];
-        float stackTrajectoryScale[PoseSearchSchema::GetTrajectoryFeatureSize()];
+        float stackPoseScale[FeatureLayout::ReferencePoseFeatureSize];
+        float stackTrajectoryScale[FeatureLayout::ReferenceTrajectoryFeatureSize];
         Array<float> heapPoseScale, heapTrajectoryScale;
         float* poseScale = stackPoseScale;
         float* trajectoryScale = stackTrajectoryScale;
-        if (poseFeatureSize > PoseSearchSchema::GetPoseFeatureSize())
+        if (poseFeatureSize > FeatureLayout::ReferencePoseFeatureSize)
         {
             heapPoseScale.Resize(poseFeatureSize);
             poseScale = heapPoseScale.Get();
         }
-        if (trajectoryFeatureSize > PoseSearchSchema::GetTrajectoryFeatureSize())
+        if (trajectoryFeatureSize > FeatureLayout::ReferenceTrajectoryFeatureSize)
         {
             heapTrajectoryScale.Resize(trajectoryFeatureSize);
             trajectoryScale = heapTrajectoryScale.Get();
@@ -1517,17 +1566,17 @@ void MotionMatchingSearch::FindTopCandidates(
     }
 
     // N1b: raw query + one per-dim scale pass (same pipeline as FindBest).
-    float stackPoseScale[PoseSearchSchema::GetPoseFeatureSize()];
-    float stackTrajectoryScale[PoseSearchSchema::GetTrajectoryFeatureSize()];
+    float stackPoseScale[FeatureLayout::ReferencePoseFeatureSize];
+    float stackTrajectoryScale[FeatureLayout::ReferenceTrajectoryFeatureSize];
     Array<float> heapPoseScale, heapTrajectoryScale;
     float* poseScale = stackPoseScale;
     float* trajectoryScale = stackTrajectoryScale;
-    if (poseFeatureSize > PoseSearchSchema::GetPoseFeatureSize())
+    if (poseFeatureSize > FeatureLayout::ReferencePoseFeatureSize)
     {
         heapPoseScale.Resize(poseFeatureSize);
         poseScale = heapPoseScale.Get();
     }
-    if (trajectoryFeatureSize > PoseSearchSchema::GetTrajectoryFeatureSize())
+    if (trajectoryFeatureSize > FeatureLayout::ReferenceTrajectoryFeatureSize)
     {
         heapTrajectoryScale.Resize(trajectoryFeatureSize);
         trajectoryScale = heapTrajectoryScale.Get();
@@ -1777,17 +1826,17 @@ void MotionMatchingSearch::FindBest(
     // scale*(raw query - raw baked). Fixed stack caps cover the v3 layout
     // (44 + 30); larger future schemas fall back to heap. Shared with the
     // top-N/tooling path.
-    float stackPoseScale[PoseSearchSchema::GetPoseFeatureSize()];
-    float stackTrajectoryScale[PoseSearchSchema::GetTrajectoryFeatureSize()];
+    float stackPoseScale[FeatureLayout::ReferencePoseFeatureSize];
+    float stackTrajectoryScale[FeatureLayout::ReferenceTrajectoryFeatureSize];
     Array<float> heapPoseScale, heapTrajectoryScale;
     float* poseScale = stackPoseScale;
     float* trajectoryScale = stackTrajectoryScale;
-    if (poseFeatureSize > PoseSearchSchema::GetPoseFeatureSize())
+    if (poseFeatureSize > FeatureLayout::ReferencePoseFeatureSize)
     {
         heapPoseScale.Resize(poseFeatureSize);
         poseScale = heapPoseScale.Get();
     }
-    if (trajectoryFeatureSize > PoseSearchSchema::GetTrajectoryFeatureSize())
+    if (trajectoryFeatureSize > FeatureLayout::ReferenceTrajectoryFeatureSize)
     {
         heapTrajectoryScale.Resize(trajectoryFeatureSize);
         trajectoryScale = heapTrajectoryScale.Get();

@@ -20,12 +20,14 @@ public:
     /// <summary>
     /// Samples the database source clips, bakes normalized pose and trajectory
     /// features, stores the schema snapshot, then saves the database asset.
-    /// Feature sizes are defined by PoseSearchSchema (pose: 7 bones x pos+vel
-    /// + 2 foot contacts, trajectory: 6 points x planar pos+dir+yawrate).
-    /// Schema weights are stored but not applied. Before sampling, the bake
-    /// logs a channel coverage report (clip channels vs model nodes, alias
-    /// suggestions) and FAILS when Root/Pelvis/LeftFoot/RightFoot have no
-    /// channel in some clip. The skeleton fingerprint stored with the data
+    /// The feature layout is declared by the schema (pose: one pos+vel per
+    /// PoseBones entry + one flag per ContactBones entry, trajectory: one
+    /// planar pos+dir+yawrate point per TrajectorySampleTimes entry).
+    /// Schema weights are stored but not applied. The bake FAILS when a
+    /// declared node is missing in the model; before sampling it logs a
+    /// channel coverage report (clip channels vs model nodes, alias
+    /// suggestions) and FAILS when RootBone or a pose bone has no channel
+    /// in some clip. The skeleton fingerprint stored with the data
     /// lets a controller refuse a model the clips do not fit.
     /// </summary>
     API_FUNCTION()

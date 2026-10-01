@@ -301,10 +301,12 @@ private:
     //   for the ExcludedTagSet split and its '+'-joined form for RunQuery
     //   settings + trace/telemetry entries (TryFastPath uses its own
     //   _fastExcludedKey/_fastExcludedCache/_fastExcludedJoin below).
-    // - _poseScratch/_prevScratch: Tick pose-sample scratch (44/21 floats).
-    //   Passed to the samplers instead of per-tick locals; Resize only when
-    //   the feature size changes (schema-fixed sizes).
-    // - _tickTrajScratch: BuildLiveTrajectory scratch (30 floats). Same rule.
+    // - _poseScratch/_prevScratch: Tick pose-sample scratch (pose feature
+    //   size / pose bones * 3 floats of the baked layout, 44/21 for the
+    //   reference biped). Passed to the samplers instead of per-tick locals;
+    //   Resize only when the baked layout changes.
+    // - _tickTrajScratch: BuildLiveTrajectory scratch (trajectory feature
+    //   size of the baked layout). Same rule.
     // RunQuery uses its params + _tickTrajectory (no per-tick member copies).
     // _snapshot itself is assigned field-wise
     // only on change (Tick) so steady-state copies no native Strings.

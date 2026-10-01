@@ -1,4 +1,5 @@
 #include "MotionMatchingRuntimePolicy.h"
+#include "../Schema/PlanarFrame.h"
 
 #include "../Database/MotionMatchingDatabase.h"
 #include "../Search/MotionMatchingSearch.h"
@@ -138,11 +139,11 @@ void MotionMatchingRuntimePolicy::Initialize(
     if (body != nullptr)
     {
         fallbackModel = body->SkinnedModel.Get();
-        _playback->Setup(database, fallbackModel, schema.Skeleton);
+        _playback->Setup(database, fallbackModel, schema.RootBone);
     }
     else
     {
-        _playback->Setup(database, nullptr, schema.Skeleton);
+        _playback->Setup(database, nullptr, schema.RootBone);
     }
     _queryTimer = 0.0f;
     _timeSinceSwitch = 999.0f;
@@ -186,7 +187,7 @@ void MotionMatchingRuntimePolicy::Initialize(
     }
 
     String resolveError;
-    if (!MotionMatchingSkeleton::TryResolve(schema.Skeleton, model, _nodes, resolveError))
+    if (!schema.TryResolveNodes(model, _nodes, resolveError))
     {
         const StringAnsi errorAnsi(resolveError);
         char message[512];
@@ -217,11 +218,22 @@ void MotionMatchingRuntimePolicy::Initialize(
         }
     }
 
-    _prevPositions.Resize(21);
-    for (int32 i = 0; i < 21; i++)
+    // Scratch sized from the baked layout (CheckSchemaBinding above proved
+    // the live declaration equals the baked one).
+    const FeatureLayout& layout = database->GetLayout();
+    const int32 prevCount = layout.GetPositionBlockSize();
+    const int32 packedCount = layout.TrajectoryPointCount * 6;
+    if (prevCount <= 0 || packedCount <= 0 ||
+        layout.PoseBoneCount != _nodes.PoseBones.Count())
+    {
+        LOG(Warning, "Motion matching policy disabled: the database has no usable feature layout (rebake required).");
+        return;
+    }
+    _prevPositions.Resize(prevCount);
+    for (int32 i = 0; i < prevCount; i++)
         _prevPositions[i] = 0.0f;
-    _packedTrajectory.Resize(36);
-    for (int32 i = 0; i < 36; i++)
+    _packedTrajectory.Resize(packedCount);
+    for (int32 i = 0; i < packedCount; i++)
         _packedTrajectory[i] = 0.0f;
     _hasPrevPositions = false;
     _usedSearchSnapshot = false;
@@ -330,6 +342,8 @@ bool MotionMatchingRuntimePolicy::ExportClipAudit(MotionMatchingDatabase* db, co
         error = String(TEXT("Clip audit stopped: database motion arrays are empty."));
         return false;
     }
+    // Ground plane of the baked root motion (Y-up keeps the (x, z) formulas).
+    const Float3 planarUp = db->GetPlanarUpAxis();
     Array<float> travel;
     Array<float> turnAngle;
     Array<float> net;
@@ -347,10 +361,10 @@ bool MotionMatchingRuntimePolicy::ExportClipAudit(MotionMatchingDatabase* db, co
         for (int32 i = 1; i < n && cursor + i < positions.Count() && cursor + i < forwards.Count(); i++)
         {
             const Float3 dp = positions[cursor + i] - positions[cursor + i - 1];
-            path += Float2(dp.X, dp.Z).Length();
+            path += PlanarFrame::Project(dp, planarUp).Length();
             last = positions[cursor + i];
-            const Float2 a(forwards[cursor + i - 1].X, forwards[cursor + i - 1].Z);
-            const Float2 b(forwards[cursor + i].X, forwards[cursor + i].Z);
+            const Float2 a = PlanarFrame::Project(forwards[cursor + i - 1], planarUp);
+            const Float2 b = PlanarFrame::Project(forwards[cursor + i], planarUp);
             if (a.LengthSquared() > 0.000001f && b.LengthSquared() > 0.000001f)
             {
                 // Signed yaw travel (radians, engine convention): same
@@ -365,7 +379,7 @@ bool MotionMatchingRuntimePolicy::ExportClipAudit(MotionMatchingDatabase* db, co
                 yaw += dy;
             }
         }
-        const float netDist = Float2(last.X - first.X, last.Z - first.Z).Length();
+        const float netDist = PlanarFrame::Project(last - first, planarUp).Length();
         travel[c] = path;
         turnAngle[c] = yaw;
         net[c] = netDist;
@@ -393,7 +407,7 @@ bool MotionMatchingRuntimePolicy::ExportClipAudit(MotionMatchingDatabase* db, co
                 for (int32 i = 1; i < n && vcursor + i < velocities.Count(); i++)
                 {
                     const Float3 dv = velocities[vcursor + i] - velocities[vcursor + i - 1];
-                    const float a = Float2(dv.X, dv.Z).Length() / dt;
+                    const float a = PlanarFrame::Project(dv, planarUp).Length() / dt;
                     for (const String& tag : tagSet)
                     {
                         int32 found = -1;
@@ -598,11 +612,15 @@ bool MotionMatchingRuntimePolicy::CheckSchemaBinding(SkinnedModel* model, String
     differs(!AxesNear(live.RootUpAxis, baked.RootUpAxis), TEXT("RootUpAxis"));
     differs(!TimesEqual(live.TrajectorySampleTimes, baked.TrajectorySampleTimes), TEXT("TrajectorySampleTimes"));
     differs(live.ContactMaxSpeed != baked.ContactMaxSpeed || live.ContactMaxHeight != baked.ContactMaxHeight, TEXT("ContactMaxSpeed/ContactMaxHeight"));
-    differs(live.Skeleton.Root != baked.Skeleton.Root || live.Skeleton.Pelvis != baked.Skeleton.Pelvis ||
-        live.Skeleton.Spine != baked.Skeleton.Spine || live.Skeleton.Head != baked.Skeleton.Head ||
-        live.Skeleton.LeftFoot != baked.Skeleton.LeftFoot || live.Skeleton.RightFoot != baked.Skeleton.RightFoot ||
-        live.Skeleton.LeftHand != baked.Skeleton.LeftHand || live.Skeleton.RightHand != baked.Skeleton.RightHand,
-        TEXT("Skeleton"));
+    differs(live.RootBone != baked.RootBone, TEXT("RootBone"));
+    bool poseBonesDiffer = live.PoseBones.Count() != baked.PoseBones.Count();
+    for (int32 i = 0; !poseBonesDiffer && i < live.PoseBones.Count(); i++)
+        poseBonesDiffer = !(live.PoseBones[i] == baked.PoseBones[i]);
+    differs(poseBonesDiffer, TEXT("PoseBones"));
+    bool contactBonesDiffer = live.ContactBones.Count() != baked.ContactBones.Count();
+    for (int32 i = 0; !contactBonesDiffer && i < live.ContactBones.Count(); i++)
+        contactBonesDiffer = !(live.ContactBones[i] == baked.ContactBones[i]);
+    differs(contactBonesDiffer, TEXT("ContactBones"));
     bool aliasesDiffer = live.BoneAliases.Count() != baked.BoneAliases.Count();
     for (int32 i = 0; !aliasesDiffer && i < live.BoneAliases.Count(); i++)
         aliasesDiffer = !(live.BoneAliases[i] == baked.BoneAliases[i]);
@@ -730,6 +748,7 @@ void MotionMatchingRuntimePolicy::EnsureClipSpeedCache()
     if (counts.Count() != clipCount || positions.Count() == 0)
         return;
     _clipSpeeds.Resize(clipCount);
+    const Float3 planarUp = db->GetPlanarUpAxis();
     int32 cursor = 0;
     for (int32 c = 0; c < clipCount; c++)
     {
@@ -741,8 +760,8 @@ void MotionMatchingRuntimePolicy::EnsureClipSpeedCache()
             float path = 0.0f;
             for (int32 i = 1; i < n; i++)
             {
-                const Float3 dp = positions[cursor + i] - positions[cursor + i - 1];
-                path += Math::Sqrt(dp.X * dp.X + dp.Z * dp.Z);
+                const Float2 dp = PlanarFrame::Project(positions[cursor + i] - positions[cursor + i - 1], planarUp);
+                path += Math::Sqrt(dp.X * dp.X + dp.Y * dp.Y);
             }
             speed = path / len;
         }
@@ -838,13 +857,13 @@ void MotionMatchingRuntimePolicy::Tick(
     String poseError;
     if (haveSnapshot)
     {
-        sampled = MotionMatchingQuery::SampleSearchPose(_body, searchLocals, _nodes, sampleDt,
+        sampled = MotionMatchingQuery::SampleSearchPose(_body, searchLocals, _nodes, _database->GetLayout(), sampleDt,
             _prevPositions, _database->GetSchema(), _poseScratch, _prevScratch, rootWorld, poseError);
     }
     else
     {
-        sampled = MotionMatchingQuery::SampleLivePose(_body, _nodes, sampleDt, _prevPositions,
-            _poseScratch, _prevScratch, rootWorld, poseError);
+        sampled = MotionMatchingQuery::SampleLivePose(_body, _nodes, _database->GetLayout(), sampleDt, _prevPositions,
+            _database->GetSchema(), _poseScratch, _prevScratch, rootWorld, poseError);
     }
     if (sampled)
     {
@@ -880,9 +899,10 @@ void MotionMatchingRuntimePolicy::Tick(
     // the resulting filter per tick (Tick params above). The fast-path yields
     // to a changed caller filter via the signature check inside TryFastPath.
     _tickTrajectory.Clear();
-    if (_poseValid && trajectoryPoints.Count() == 6)
+    const int32 trajectoryPointCount = _database->GetTrajectoryPointCount();
+    if (_poseValid && trajectoryPointCount > 0 && trajectoryPoints.Count() == trajectoryPointCount)
     {
-        for (int32 i = 0; i < 6; i++)
+        for (int32 i = 0; i < trajectoryPointCount; i++)
         {
             _packedTrajectory[i * 6] = trajectoryPoints[i].Position.X;
             _packedTrajectory[i * 6 + 1] = trajectoryPoints[i].Position.Y;
@@ -1103,9 +1123,10 @@ void MotionMatchingRuntimePolicy::RunQuery(const Array<TrajectoryPoint>& traject
         return;
     }
 
-    if (trajectoryPoints.Count() != 6)
+    if (trajectoryPoints.Count() != _database->GetTrajectoryPointCount())
     {
-        WarnOnce(String(TEXT("Motion matching query skipped: trajectory has 6 points.")));
+        WarnOnce(String::Format(TEXT("Motion matching query skipped: the host passed {} trajectory points, the schema declares {} sample times."),
+            trajectoryPoints.Count(), _database->GetTrajectoryPointCount()));
         return;
     }
 

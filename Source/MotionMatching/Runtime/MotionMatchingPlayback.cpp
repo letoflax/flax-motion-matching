@@ -110,7 +110,7 @@ float MotionMatchingPlayback::GetCurrentClipLength() const
 void MotionMatchingPlayback::Setup(
     MotionMatchingDatabase* database,
     SkinnedModel* fallbackModel,
-    const SkeletonProfile& skeleton)
+    const String& rootBone)
 {
     Stop();
     _database = database;
@@ -147,21 +147,22 @@ void MotionMatchingPlayback::Setup(
     // clip's travel through space and must be stripped every frame
     // (see Tick), otherwise the body teleports meters away on walk/run.
     SkinnedModel* resolveModel = _fallbackModel;
-    NodeIndices nodes;
-    String resolveError;
-    if (resolveModel != nullptr && MotionMatchingSkeleton::TryResolve(skeleton, resolveModel, nodes, resolveError))
+    const int32 rootIndex = resolveModel != nullptr && rootBone.HasChars() && !resolveModel->WaitForLoaded()
+        ? resolveModel->FindNode(rootBone)
+        : -1;
+    if (rootIndex >= 0)
     {
-        _rootNodeIndex = nodes.Root;
+        _rootNodeIndex = rootIndex;
     }
     else if (resolveModel != nullptr)
     {
-        // Fail-fast with the resolve reason: an empty profile means the host
-        // never configured the skeleton for its rig (the struct ships empty
-        // with no mannequin fallback); indices stay -1 and travel is NOT
-        // stripped until the host configures it.
-        LOG(Warning, "Motion matching playback skeleton not resolved: {}. "
-            "Configure the SkeletonProfile for your rig "
-            "(scene → MotionMatchingController → Schema → Skeleton).", resolveError);
+        // Fail-fast: an empty or unknown root means the host never declared
+        // the layout for its rig (the schema ships empty, with no mannequin
+        // fallback); the index stays -1 and travel is NOT stripped until the
+        // host configures it.
+        LOG(Warning, "Motion matching playback root node '{}' not found in the model. "
+            "Declare Schema.RootBone for your rig "
+            "(scene -> MotionMatchingController -> Schema).", rootBone);
     }
     EnsureHierarchy(resolveModel);
 }

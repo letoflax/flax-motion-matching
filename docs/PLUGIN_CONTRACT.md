@@ -11,7 +11,7 @@ depending on this repository's player or sample code.
 | `IMotionMatchingInputProvider` | host | Convert host state into one `MotionMatchingFrameInput` per tick. |
 | `MotionMatchingInputContext` | plugin -> provider | Time, frame id, actor world transform, database tags, and sample times. |
 | `MotionMatchingFrameInput` | provider -> plugin | Trajectory, scope, and explicit caller filters for one tick. |
-| `PoseSearchSchema` | host authoring | Rig names, axes, sample times, and live search weights. |
+| `PoseSearchSchema` | host authoring | Axes, the declared feature layout (`RootBone`, `PoseBones`, `ContactBones`, sample times), and live search weights. |
 | `MotionMatchingPlayback` | plugin, borrowed by host | Read current playback/base-pose state; never destroy the handle. |
 | `MotionMatchingEditorService` | host editor tooling | Registry, bake, validation, audit, tuning, and top-candidate operations. |
 
@@ -29,10 +29,24 @@ boundary receives only plain scope/filter data and trajectory points.
   `SampleTimes` entry (past from its own history, future from its own motion
   model) in the actor frame, X = right and Z = forward. The flax-test game does
   this in `Source/Game/Animation/Trajectory/TrajectoryPredictor.cs`.
-- `SampleTimes` must contain the six strictly ascending times used by the
-  schema, spanning negative and positive time around zero.
+- `SampleTimes` must contain the strictly ascending times used by the schema
+  (one point each, 1 to 32), spanning negative and positive time around zero.
+  The point count comes from the baked database
+  (`MotionMatchingDatabase.TrajectoryPointCount`), never from a constant.
 - A host tick updates its provider state, calls `BuildInput(context)`, then
   calls `controller.Update(deltaTime, actorWorld, frame)`.
+
+## Feature layout
+
+The layout is declared by the schema and baked into the database (see
+`AUTHORING.md`, declaring the feature layout). Pose and trajectory sizes,
+contact offsets and normalization groups are derived from it at run time
+(`FeatureLayout`); the database exposes `PoseFeatureSize`,
+`TrajectoryFeatureSize`, `PoseBoneCount`, `ContactCount`,
+`TrajectoryPointCount`, `PlanarUpAxis` and `FeatureLayoutHash`. A declared
+node missing from the bake or bound model is an error, never a silent skip.
+Hosts must not hardcode feature sizes or bone roles: the plugin has no
+pelvis/foot/hand roles of its own.
 
 ## Scope and filter semantics
 

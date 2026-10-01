@@ -85,14 +85,14 @@ bool MotionMatchingPlayback::RunPlaybackSelfTest(MotionMatchingDatabase* databas
     const PoseSearchSchema& schema = database->GetSchema();
     NodeIndices nodes;
     String resolveError;
-    if (!MotionMatchingSkeleton::TryResolve(schema.Skeleton, model, nodes, resolveError))
+    if (!schema.TryResolveNodes(model, nodes, resolveError))
     {
-        log = String::Format(TEXT("Playback self-test failed: skeleton not resolved for this rig: {}."), resolveError);
+        log = String::Format(TEXT("Playback self-test failed: schema layout not resolved for this rig: {}."), resolveError);
         return false;
     }
     if (nodes.Root < 0)
     {
-        log = TEXT("Playback self-test failed: skeleton profile resolved without a root node.");
+        log = TEXT("Playback self-test failed: schema layout resolved without a root node.");
         return false;
     }
 
@@ -119,7 +119,7 @@ bool MotionMatchingPlayback::RunPlaybackSelfTest(MotionMatchingDatabase* databas
     };
 
     MotionMatchingPlayback playback;
-    playback.Setup(database, model, schema.Skeleton);
+    playback.Setup(database, model, schema.RootBone);
 
     // Time advance: one tick moves the clip time by dt * rate.
     playback.SetPlayRate(1.0f);
@@ -178,7 +178,7 @@ bool MotionMatchingPlayback::RunPlaybackSelfTest(MotionMatchingDatabase* databas
     // (stripped to the model's bind translation and rotation).
     {
         MotionMatchingPlayback fresh;
-        fresh.Setup(database, model, schema.Skeleton);
+        fresh.Setup(database, model, schema.RootBone);
         fresh.SetPlayRate(1.0f);
         fresh.Play(loopClip, ClipLength(database, loopClip) * 0.5f, true);
         fresh.Tick(dt, body);

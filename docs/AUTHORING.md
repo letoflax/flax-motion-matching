@@ -2,11 +2,68 @@
 
 ## Schema and rig
 
-Configure `PoseSearchSchema` for the consuming project's rig. `Root`,
-`Pelvis`, `LeftFoot`, and `RightFoot` are required; additional named bones are
-stored for the declared feature layout. Root forward and up axes must be finite,
-non-zero, and non-parallel. The default trajectory times are six ascending
-values from past through future and must include time zero.
+Configure `PoseSearchSchema` for the consuming project's rig. Root forward and
+up axes must be finite, non-zero, and non-parallel. The schema also declares
+the feature layout: which bones the pose features read, which of them carry a
+contact flag, and how many trajectory points the query compares.
+
+## Declaring the feature layout
+
+The layout is data, not code. Four schema fields declare it:
+
+| Field | Meaning |
+|---|---|
+| `RootBone` | Node that carries root motion. Required. Never a pose bone. |
+| `PoseBones` | Ordered list of `{Node, Group}`. 1 to 64 entries, unique nodes. Each bone adds position xyz and velocity xyz (6 floats) in root space. |
+| `ContactBones` | Ordered list of `{Node}`. 0 to 16 entries; each names a `PoseBones` node and adds one contact flag. |
+| `TrajectorySampleTimes` | 1 to 32 strictly ascending times that span past and future around 0. Each time is one trajectory point (planar position xy, planar facing xy, yaw rate: 5 floats). |
+
+From these the plugin derives the runtime layout (`Schema/FeatureLayout.h`):
+
+```text
+pose features       = PoseBones * 6 + ContactBones
+                      [positions of every bone][velocities of every bone][contact flags]
+trajectory features = TrajectorySampleTimes * 5
+```
+
+`Group` is an optional normalization label. Bones with the same non-empty
+label share one normalization group (one deviation for positions and one for
+velocities), so left and right limbs are scaled alike. An empty label gives
+the bone its own groups. Group ids are assigned in first-seen order:
+positions first, then velocities, then one group for all contact flags.
+
+Example: a biped that matches pelvis, both feet, spine, head and both hands,
+with contacts on the feet (this is the layout of format v4 and of the
+flax-test scenes, 44 pose floats and 30 trajectory floats):
+
+```text
+RootBone      root
+PoseBones     pelvis "", foot_l "Foot", foot_r "Foot", spine "", head "",
+              hand_l "Hand", hand_r "Hand"
+ContactBones  foot_l, foot_r
+SampleTimes   -0.4, -0.2, 0, 0.2, 0.4, 0.6
+```
+
+A quadruped could declare its hips, the four paws under one `"Paw"` label and
+the head, with contacts on all four paws and eight trajectory points; nothing
+in the plugin assumes two legs or six points.
+
+Rules, all checked by `TryValidate` before a bake and at bind time:
+
+- Every declared node (root, pose and contact bones, after `BoneAliases`)
+  must exist in the bake model and in the bound model. A missing node is an
+  error that lists the missing names; nothing is skipped silently.
+- Every pose bone and the root must have an animation channel in every clip
+  (see the coverage report below), or the bake fails.
+- The layout is part of the baked snapshot and of `FeatureLayoutHash`.
+  Changing any of the four fields needs a rebake; the controller refuses a
+  database whose layout differs from the live schema.
+
+The trajectory plane follows the schema axes, not a world axis: positions and
+facings are measured along root right (forward x up) and root forward. The
+ground plane used for yaw rate and clip turn angles is the bake model's root
+up axis (`RootUpAxis` carried through the root's bind pose, snapped to a
+cardinal axis when within 0.999), stored in the database as `PlanarUpAxis`.
 
 `ContactMaxSpeed` (world units per second, default 300) and `ContactMaxHeight`
 (world units above the root, default 12) gate the foot contact flags: a foot
@@ -78,8 +135,7 @@ name to one model node name; channel names must be unique.
 
 Before every bake the baker logs a channel coverage report: channels without a
 node, nodes without a channel and alias suggestions. The bake fails when the
-schema's `Root`, `Pelvis`, `LeftFoot` or `RightFoot` node has no channel in
-some clip. Suggestions pair an unresolved channel with the one undriven node
+schema's `RootBone` or any `PoseBones` node has no channel in some clip. Suggestions pair an unresolved channel with the one undriven node
 that has the same normalized name (case, separators, digits, a dominant rig
 prefix such as `CC_Base_` or `mixamorig:`, and left/right markers are
 ignored). Review them before adding them to the schema. The same report is

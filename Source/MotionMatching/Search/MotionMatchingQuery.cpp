@@ -16,33 +16,34 @@ namespace
     {
         return std::isfinite(value.X) && std::isfinite(value.Y) && std::isfinite(value.Z);
     }
+
+    bool CheckLayout(const NodeIndices& nodes, const FeatureLayout& layout, String& error)
+    {
+        if (!layout.IsValid() || layout.PoseBoneCount > FeatureLayout::MaxPoseBones)
+        {
+            error = TEXT("Motion matching query failed: the schema declares no valid feature layout.");
+            return false;
+        }
+        if (!nodes.IsValid() || nodes.PoseBones.Count() != layout.PoseBoneCount)
+        {
+            error = TEXT("Motion matching query failed: skeleton node indices are not resolved for this layout.");
+            return false;
+        }
+        return true;
+    }
 }
 
-bool MotionMatchingQuery::SamplePoseFeatures(
-    AnimatedModel* model,
-    const NodeIndices& nodes,
-    float deltaTime,
-    Float3* prevPositions,
-    float* outPose,
-    String& error)
-{
-    // Legacy entry: default schema axis (up = (0,0,-1)). New callers use the
-    // schema-aware overload so bake/live share one axis semantic.
-    const PoseSearchSchema defaultSchema;
-    return SamplePoseFeatures(model, nodes, deltaTime, prevPositions, defaultSchema, outPose, error);
-}
-
-// Shared feature core (PLAN §5.3 fix): bone WORLD matrices supplied by the
-// caller — either read live from the animated model or composed from the
-// playback's pre-layer/pre-IK search snapshot. One definition, no copies:
-// mirror the baker exactly (world * rootInverse, translation = root-relative
-// position in the root frame; backward velocity; schema-axis contacts via
-// metadata offsets). Missing optional upper-body nodes sample zeros (same
-// as the baker).
+// Shared feature core (PLAN 5.3): bone WORLD matrices supplied by the caller,
+// either read live from the animated model or composed from the playback's
+// pre-layer/pre-IK search snapshot. One definition, no copies: mirror the
+// baker exactly (world * rootInverse, translation = root-relative position
+// in the root frame; backward velocity; schema-axis contacts via layout
+// offsets).
 static bool SampleFeaturesFromWorlds(
     const Matrix* nodeWorlds,
     int32 nodeWorldCount,
     const NodeIndices& nodes,
+    const FeatureLayout& layout,
     float deltaTime,
     Float3* prevPositions,
     const PoseSearchSchema& schema,
@@ -55,38 +56,34 @@ static bool SampleFeaturesFromWorlds(
         error = TEXT("Motion matching query failed: null world matrices or output buffer.");
         return false;
     }
-    if (!nodes.IsValid())
-    {
-        error = TEXT("Motion matching query failed: skeleton node indices are not resolved.");
+    if (!CheckLayout(nodes, layout, error))
         return false;
-    }
     if (nodes.Root < 0 || nodes.Root >= nodeWorldCount)
     {
         error = TEXT("Motion matching query failed: root node is outside the world-matrix range.");
         return false;
     }
 
-    int32 boneIndices[PoseSearchSchema::PoseBoneCount];
-    nodes.GetPoseBoneIndices(boneIndices);
-
+    const int32 boneCount = layout.PoseBoneCount;
+    const int32 positionBlockSize = layout.GetPositionBlockSize();
     const Matrix rootInverse = Matrix::Invert(nodeWorlds[nodes.Root]);
 
     // Mirror the baker: bone transform composed with the root inverse, then the
     // translation is the root-relative position in the root node's local frame.
-    // Missing optional upper-body nodes sample zeros (same as the baker).
-    // C1: root-relative pose velocity (feature) — never the world foot
+    // C1: root-relative pose velocity (feature), never the world foot
     // velocity used by foot-lock. Named distinctly; thresholds never shared.
-    Float3 poseVelocityRootRelative[PoseSearchSchema::PoseBoneCount];
-    for (int32 boneIndex = 0; boneIndex < PoseSearchSchema::PoseBoneCount; boneIndex++)
+    Float3 poseVelocityRootRelative[FeatureLayout::MaxPoseBones];
+    for (int32 boneIndex = 0; boneIndex < boneCount; boneIndex++)
     {
-        Float3 position = Float3::Zero;
-        const int32 nodeIndex = boneIndices[boneIndex];
-        if (nodeIndex >= 0 && nodeIndex < nodeWorldCount)
+        const int32 nodeIndex = nodes.PoseBones[boneIndex];
+        if (nodeIndex < 0 || nodeIndex >= nodeWorldCount)
         {
-            Matrix relative;
-            Matrix::Multiply(nodeWorlds[nodeIndex], rootInverse, relative);
-            position = relative.GetTranslation();
+            error = TEXT("Motion matching query failed: a pose bone is outside the world-matrix range.");
+            return false;
         }
+        Matrix relative;
+        Matrix::Multiply(nodeWorlds[nodeIndex], rootInverse, relative);
+        const Float3 position = relative.GetTranslation();
 
         outPose[boneIndex * 3] = position.X;
         outPose[boneIndex * 3 + 1] = position.Y;
@@ -95,18 +92,18 @@ static bool SampleFeaturesFromWorlds(
         // Backward difference against the previous frame. The baker uses central
         // differences, so live velocity lags by half a sample interval; this is
         // standard practice and well within the trajectory weight's tolerance.
-        // T1 timescale note (Phase 2 §3.3): bake stencil = central ±1 bake
-        // sample (2/rate s, one-sided at non-loop edges); live stencil =
-        // backward over the live frame dt (causal — central would need the
-        // future). Both are root-relative m/s under one velocity definition;
-        // the half-interval lag is documented, not compensated, and query
+        // T1 timescale note: bake stencil = central +-1 bake sample (2/rate s,
+        // one-sided at non-loop edges); live stencil = backward over the live
+        // frame dt (causal, central would need the future). Both are
+        // root-relative units/s under one velocity definition; the
+        // half-interval lag is documented, not compensated, and the query
         // yaw-rate below shares MotionMatchingSampler unwrap/rate helpers with
         // the baker so rad/s means the same thing on both sides.
         Float3 velocity = Float3::Zero;
         if (deltaTime > MinimumDeltaTime)
             velocity = (position - prevPositions[boneIndex]) / deltaTime;
         poseVelocityRootRelative[boneIndex] = velocity;
-        const int32 velocityOffset = PoseSearchSchema::GetPosePositionBlockSize() + boneIndex * 3;
+        const int32 velocityOffset = positionBlockSize + boneIndex * 3;
         outPose[velocityOffset] = velocity.X;
         outPose[velocityOffset + 1] = velocity.Y;
         outPose[velocityOffset + 2] = velocity.Z;
@@ -114,10 +111,11 @@ static bool SampleFeaturesFromWorlds(
         prevPositions[boneIndex] = position;
     }
 
-    // Foot-contact flags (M3, C1): same gate as the baker (feet are required,
-    // so indices 1/2 are always valid here). C1: height via the shared helper
-    // with the schema up axis — never hardcoded .Y. Positions above are
-    // root-relative (root at origin), so relativeFoot = foot - root(origin).
+    // Contact flags (C1): same gate as the baker, one per declared contact,
+    // from its pose bone. Height via the shared helper with the schema up
+    // axis (never a hardcoded axis). Positions above are root-relative (root
+    // at the origin).
+    if (layout.ContactCount > 0)
     {
         Float3 normalizedUp;
         if (!schema.TryGetNormalizedUpAxis(normalizedUp))
@@ -126,28 +124,17 @@ static bool SampleFeaturesFromWorlds(
             return false;
         }
         const Float3 rootOrigin = Float3::Zero;
-        const Float3 footL(outPose[3], outPose[4], outPose[5]);
-        const Float3 footR(outPose[6], outPose[7], outPose[8]);
-        const float heightL = PoseSearchSchema::ComputeContactHeight(footL, rootOrigin, normalizedUp);
-        const float heightR = PoseSearchSchema::ComputeContactHeight(footR, rootOrigin, normalizedUp);
-        // N1: contact offsets via channel metadata, never size-2/-1.
-        const int32 contactL = PoseSearchSchema::GetContactFeatureOffset(0);
-        const int32 contactR = PoseSearchSchema::GetContactFeatureOffset(1);
-        if (contactL < 0 || contactR < 0 ||
-            contactL >= PoseSearchSchema::GetPoseFeatureSize() ||
-            contactR >= PoseSearchSchema::GetPoseFeatureSize())
+        for (int32 contact = 0; contact < layout.ContactCount; contact++)
         {
-            error = TEXT("Motion matching query failed: contact feature offsets are invalid.");
-            return false;
+            const int32 bone = layout.ContactPoseBones[contact];
+            const Float3 bonePosition(outPose[bone * 3], outPose[bone * 3 + 1], outPose[bone * 3 + 2]);
+            const float height = PoseSearchSchema::ComputeContactHeight(bonePosition, rootOrigin, normalizedUp);
+            // Contact gate from the schema the caller passes (the policy passes
+            // the baked snapshot, so live and baked contacts share one gate).
+            outPose[layout.GetContactFeatureOffset(contact)] = PoseSearchSchema::IsPlantedContact(
+                poseVelocityRootRelative[bone].LengthSquared(), schema.ContactMaxSpeed,
+                height, schema.ContactMaxHeight) ? 1.0f : 0.0f;
         }
-        // Contact gate from the schema the caller passes (the policy passes
-        // the baked snapshot, so live and baked contacts share one gate).
-        outPose[contactL] = PoseSearchSchema::IsPlantedContact(
-            poseVelocityRootRelative[1].LengthSquared(), schema.ContactMaxSpeed,
-            heightL, schema.ContactMaxHeight) ? 1.0f : 0.0f;
-        outPose[contactR] = PoseSearchSchema::IsPlantedContact(
-            poseVelocityRootRelative[2].LengthSquared(), schema.ContactMaxSpeed,
-            heightR, schema.ContactMaxHeight) ? 1.0f : 0.0f;
     }
 
     return true;
@@ -156,6 +143,7 @@ static bool SampleFeaturesFromWorlds(
 bool MotionMatchingQuery::SamplePoseFeatures(
     AnimatedModel* model,
     const NodeIndices& nodes,
+    const FeatureLayout& layout,
     float deltaTime,
     Float3* prevPositions,
     const PoseSearchSchema& schema,
@@ -168,21 +156,16 @@ bool MotionMatchingQuery::SamplePoseFeatures(
         error = TEXT("Motion matching query failed: null model or output buffer.");
         return false;
     }
-    if (!nodes.IsValid())
-    {
-        error = TEXT("Motion matching query failed: skeleton node indices are not resolved.");
+    if (!CheckLayout(nodes, layout, error))
         return false;
-    }
 
     // Gather one world matrix per used skeleton node, then run the shared
     // core so live reads and search snapshots cannot drift apart.
-    int32 boneIndices[PoseSearchSchema::PoseBoneCount];
-    nodes.GetPoseBoneIndices(boneIndices);
     int32 maxNode = nodes.Root;
-    for (int32 boneIndex = 0; boneIndex < PoseSearchSchema::PoseBoneCount; boneIndex++)
+    for (int32 boneIndex = 0; boneIndex < layout.PoseBoneCount; boneIndex++)
     {
-        if (boneIndices[boneIndex] > maxNode)
-            maxNode = boneIndices[boneIndex];
+        if (nodes.PoseBones[boneIndex] > maxNode)
+            maxNode = nodes.PoseBones[boneIndex];
     }
     Array<Matrix> worlds;
     worlds.Resize(maxNode + 1);
@@ -190,13 +173,14 @@ bool MotionMatchingQuery::SamplePoseFeatures(
         model->GetNodeTransformation(nodeIndex, worlds[nodeIndex], true);
 
     return SampleFeaturesFromWorlds(
-        worlds.Get(), worlds.Count(), nodes, deltaTime, prevPositions, schema, outPose, error);
+        worlds.Get(), worlds.Count(), nodes, layout, deltaTime, prevPositions, schema, outPose, error);
 }
 
 bool MotionMatchingQuery::SampleSearchPose(
     AnimatedModel* animatedModel,
     const Array<Matrix>& searchLocals,
     const NodeIndices& nodes,
+    const FeatureLayout& layout,
     float deltaTime,
     const Array<float>& prevPositions,
     const PoseSearchSchema& schema,
@@ -220,7 +204,9 @@ bool MotionMatchingQuery::SampleSearchPose(
         error = TEXT("Motion matching query failed: empty search snapshot.");
         return false;
     }
-    if (prevPositions.Count() != PoseSearchSchema::GetPosePositionBlockSize())
+    if (!CheckLayout(nodes, layout, error))
+        return false;
+    if (prevPositions.Count() != layout.GetPositionBlockSize())
     {
         error = TEXT("Motion matching query failed: prevPositions has wrong size.");
         return false;
@@ -236,13 +222,14 @@ bool MotionMatchingQuery::SampleSearchPose(
     if (!MotionMatchingSampler::ComposeModelPose(skinned, searchLocals, modelPose, error))
         return false;
 
-    Float3 prev[PoseSearchSchema::PoseBoneCount];
-    for (int32 i = 0; i < PoseSearchSchema::PoseBoneCount; i++)
+    const int32 boneCount = layout.PoseBoneCount;
+    Float3 prev[FeatureLayout::MaxPoseBones];
+    for (int32 i = 0; i < boneCount; i++)
         prev[i] = Float3(prevPositions[i * 3], prevPositions[i * 3 + 1], prevPositions[i * 3 + 2]);
 
-    float pose[PoseSearchSchema::GetPoseFeatureSize()];
+    float pose[FeatureLayout::MaxPoseFeatureSize];
     if (!SampleFeaturesFromWorlds(
-            modelPose.Get(), modelPose.Count(), nodes, deltaTime, prev, schema, pose, error))
+            modelPose.Get(), modelPose.Count(), nodes, layout, deltaTime, prev, schema, pose, error))
         return false;
 
     if (nodes.Root < 0 || nodes.Root >= modelPose.Count())
@@ -252,11 +239,12 @@ bool MotionMatchingQuery::SampleSearchPose(
     }
     outRootWorld = modelPose[nodes.Root];
 
-    outPose.Resize(PoseSearchSchema::GetPoseFeatureSize());
-    outPrevPositions.Resize(PoseSearchSchema::GetPosePositionBlockSize());
-    for (int32 i = 0; i < PoseSearchSchema::GetPoseFeatureSize(); i++)
+    const int32 poseFeatureSize = layout.PoseFeatureSize;
+    outPose.Resize(poseFeatureSize);
+    outPrevPositions.Resize(layout.GetPositionBlockSize());
+    for (int32 i = 0; i < poseFeatureSize; i++)
         outPose[i] = pose[i];
-    for (int32 i = 0; i < PoseSearchSchema::PoseBoneCount; i++)
+    for (int32 i = 0; i < boneCount; i++)
     {
         outPrevPositions[i * 3] = prev[i].X;
         outPrevPositions[i * 3 + 1] = prev[i].Y;
@@ -265,8 +253,34 @@ bool MotionMatchingQuery::SampleSearchPose(
     return true;
 }
 
+bool MotionMatchingQuery::SampleSearchPose(
+    AnimatedModel* animatedModel,
+    const Array<Matrix>& searchLocals,
+    const NodeIndices& nodes,
+    float deltaTime,
+    const Array<float>& prevPositions,
+    const PoseSearchSchema& schema,
+    Array<float>& outPose,
+    Array<float>& outPrevPositions,
+    Matrix& outRootWorld,
+    String& error)
+{
+    FeatureLayout layout;
+    if (!schema.TryBuildLayout(layout, error))
+    {
+        outPose.Clear();
+        outPrevPositions.Clear();
+        outRootWorld = Matrix::Identity;
+        error = String(TEXT("Motion matching query failed: ")) + error;
+        return false;
+    }
+    return SampleSearchPose(animatedModel, searchLocals, nodes, layout, deltaTime, prevPositions, schema,
+        outPose, outPrevPositions, outRootWorld, error);
+}
+
 bool MotionMatchingQuery::BuildRawTrajectory(
     const TrajectoryPoint* points,
+    int32 pointCount,
     const Matrix& actorWorld,
     const Matrix& rootWorld,
     const PoseSearchSchema& schema,
@@ -279,6 +293,15 @@ bool MotionMatchingQuery::BuildRawTrajectory(
         error = TEXT("Motion matching query failed: null trajectory points or output buffer.");
         return false;
     }
+    if (pointCount <= 0 || pointCount > FeatureLayout::MaxTrajectoryPoints ||
+        pointCount != schema.TrajectorySampleTimes.Count())
+    {
+        error = String::Format(
+            TEXT("Motion matching query failed: {} trajectory points, the schema declares {} sample times."),
+            pointCount, schema.TrajectorySampleTimes.Count());
+        return false;
+    }
+    constexpr int32 pointSize = FeatureLayout::TrajectoryFloatsPerPoint;
 
     Float3 localRight;
     if (!schema.TryGetRightAxis(localRight))
@@ -295,7 +318,7 @@ bool MotionMatchingQuery::BuildRawTrajectory(
     Matrix actorToRoot;
     Matrix::Multiply(actorWorld, rootInverse, actorToRoot);
 
-    for (int32 pointIndex = 0; pointIndex < PoseSearchSchema::TrajectoryPointCount; pointIndex++)
+    for (int32 pointIndex = 0; pointIndex < pointCount; pointIndex++)
     {
         const TrajectoryPoint& point = points[pointIndex];
         const Float3 relativePosition = Float3::Transform(point.Position, actorToRoot);
@@ -309,7 +332,8 @@ bool MotionMatchingQuery::BuildRawTrajectory(
         }
 
         // Same planar projection as the baker: dot with the root-local right
-        // and forward axes, direction normalized with a (0, 1) fallback.
+        // and forward axes (the trajectory plane of the schema root axes),
+        // direction normalized with a (0, 1) fallback.
         const Float2 planarPosition(
             Float3::Dot(relativePosition, localRight),
             Float3::Dot(relativePosition, rootForwardAxis));
@@ -321,7 +345,7 @@ bool MotionMatchingQuery::BuildRawTrajectory(
         else
             planarDirection = Float2(0.0f, 1.0f);
 
-        const int32 offset = pointIndex * PoseSearchSchema::TrajectoryFloatsPerPoint;
+        const int32 offset = pointIndex * pointSize;
         outTrajectory[offset] = planarPosition.X;
         outTrajectory[offset + 1] = planarPosition.Y;
         outTrajectory[offset + 2] = planarDirection.X;
@@ -336,18 +360,17 @@ bool MotionMatchingQuery::BuildRawTrajectory(
     // every point by a constant. Subtract the zero-time position and rotate so
     // zero-time facing is forward; relative shape is preserved.
     int32 zeroIndex = -1;
-    for (int32 i = 0; i < PoseSearchSchema::TrajectoryPointCount; i++)
+    for (int32 i = 0; i < pointCount; i++)
     {
-        if (i < schema.TrajectorySampleTimes.Count() &&
-            std::fabs(schema.TrajectorySampleTimes[i]) <= 0.0001f)
+        if (std::fabs(schema.TrajectorySampleTimes[i]) <= 0.0001f)
         {
             zeroIndex = i;
             break;
         }
     }
     if (zeroIndex < 0)
-        zeroIndex = PoseSearchSchema::TrajectoryPointCount / 2; // schema validated to contain zero; fallback
-    const int32 zeroOffset = zeroIndex * PoseSearchSchema::TrajectoryFloatsPerPoint;
+        zeroIndex = pointCount / 2; // schema validated to contain zero; fallback
+    const int32 zeroOffset = zeroIndex * pointSize;
     const float zeroX = outTrajectory[zeroOffset];
     const float zeroY = outTrajectory[zeroOffset + 1];
     float zeroDirX = outTrajectory[zeroOffset + 2];
@@ -361,15 +384,14 @@ bool MotionMatchingQuery::BuildRawTrajectory(
         zeroDirX *= invLen;
         zeroDirY *= invLen;
         // Rotation taking zeroDir -> (0, 1): cosA = dot(zeroDir, forward),
-        // sinA = cross-equivalent (zeroDir.x * 1 - zeroDir.y * 0) = zeroDir.x.
-        // Apply R(-angle): x' = x * cosA - y * sinA? Verified: with zeroDir as
-        // reference, R maps zeroDir to (0,1) exactly.
+        // sinA = zeroDir.x; with zeroDir as reference, R maps zeroDir to
+        // (0, 1) exactly.
         cosA = zeroDirY;
         sinA = zeroDirX;
     }
-    for (int32 pointIndex = 0; pointIndex < PoseSearchSchema::TrajectoryPointCount; pointIndex++)
+    for (int32 pointIndex = 0; pointIndex < pointCount; pointIndex++)
     {
-        const int32 offset = pointIndex * PoseSearchSchema::TrajectoryFloatsPerPoint;
+        const int32 offset = pointIndex * pointSize;
         const float relX = outTrajectory[offset] - zeroX;
         const float relY = outTrajectory[offset + 1] - zeroY;
         const float dirX = outTrajectory[offset + 2];
@@ -381,9 +403,9 @@ bool MotionMatchingQuery::BuildRawTrajectory(
     }
     // Renormalize directions after rotation (rotation preserves length, but the
     // (0,1) fallback path and float error can drift); enforce zero-time exactly.
-    for (int32 pointIndex = 0; pointIndex < PoseSearchSchema::TrajectoryPointCount; pointIndex++)
+    for (int32 pointIndex = 0; pointIndex < pointCount; pointIndex++)
     {
-        const int32 offset = pointIndex * PoseSearchSchema::TrajectoryFloatsPerPoint;
+        const int32 offset = pointIndex * pointSize;
         float dx = outTrajectory[offset + 2];
         float dy = outTrajectory[offset + 3];
         const float lenSq = dx * dx + dy * dy;
@@ -408,24 +430,24 @@ bool MotionMatchingQuery::BuildRawTrajectory(
     // central difference of facing yaw over the schema sample times. Same
     // physical quantity (rad/s, unwrap [-pi,pi]) the baker derives from root
     // motion, through the SAME MotionMatchingSampler::ComputeYawRate helper.
-    // Stencil differs by construction: bake = ±1 bake sample, query = ±1
+    // Stencil differs by construction: bake = +-1 bake sample, query = +-1
     // trajectory interval (schema times, non-uniform allowed). No timescale
-    // conversion is needed — both sides divide unwrapped yaw by their own true
+    // conversion is needed: both sides divide unwrapped yaw by their own true
     // dt (bake: 2*frameDt or one-sided 1*frameDt at non-loop edges; query: the
     // actual schema-time span below).
     {
-        float yaws[PoseSearchSchema::TrajectoryPointCount];
-        for (int32 pointIndex = 0; pointIndex < PoseSearchSchema::TrajectoryPointCount; pointIndex++)
+        float yaws[FeatureLayout::MaxTrajectoryPoints];
+        for (int32 pointIndex = 0; pointIndex < pointCount; pointIndex++)
         {
-            const int32 offset = pointIndex * PoseSearchSchema::TrajectoryFloatsPerPoint;
+            const int32 offset = pointIndex * pointSize;
             yaws[pointIndex] = Math::Atan2(outTrajectory[offset + 2], outTrajectory[offset + 3]);
         }
-        for (int32 pointIndex = 0; pointIndex < PoseSearchSchema::TrajectoryPointCount; pointIndex++)
+        for (int32 pointIndex = 0; pointIndex < pointCount; pointIndex++)
         {
             const int32 prevIndex = Math::Max(pointIndex - 1, 0);
-            const int32 nextIndex = Math::Min(pointIndex + 1, PoseSearchSchema::TrajectoryPointCount - 1);
+            const int32 nextIndex = Math::Min(pointIndex + 1, pointCount - 1);
             const float dt = schema.TrajectorySampleTimes[nextIndex] - schema.TrajectorySampleTimes[prevIndex];
-            const int32 offset = pointIndex * PoseSearchSchema::TrajectoryFloatsPerPoint;
+            const int32 offset = pointIndex * pointSize;
             outTrajectory[offset + 4] = MotionMatchingSampler::ComputeYawRate(yaws[prevIndex], yaws[nextIndex], dt);
         }
     }
@@ -436,22 +458,7 @@ bool MotionMatchingQuery::BuildRawTrajectory(
 bool MotionMatchingQuery::SampleLivePose(
     AnimatedModel* animatedModel,
     const NodeIndices& nodes,
-    float deltaTime,
-    const Array<float>& prevPositions,
-    Array<float>& outPose,
-    Array<float>& outPrevPositions,
-    Matrix& outRootWorld,
-    String& error)
-{
-    const PoseSearchSchema defaultSchema;
-    return SampleLivePoseWithSchema(
-        animatedModel, nodes, deltaTime, prevPositions, defaultSchema,
-        outPose, outPrevPositions, outRootWorld, error);
-}
-
-bool MotionMatchingQuery::SampleLivePoseWithSchema(
-    AnimatedModel* animatedModel,
-    const NodeIndices& nodes,
+    const FeatureLayout& layout,
     float deltaTime,
     const Array<float>& prevPositions,
     const PoseSearchSchema& schema,
@@ -465,21 +472,24 @@ bool MotionMatchingQuery::SampleLivePoseWithSchema(
     outRootWorld = Matrix::Identity;
     error = String::Empty;
 
-    if (prevPositions.Count() != PoseSearchSchema::GetPosePositionBlockSize())
+    if (!CheckLayout(nodes, layout, error))
+        return false;
+    if (prevPositions.Count() != layout.GetPositionBlockSize())
     {
         error = String::Format(
             TEXT("Motion matching query failed: prevPositions has {} floats, expected {}."),
             prevPositions.Count(),
-            PoseSearchSchema::GetPosePositionBlockSize());
+            layout.GetPositionBlockSize());
         return false;
     }
 
-    Float3 prev[PoseSearchSchema::PoseBoneCount];
-    for (int32 i = 0; i < PoseSearchSchema::PoseBoneCount; i++)
+    const int32 boneCount = layout.PoseBoneCount;
+    Float3 prev[FeatureLayout::MaxPoseBones];
+    for (int32 i = 0; i < boneCount; i++)
         prev[i] = Float3(prevPositions[i * 3], prevPositions[i * 3 + 1], prevPositions[i * 3 + 2]);
 
-    float pose[PoseSearchSchema::GetPoseFeatureSize()];
-    if (!SamplePoseFeatures(animatedModel, nodes, deltaTime, prev, schema, pose, error))
+    float pose[FeatureLayout::MaxPoseFeatureSize];
+    if (!SamplePoseFeatures(animatedModel, nodes, layout, deltaTime, prev, schema, pose, error))
         return false;
 
     // Root world is re-read here (one extra node lookup at 10 Hz) so the C#
@@ -487,17 +497,42 @@ bool MotionMatchingQuery::SampleLivePoseWithSchema(
     if (animatedModel)
         animatedModel->GetNodeTransformation(nodes.Root, outRootWorld, true);
 
-    outPose.Resize(PoseSearchSchema::GetPoseFeatureSize());
-    outPrevPositions.Resize(PoseSearchSchema::GetPosePositionBlockSize());
-    for (int32 i = 0; i < PoseSearchSchema::GetPoseFeatureSize(); i++)
+    const int32 poseFeatureSize = layout.PoseFeatureSize;
+    outPose.Resize(poseFeatureSize);
+    outPrevPositions.Resize(layout.GetPositionBlockSize());
+    for (int32 i = 0; i < poseFeatureSize; i++)
         outPose[i] = pose[i];
-    for (int32 i = 0; i < PoseSearchSchema::PoseBoneCount; i++)
+    for (int32 i = 0; i < boneCount; i++)
     {
         outPrevPositions[i * 3] = prev[i].X;
         outPrevPositions[i * 3 + 1] = prev[i].Y;
         outPrevPositions[i * 3 + 2] = prev[i].Z;
     }
     return true;
+}
+
+bool MotionMatchingQuery::SampleLivePose(
+    AnimatedModel* animatedModel,
+    const NodeIndices& nodes,
+    float deltaTime,
+    const Array<float>& prevPositions,
+    const PoseSearchSchema& schema,
+    Array<float>& outPose,
+    Array<float>& outPrevPositions,
+    Matrix& outRootWorld,
+    String& error)
+{
+    FeatureLayout layout;
+    if (!schema.TryBuildLayout(layout, error))
+    {
+        outPose.Clear();
+        outPrevPositions.Clear();
+        outRootWorld = Matrix::Identity;
+        error = String(TEXT("Motion matching query failed: ")) + error;
+        return false;
+    }
+    return SampleLivePose(animatedModel, nodes, layout, deltaTime, prevPositions, schema,
+        outPose, outPrevPositions, outRootWorld, error);
 }
 
 bool MotionMatchingQuery::BuildLiveTrajectory(
@@ -511,29 +546,32 @@ bool MotionMatchingQuery::BuildLiveTrajectory(
     outTrajectory.Clear();
     error = String::Empty;
 
-    const int32 expected = PoseSearchSchema::TrajectoryPointCount * 6;
-    if (points.Count() != expected)
+    const int32 pointCount = schema.TrajectorySampleTimes.Count();
+    const int32 expected = pointCount * 6;
+    if (pointCount <= 0 || pointCount > FeatureLayout::MaxTrajectoryPoints || points.Count() != expected)
     {
         error = String::Format(
-            TEXT("Motion matching query failed: trajectory packs {} floats, expected {} (6 points x pos xyz + facing xyz)."),
+            TEXT("Motion matching query failed: trajectory packs {} floats, expected {} ({} points x pos xyz + facing xyz)."),
             points.Count(),
-            expected);
+            expected,
+            pointCount);
         return false;
     }
 
-    TrajectoryPoint unpacked[PoseSearchSchema::TrajectoryPointCount];
-    for (int32 i = 0; i < PoseSearchSchema::TrajectoryPointCount; i++)
+    TrajectoryPoint unpacked[FeatureLayout::MaxTrajectoryPoints];
+    for (int32 i = 0; i < pointCount; i++)
     {
         unpacked[i].Position = Float3(points[i * 6], points[i * 6 + 1], points[i * 6 + 2]);
         unpacked[i].Facing = Float3(points[i * 6 + 3], points[i * 6 + 4], points[i * 6 + 5]);
     }
 
-    float trajectory[PoseSearchSchema::GetTrajectoryFeatureSize()];
-    if (!BuildRawTrajectory(unpacked, actorWorld, rootWorld, schema, trajectory, error))
+    float trajectory[FeatureLayout::MaxTrajectoryFeatureSize];
+    if (!BuildRawTrajectory(unpacked, pointCount, actorWorld, rootWorld, schema, trajectory, error))
         return false;
 
-    outTrajectory.Resize(PoseSearchSchema::GetTrajectoryFeatureSize());
-    for (int32 i = 0; i < PoseSearchSchema::GetTrajectoryFeatureSize(); i++)
+    const int32 size = pointCount * FeatureLayout::TrajectoryFloatsPerPoint;
+    outTrajectory.Resize(size);
+    for (int32 i = 0; i < size; i++)
         outTrajectory[i] = trajectory[i];
     return true;
 }

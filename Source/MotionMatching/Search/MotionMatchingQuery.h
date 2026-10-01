@@ -275,12 +275,15 @@ struct MOTIONMATCHING_API MotionMatchingResult
 
 /// <summary>
 /// Builds raw (unnormalized) query features in the exact convention the baker used,
-/// so MotionMatchingSearch can normalize them with the stored means/std.
-/// Pose: 44 floats, 7 bones [pelvis, feet, spine, head, hands] positions (21)
-/// then velocities (21) plus 2 foot-contact flags, all root-relative.
-/// Trajectory: 30 floats, 6 points x [posRight, posForward, dirRight, dirForward, yawRate].
-/// The pointer core avoids remarshalling; the API wrappers adapt C#-owned
-/// float arrays. No bone math is duplicated in C#.
+/// so MotionMatchingSearch can score them with the stored deviations.
+/// The layout comes from the schema declaration (FeatureLayout): pose =
+/// one root-relative position per pose bone, then one velocity per pose
+/// bone, then one planted flag per contact; trajectory = one
+/// [posRight, posForward, dirRight, dirForward, yawRate] point per
+/// TrajectorySampleTimes entry. The pointer cores take a prebuilt layout
+/// and never allocate; the API wrappers adapt C#-owned float arrays and
+/// derive the layout from the schema they are given. No bone math is
+/// duplicated in C#.
 /// </summary>
 API_CLASS(Static, Namespace="MotionMatching")
 class MOTIONMATCHING_API MotionMatchingQuery
@@ -289,30 +292,17 @@ class MOTIONMATCHING_API MotionMatchingQuery
 
 public:
     /// <summary>
-    /// Samples live bone transforms and writes 44 raw pose features.
-    /// prevPositions persists across frames (7 root-relative positions);
-    /// the first call seeds it and reports zero velocity.
-    /// </summary>
-    /// <returns>False with an actionable error when the model or nodes are unusable.</returns>
-    static bool SamplePoseFeatures(
-        AnimatedModel* model,
-        const NodeIndices& nodes,
-        float deltaTime,
-        Float3* prevPositions,
-        float* outPose,
-        String& error);
-
-    /// <summary>
-    /// C1 schema-aware core: same convention as SamplePoseFeatures but the
-    /// contact height uses schema.RootUpAxis (normalized) through the shared
-    /// PoseSearchSchema helper instead of hardcoded .Y. The legacy overload
-    /// delegates here with a default schema (up = (0,0,-1)) so existing
-    /// callers (policy) keep compiling unchanged.
+    /// Samples live bone transforms and writes layout.PoseFeatureSize raw pose
+    /// features. prevPositions persists across frames (layout.PoseBoneCount
+    /// root-relative positions); the first call seeds it and reports zero
+    /// velocity. Contact height uses schema.RootUpAxis (normalized) and the
+    /// schema contact gate.
     /// </summary>
     /// <returns>False with an actionable error when the model, nodes or axis are unusable.</returns>
     static bool SamplePoseFeatures(
         AnimatedModel* model,
         const NodeIndices& nodes,
+        const FeatureLayout& layout,
         float deltaTime,
         Float3* prevPositions,
         const PoseSearchSchema& schema,
@@ -320,14 +310,16 @@ public:
         String& error);
 
     /// <summary>
-    /// Converts 6 actor-local trajectory points (X = right, Z = forward, as predicted
-    /// by the host) into 30 raw trajectory features in the root
-    /// node's local frame, mirroring the baker's planar projection exactly
-    /// (plus the yaw-rate channel derived from facing deltas).
+    /// Converts pointCount actor-local trajectory points (X = right, Z =
+    /// forward, as predicted by the host; one per schema sample time) into
+    /// pointCount x 5 raw trajectory features in the root node's local frame,
+    /// mirroring the baker's planar projection exactly (plus the yaw-rate
+    /// channel derived from facing deltas).
     /// </summary>
-    /// <returns>False with an actionable error when the schema axes are degenerate.</returns>
+    /// <returns>False with an actionable error when the count or the schema axes are wrong.</returns>
     static bool BuildRawTrajectory(
         const TrajectoryPoint* points,
+        int32 pointCount,
         const Matrix& actorWorld,
         const Matrix& rootWorld,
         const PoseSearchSchema& schema,
@@ -335,30 +327,30 @@ public:
         String& error);
 
     /// <summary>
-    /// C#-facing live pose sampler. Reads the animated body's current bone
-    /// transforms and writes 44 raw pose features plus the root world matrix
-    /// (needed to map the trajectory into the root frame). prevPositions is
-    /// 21 floats (7 root-relative xyz) owned by the caller across frames.
+    /// Allocation-free live sampler for a prebuilt layout (the policy path).
+    /// See the API overload.
     /// </summary>
-    API_FUNCTION()
     static bool SampleLivePose(
         AnimatedModel* animatedModel,
         const NodeIndices& nodes,
+        const FeatureLayout& layout,
         float deltaTime,
         const Array<float>& prevPositions,
-        API_PARAM(Out) Array<float>& outPose,
-        API_PARAM(Out) Array<float>& outPrevPositions,
-        API_PARAM(Out) Matrix& outRootWorld,
-        API_PARAM(Out) String& error);
+        const PoseSearchSchema& schema,
+        Array<float>& outPose,
+        Array<float>& outPrevPositions,
+        Matrix& outRootWorld,
+        String& error);
 
     /// <summary>
-    /// C1 schema-aware live sampler: same as SampleLivePose but contact uses
-    /// the provided schema up axis. Kept as a separately-named API entry so
-    /// the existing policy call-site compiles untouched; new callers should
-    /// prefer this and pass the database/baked schema snapshot.
+    /// C#-facing live pose sampler. Reads the animated body's current bone
+    /// transforms and writes the raw pose features of the schema layout plus
+    /// the root world matrix (needed to map the trajectory into the root
+    /// frame). prevPositions is 3 floats per pose bone (root-relative xyz),
+    /// owned by the caller across frames. Pass the database (baked) schema.
     /// </summary>
     API_FUNCTION()
-    static bool SampleLivePoseWithSchema(
+    static bool SampleLivePose(
         AnimatedModel* animatedModel,
         const NodeIndices& nodes,
         float deltaTime,
@@ -370,12 +362,28 @@ public:
         API_PARAM(Out) String& error);
 
     /// <summary>
-    /// PLAN §5.3 query source: samples features from the playback's saved
+    /// Allocation-free search-snapshot sampler for a prebuilt layout (the
+    /// policy path). See the API overload.
+    /// </summary>
+    static bool SampleSearchPose(
+        AnimatedModel* animatedModel,
+        const Array<Matrix>& searchLocals,
+        const NodeIndices& nodes,
+        const FeatureLayout& layout,
+        float deltaTime,
+        const Array<float>& prevPositions,
+        const PoseSearchSchema& schema,
+        Array<float>& outPose,
+        Array<float>& outPrevPositions,
+        Matrix& outRootWorld,
+        String& error);
+
+    /// <summary>
+    /// PLAN 5.3 query source: samples features from the playback's saved
     /// pre-layer/pre-IK search snapshot (bone-LOCAL matrices) instead of the
     /// displayed pose, so the layer and foot IK never feed back into the
     /// next frame's candidate costs. Composes with the shared sampler FK, then
     /// runs the same feature core as the live path (no duplicated math).
-    /// Falls back to SampleLivePoseWithSchema when no snapshot exists yet.
     /// </summary>
     API_FUNCTION()
     static bool SampleSearchPose(
@@ -391,8 +399,9 @@ public:
         API_PARAM(Out) String& error);
 
     /// <summary>
-    /// C#-facing trajectory builder. points packs 6 actor-local points as
-    /// 36 floats (pos xyz + facing xyz each), matching TrajectoryPoint layout.
+    /// C#-facing trajectory builder. points packs one actor-local point per
+    /// schema sample time as 6 floats (pos xyz + facing xyz each), matching
+    /// the TrajectoryPoint layout.
     /// </summary>
     API_FUNCTION()
     static bool BuildLiveTrajectory(

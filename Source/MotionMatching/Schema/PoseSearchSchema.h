@@ -3,11 +3,28 @@
 #include "Engine/Core/Collections/Array.h"
 #include "Engine/Core/Math/Vector3.h"
 #include "Engine/Core/Types/String.h"
-#include "FeatureChannel.h"
+#include "FeatureLayout.h"
 #include "MotionMatchingTypes.h"
 
 class ReadStream;
 class WriteStream;
+
+/// <summary>
+/// Named skeleton roles of database formats v2-v4 (the former
+/// SkeletonProfile). Upgrader-only; the live schema declares its layout with
+/// RootBone, PoseBones and ContactBones.
+/// </summary>
+struct LegacySkeletonNames
+{
+    String Root;
+    String Pelvis;
+    String Spine;
+    String Head;
+    String LeftFoot;
+    String RightFoot;
+    String LeftHand;
+    String RightHand;
+};
 
 /// <summary>
 /// Bake contract shared by the baker and the runtime query builder.
@@ -43,17 +60,32 @@ struct MOTIONMATCHING_API PoseSearchSchema
     API_FIELD(Attributes="Limit(0, 100)") float TrajectoryWeight = 1.0f;
 
     /// <summary>
-    /// Skeleton node names. Empty by default — the host MUST configure them
-    /// for its own rig (scene → MotionMatchingController → Schema → Skeleton).
-    /// Only Root, Pelvis, LeftFoot and RightFoot are required and extracted;
-    /// the remaining names are stored for future channels.
+    /// Root node of the model: origin and frame of every feature (positions,
+    /// velocities and trajectory are expressed relative to it). Empty by
+    /// default: the host MUST configure the layout for its own rig.
     /// </summary>
-    API_FIELD() SkeletonProfile Skeleton;
+    API_FIELD() String RootBone;
 
     /// <summary>
-    /// Trajectory sampling times in seconds relative to the current pose.
-    /// Exactly TrajectoryPointCount values, strictly ascending, spanning past and
-    /// future around time zero (for example -0.4 .. 0.6).
+    /// Pose feature bones, in feature order (1..64). Each adds a root-relative
+    /// position and velocity. Bones sharing a Group label share one
+    /// normalization deviation. Every declared node must exist in the model.
+    /// Changing the list requires a rebake.
+    /// </summary>
+    API_FIELD() Array<PoseFeatureBone> PoseBones;
+
+    /// <summary>
+    /// Foot-contact features (0..16), each the planted flag of one pose bone
+    /// (slow and low, see ContactMaxSpeed/ContactMaxHeight). Order is the
+    /// feature order. Changing the list requires a rebake.
+    /// </summary>
+    API_FIELD() Array<ContactFeatureBone> ContactBones;
+
+    /// <summary>
+    /// Trajectory sampling times in seconds relative to the current pose. One
+    /// trajectory point per value (up to 32), strictly ascending, spanning
+    /// past and future and including time zero (for example -0.4 .. 0.6).
+    /// The host provides one TrajectoryPoint per value.
     /// </summary>
     API_FIELD() Array<float> TrajectorySampleTimes = { -0.4f, -0.2f, 0.0f, 0.2f, 0.4f, 0.6f };
 
@@ -82,131 +114,39 @@ struct MOTIONMATCHING_API PoseSearchSchema
     /// </summary>
     API_FIELD() Array<BoneAlias> BoneAliases;
 
-    // Feature layout (v3, M3 upper body). Pose bones are extracted in this
-    // fixed order: [0] pelvis, [1] left foot, [2] right foot, [3] spine,
-    // [4] head, [5] left hand, [6] right hand. After the velocity block come
-    // PoseExtraCount foot-contact flags (left, right; 1 = planted).
-    static constexpr int32 PoseBoneCount = 7;
-    static constexpr int32 PoseFloatsPerBone = 6;           // position xyz + velocity xyz
-    static constexpr int32 PoseExtraCount = 2;              // L/R foot contact flags
-    static constexpr int32 TrajectoryPointCount = 6;
-    static constexpr int32 TrajectoryFloatsPerPoint = 5;    // planar position xy + planar facing xy + yaw rate
     static constexpr float AxisTolerance = 0.001f;       // tolerance for axis validation
-    // Normalization revision (Phase 3 N1b UE-style): bumped when the bake-time
-    // statistics change shape. Stored per-database (NOT in the schema
-    // snapshot); databases baked with an older revision load registry-only
-    // with a "rebake required" message instead of silently mismatching.
-    // Rev 1 = Phase 2 pooled grouped (mean/std over samples x grouped dims).
-    // Rev 2 = N1: scalar per-dim mean/population-variance, baked z-scored
+    // Normalization revision: bumped when the bake-time statistics change
+    // shape. Stored per-database (NOT in the schema snapshot); databases
+    // baked with an older revision load registry-only with a "rebake
+    // required" message instead of silently mismatching.
+    // Rev 1 = pooled grouped (mean/std over samples x grouped dims).
+    // Rev 2 = scalar per-dim mean/population-variance, baked z-scored
     // features + stored means.
-    // Rev 3 = N1b: NO means, raw baked/query values, one mean-row-norm
+    // Rev 3 = NO means, raw baked/query values, one mean-row-norm
     // deviation per group floored at `dev > 0.1 ? dev : 1.0`; the search
     // applies sqrt(sum-normalized weight)/deviation once at cost time.
     static constexpr int32 NormalizationRevision = 3;
-    // Normalization groups (N1 UE-style NormalizationGroup analogue; N1b
-    // keeps the same ids): channels that share a class, cardinality and
-    // semantic share one group so left/right statistics cannot skew turns;
-    // solo bones and every trajectory dimension keep their own group.
-    // Pose layout: [0] pelvis, [1] L foot, [2] R foot, [3] spine, [4] head,
-    // [5] L hand, [6] R hand; positions 0..20, velocities 21..41, contacts 42..43.
-    static int32 GetPoseNormalizationGroup(int32 dim)
-    {
-        if (dim < 0)
-            return -1;
-        if (dim < 21)
-        {
-            const int32 bone = dim / 3;
-            if (bone == 0)
-                return 0;
-            if (bone == 1 || bone == 2)
-                return 1;
-            if (bone == 3)
-                return 2;
-            if (bone == 4)
-                return 3;
-            return 4;
-        }
-        if (dim < 42)
-        {
-            const int32 bone = (dim - 21) / 3;
-            if (bone == 0)
-                return 5;
-            if (bone == 1 || bone == 2)
-                return 6;
-            if (bone == 3)
-                return 7;
-            if (bone == 4)
-                return 8;
-            return 9;
-        }
-        return 10;
-    }
-
-    static int32 GetTrajectoryNormalizationGroup(int32 dim)
-    {
-        return dim;
-    }
 
     /// <summary>
-    /// N1 contact metadata: block-local pose offset of a planted flag.
-    /// side 0 = left, 1 = right; returns -1 for any other side. All bake,
-    /// query and search code must resolve contacts through this; deriving
-    /// them from poseFeatureSize-2/-1 is forbidden (layout coupling).
+    /// Derives the runtime feature layout from the declaration: pose bone
+    /// count and order, contacts (each mapped to its pose bone), trajectory
+    /// point count (one per TrajectorySampleTimes entry) and normalization
+    /// groups. Group ids: positions first (a new id per solo bone or per
+    /// first use of a label), then velocities the same way, then one shared
+    /// id for all contacts. Fails with an actionable error when the
+    /// declaration is invalid.
     /// </summary>
-    static int32 GetContactFeatureOffset(int32 side)
-    {
-        if (side < 0 || side >= PoseExtraCount)
-            return -1;
-        return GetPoseFeatureSize() - PoseExtraCount + side;
-    }
+    bool TryBuildLayout(FeatureLayout& layout, String& error) const;
 
     /// <summary>
-    /// N1 layout hash (FNV-1a over block/offset/dim/kind/group/symmetry/
-    /// semantic/contact-role of every channel). Stored per-database next to
-    /// the normalization revision; a mismatch drops baked arrays to
-    /// registry-only with REBAKE REQUIRED. Never 0 (0 = unknown/legacy).
+    /// Resolves RootBone and every pose bone against a model. A declared node
+    /// that the model does not have is an error (never baked as zeros).
     /// </summary>
-    static uint32 GetFeatureLayoutHash();
+    bool TryResolveNodes(SkinnedModel* model, NodeIndices& result, String& error) const;
 
     /// <summary>
-    /// N1b channel metadata, single source of truth for layout. Pose block:
-    /// 14 vector channels (7 positions + 7 velocities, dim 3) + 2 scalar
-    /// contact channels. Trajectory block: 30 scalar channels (identity
-    /// groups). Offsets are block-local. Kind/cardinality are documentation
-    /// metadata: the rev-3 deviation uses one mean-row-norm formula for every
-    /// group, so no scalar/vector dispatch exists anymore.
-    /// </summary>
-    static void DescribePoseChannels(Array<FeatureChannel>& outChannels);
-    static void DescribeTrajectoryChannels(Array<FeatureChannel>& outChannels);
-
-    // Clip groups (the one-shot group filter) are plain ints authored in the
-    // clip registry. Neither the schema nor the baker infers anything from
-    // asset names.
-
-    /// <summary>
-    /// N1 layout validation: every channel inside its block bounds, no two
-    /// channels overlapping, contact channels exactly at
-    /// GetContactFeatureOffset. Called by TryValidate.
-    /// </summary>
-    static bool ValidateLayout(String& error);
-
-    static constexpr int32 GetPosePositionBlockSize()
-    {
-        return PoseBoneCount * 3;
-    }
-
-    static constexpr int32 GetPoseFeatureSize()
-    {
-        return PoseBoneCount * PoseFloatsPerBone + PoseExtraCount;
-    }
-
-    static constexpr int32 GetTrajectoryFeatureSize()
-    {
-        return TrajectoryPointCount * TrajectoryFloatsPerPoint;
-    }
-
-    /// <summary>
-    /// Checks sample rate, axes, weights, required bone names and trajectory times.
+    /// Checks sample rate, axes, weights, the declared layout (root, pose
+    /// bones, contacts, trajectory times), contact gate and bone aliases.
     /// </summary>
     bool TryValidate(String& error) const;
 
@@ -249,16 +189,30 @@ struct MOTIONMATCHING_API PoseSearchSchema
     }
 
     /// <summary>
-    /// Database format v4 layout: the v3 fields in their original order, then
-    /// ContactMaxSpeed, ContactMaxHeight and BoneAliases.
+    /// Database format v5 layout: SampleRate, axes, weights,
+    /// TrajectorySampleTimes, contact gate, BoneAliases, RootBone, PoseBones,
+    /// ContactBones.
     /// </summary>
     void Serialize(WriteStream& stream) const;
     void Deserialize(ReadStream& stream);
 
     /// <summary>
-    /// Legacy v2/v3 layout (no contact gate, no aliases). Used only by the
-    /// database upgraders; Deserialize leaves the new fields at defaults.
+    /// Legacy layouts used only by the database upgraders. v2/v3: no contact
+    /// gate, no aliases, eight named skeleton roles. v4: v3 + contact gate +
+    /// aliases. The legacy role names travel in LegacySkeletonNames;
+    /// ApplyLegacySkeleton converts them into the v5 declaration.
     /// </summary>
-    void SerializeV3(WriteStream& stream) const;
-    void DeserializeV3(ReadStream& stream);
+    void SerializeV3(WriteStream& stream, const LegacySkeletonNames& legacy) const;
+    void DeserializeV3(ReadStream& stream, LegacySkeletonNames& legacy);
+    void SerializeV4(WriteStream& stream, const LegacySkeletonNames& legacy) const;
+    void DeserializeV4(ReadStream& stream, LegacySkeletonNames& legacy);
+
+    /// <summary>
+    /// The fixed v2-v4 layout as a declaration: Root; pose bones pelvis,
+    /// left foot, right foot, spine, head, left hand, right hand (feet share
+    /// group "Foot", hands share group "Hand", empty names skipped); contacts
+    /// left foot, right foot. Reproduces the v4 feature layout exactly when
+    /// all eight names are set.
+    /// </summary>
+    void ApplyLegacySkeleton(const LegacySkeletonNames& legacy);
 };

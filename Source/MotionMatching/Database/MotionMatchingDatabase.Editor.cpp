@@ -89,10 +89,13 @@ void MotionMatchingDatabase::SetBakedData(
     const Array<float>& trajectoryFeatures,
     const Array<float>& poseFeatureDeviations,
     const Array<float>& trajectoryFeatureDeviations,
-    const MotionMatchingSkeletonFingerprint& skeletonFingerprint)
+    const MotionMatchingSkeletonFingerprint& skeletonFingerprint,
+    const Float3& planarUpAxis)
 {
     ClearBakedData();
     _schema = schema;
+    RebuildLayout();
+    _planarUpAxis = planarUpAxis;
 
     _clipAnimations.EnsureCapacity(sourceClipIndices.Count());
     _clipTags.EnsureCapacity(sourceClipIndices.Count());
@@ -122,9 +125,9 @@ void MotionMatchingDatabase::SetBakedData(
     _poseFeatureDeviations = poseFeatureDeviations;
     _trajectoryFeatureDeviations = trajectoryFeatureDeviations;
     // Freshly baked by this build: stamp the current statistics revision and
-    // the N1 feature-layout hash.
+    // the feature-layout hash of the baked schema.
     _normalizationRevision = PoseSearchSchema::NormalizationRevision;
-    _featureLayoutHash = static_cast<int32>(PoseSearchSchema::GetFeatureLayoutHash());
+    _featureLayoutHash = _currentLayoutHash;
     // D1 §18.5 provenance: schema contract revision (class const), sampling
     // contract hash (schema sampling values + SamplingContractRevision),
     // source manifest identity (registered source asset IDs/tags/loop) and the
@@ -205,8 +208,10 @@ bool MotionMatchingDatabase::Save(const StringView& path)
     stream.Write(_clipGroups);
     stream.Write(_sourceGroups);
     _skeletonFingerprint.Serialize(stream);
+    // v5 tail: model-space planar up axis.
+    stream.Write(_planarUpAxis);
 
-    // Every save writes the v4 type name, also for a file that still carried
+    // Every save writes the current type name, also for a file that still carried
     // the legacy name in its header.
     _header.TypeName = TypeName;
     FlaxChunk* chunk;

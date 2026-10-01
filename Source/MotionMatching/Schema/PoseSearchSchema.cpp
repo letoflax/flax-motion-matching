@@ -48,42 +48,6 @@ bool PoseSearchSchema::TryValidate(String &error) const
         return false;
     }
 
-    if (Skeleton.Root.IsEmpty() || Skeleton.Pelvis.IsEmpty() ||
-        Skeleton.LeftFoot.IsEmpty() || Skeleton.RightFoot.IsEmpty())
-    {
-        error = TEXT("Skeleton requires Root, Pelvis, LeftFoot and RightFoot names. "
-            "Configure the SkeletonProfile for your rig "
-            "(scene → MotionMatchingController → Schema → Skeleton).");
-        return false;
-    }
-
-    if (TrajectorySampleTimes.Count() != TrajectoryPointCount)
-    {
-        error = String::Format(
-            TEXT("TrajectorySampleTimes must contain exactly {} values."),
-            static_cast<int32>(TrajectoryPointCount));
-        return false;
-    }
-    bool includesZero = false;
-    for (int32 i = 0; i < TrajectoryPointCount; i++)
-    {
-        const float time = TrajectorySampleTimes[i];
-        if (!std::isfinite(time) || (i > 0 && time <= TrajectorySampleTimes[i - 1]))
-        {
-            error = TEXT("TrajectorySampleTimes must be finite and strictly ascending.");
-            return false;
-        }
-        if (std::fabs(time) <= TimeZeroTolerance)
-            includesZero = true;
-    }
-    if (TrajectorySampleTimes[0] >= 0.0f ||
-        TrajectorySampleTimes[TrajectoryPointCount - 1] <= 0.0f ||
-        !includesZero)
-    {
-        error = TEXT("TrajectorySampleTimes must span past and future around time zero.");
-        return false;
-    }
-
     if (!std::isfinite(ContactMaxSpeed) || !std::isfinite(ContactMaxHeight) ||
         ContactMaxSpeed <= 0.0f || ContactMaxHeight <= 0.0f)
     {
@@ -109,296 +73,264 @@ bool PoseSearchSchema::TryValidate(String &error) const
         }
     }
 
-    if (!ValidateLayout(error))
+    FeatureLayout layout;
+    if (!TryBuildLayout(layout, error))
         return false;
 
     return true;
 }
 
-void PoseSearchSchema::DescribePoseChannels(Array<FeatureChannel>& outChannels)
+bool PoseSearchSchema::TryBuildLayout(FeatureLayout& layout, String& error) const
 {
-    outChannels.Clear();
-    // Fixed bone order matches GetPoseBoneIndices: [0] pelvis, [1] L foot,
-    // [2] R foot, [3] spine, [4] head, [5] L hand, [6] R hand.
-    const Char* boneNames[PoseBoneCount] = {
-        TEXT("pelvis"), TEXT("left_foot"), TEXT("right_foot"),
-        TEXT("spine"), TEXT("head"), TEXT("left_hand"), TEXT("right_hand")
-    };
-    // L/R limbs share one normalization group AND one semantic/symmetry
-    // scope, never mixed with another bone or with velocities.
-    const Char* posSemantics[PoseBoneCount] = {
-        TEXT("position.pelvis"), TEXT("position.foot"), TEXT("position.foot"),
-        TEXT("position.spine"), TEXT("position.head"), TEXT("position.hand"), TEXT("position.hand")
-    };
-    const Char* velSemantics[PoseBoneCount] = {
-        TEXT("velocity.pelvis"), TEXT("velocity.foot"), TEXT("velocity.foot"),
-        TEXT("velocity.spine"), TEXT("velocity.head"), TEXT("velocity.hand"), TEXT("velocity.hand")
-    };
-    const int32 posGroups[PoseBoneCount] = { 0, 1, 1, 2, 3, 4, 4 };
-    const int32 velGroups[PoseBoneCount] = { 5, 6, 6, 7, 8, 9, 9 };
-    const int32 positionBlockSize = GetPosePositionBlockSize();
-
-    for (int32 bone = 0; bone < PoseBoneCount; bone++)
-    {
-        FeatureChannel pos;
-        pos.Name = String(TEXT("pose.positions.")) + String(boneNames[bone]);
-        pos.Block = 0;
-        pos.Offset = bone * 3;
-        pos.Dimension = 3;
-        pos.Weight = 1.0f;
-        pos.NormalizationGroup = posGroups[bone];
-        pos.Kind = FeatureChannelKind::Vector;
-        pos.SymmetryGroup = posGroups[bone];
-        pos.Semantic = String(posSemantics[bone]);
-        pos.ContactRole = FeatureContactRole::None;
-        outChannels.Add(pos);
-
-        FeatureChannel vel;
-        vel.Name = String(TEXT("pose.velocities.")) + String(boneNames[bone]);
-        vel.Block = 0;
-        vel.Offset = positionBlockSize + bone * 3;
-        vel.Dimension = 3;
-        vel.Weight = 1.0f;
-        vel.NormalizationGroup = velGroups[bone];
-        vel.Kind = FeatureChannelKind::Vector;
-        vel.SymmetryGroup = velGroups[bone];
-        vel.Semantic = String(velSemantics[bone]);
-        vel.ContactRole = FeatureContactRole::None;
-        outChannels.Add(vel);
-    }
-
-    FeatureChannel contactL;
-    contactL.Name = String(TEXT("pose.contacts.L"));
-    contactL.Block = 0;
-    contactL.Offset = GetContactFeatureOffset(0);
-    contactL.Dimension = 1;
-    contactL.Weight = 1.0f;
-    contactL.NormalizationGroup = 10;
-    contactL.Kind = FeatureChannelKind::Scalar;
-    contactL.SymmetryGroup = 10;
-    contactL.Semantic = String(TEXT("contact"));
-    contactL.ContactRole = FeatureContactRole::Left;
-    outChannels.Add(contactL);
-
-    FeatureChannel contactR;
-    contactR.Name = String(TEXT("pose.contacts.R"));
-    contactR.Block = 0;
-    contactR.Offset = GetContactFeatureOffset(1);
-    contactR.Dimension = 1;
-    contactR.Weight = 1.0f;
-    contactR.NormalizationGroup = 10;
-    contactR.Kind = FeatureChannelKind::Scalar;
-    contactR.SymmetryGroup = 10;
-    contactR.Semantic = String(TEXT("contact"));
-    contactR.ContactRole = FeatureContactRole::Right;
-    outChannels.Add(contactR);
-}
-
-void PoseSearchSchema::DescribeTrajectoryChannels(Array<FeatureChannel>& outChannels)
-{
-    outChannels.Clear();
-    // N1 contract: trajectory dims stay scalar with identity groups (each
-    // dim normalizes independently). A future vectorization (pos_xy/facing_xy
-    // sharing one deviation) would change group ids, the layout hash and the
-    // revision, and must rebake + sync the manifest mirror.
-    const Char* fieldNames[TrajectoryFloatsPerPoint] = {
-        TEXT("position_x"), TEXT("position_y"),
-        TEXT("facing_x"), TEXT("facing_y"), TEXT("yaw_rate")
-    };
-    const Char* fieldSemantics[TrajectoryFloatsPerPoint] = {
-        TEXT("trajectory.position"), TEXT("trajectory.position"),
-        TEXT("trajectory.facing"), TEXT("trajectory.facing"), TEXT("trajectory.yaw_rate")
-    };
-    for (int32 point = 0; point < TrajectoryPointCount; point++)
-    {
-        for (int32 field = 0; field < TrajectoryFloatsPerPoint; field++)
-        {
-            const int32 local = point * TrajectoryFloatsPerPoint + field;
-            FeatureChannel ch;
-            ch.Name = String(TEXT("trajectory.")) + String::Format(TEXT("{}"), point) +
-                String(TEXT(".")) + String(fieldNames[field]);
-            ch.Block = 1;
-            ch.Offset = local;
-            ch.Dimension = 1;
-            ch.Weight = 1.0f;
-            ch.NormalizationGroup = GetTrajectoryNormalizationGroup(local);
-            ch.Kind = FeatureChannelKind::Scalar;
-            ch.SymmetryGroup = ch.NormalizationGroup;
-            ch.Semantic = String(fieldSemantics[field]);
-            ch.ContactRole = FeatureContactRole::None;
-            outChannels.Add(ch);
-        }
-    }
-}
-
-uint32 PoseSearchSchema::GetFeatureLayoutHash()
-{
-    // FNV-1a over the full channel metadata. 0 is reserved for unknown/legacy.
-    uint32 hash = 2166136261u;
-    auto mixByte = [&](uint32 b)
-    {
-        hash ^= (b & 0xFFu);
-        hash *= 16777619u;
-    };
-    auto mixInt = [&](int32 v)
-    {
-        const uint32 u = static_cast<uint32>(v);
-        mixByte(u);
-        mixByte(u >> 8);
-        mixByte(u >> 16);
-        mixByte(u >> 24);
-    };
-    auto mixString = [&](const String& s)
-    {
-        mixInt(s.Length());
-        for (int32 i = 0; i < s.Length(); i++)
-        {
-            const uint32 c = static_cast<uint32>(s[i]);
-            mixByte(c);
-            mixByte(c >> 8);
-            mixByte(c >> 16);
-            mixByte(c >> 24);
-        }
-    };
-    auto mixChannels = [&](Array<FeatureChannel>& channels)
-    {
-        for (int32 i = 0; i < channels.Count(); i++)
-        {
-            const FeatureChannel& ch = channels[i];
-            mixString(ch.Name);
-            mixInt(ch.Block);
-            mixInt(ch.Offset);
-            mixInt(ch.Dimension);
-            mixInt(ch.NormalizationGroup);
-            mixInt(static_cast<int32>(ch.Kind));
-            mixInt(ch.SymmetryGroup);
-            mixString(ch.Semantic);
-            mixInt(static_cast<int32>(ch.ContactRole));
-        }
-    };
-    Array<FeatureChannel> pose;
-    Array<FeatureChannel> trajectory;
-    DescribePoseChannels(pose);
-    DescribeTrajectoryChannels(trajectory);
-    mixInt(GetPoseFeatureSize());
-    mixInt(GetTrajectoryFeatureSize());
-    mixChannels(pose);
-    mixChannels(trajectory);
-    if (hash == 0)
-        hash = 1;
-    return hash;
-}
-
-bool PoseSearchSchema::ValidateLayout(String& error)
-{
+    layout.Clear();
     error = String::Empty;
-    const int32 poseSize = GetPoseFeatureSize();
-    const int32 trajectorySize = GetTrajectoryFeatureSize();
+    const Char* configureHint = TEXT("Declare the feature layout for your rig in Schema (RootBone, PoseBones, ContactBones).");
 
-    Array<FeatureChannel> pose;
-    Array<FeatureChannel> trajectory;
-    DescribePoseChannels(pose);
-    DescribeTrajectoryChannels(trajectory);
-
-    bool poseUsed[PoseBoneCount * PoseFloatsPerBone + PoseExtraCount];
-    for (int32 i = 0; i < poseSize; i++)
-        poseUsed[i] = false;
-    for (int32 i = 0; i < pose.Count(); i++)
+    if (RootBone.IsEmpty())
     {
-        const FeatureChannel& ch = pose[i];
-        if (ch.Block != 0 || ch.Dimension <= 0 ||
-            ch.Offset < 0 || ch.Offset + ch.Dimension > poseSize)
+        error = String::Format(TEXT("Schema.RootBone is empty. {}"), String(configureHint));
+        return false;
+    }
+    const int32 boneCount = PoseBones.Count();
+    if (boneCount <= 0 || boneCount > FeatureLayout::MaxPoseBones)
+    {
+        error = String::Format(TEXT("Schema.PoseBones must declare 1 to {} bones (has {}). {}"),
+            FeatureLayout::MaxPoseBones, boneCount, String(configureHint));
+        return false;
+    }
+    for (int32 i = 0; i < boneCount; i++)
+    {
+        const String& node = PoseBones[i].Node;
+        if (node.IsEmpty())
         {
-            error = String::Format(TEXT("Feature channel '{}' is outside the pose block."), ch.Name);
+            error = String::Format(TEXT("Schema.PoseBones[{}] has an empty Node name."), i);
             return false;
         }
-        // Dim-level mapping must agree with the baked group function.
-        for (int32 k = 0; k < ch.Dimension; k++)
+        if (node == RootBone)
         {
-            if (GetPoseNormalizationGroup(ch.Offset + k) != ch.NormalizationGroup)
+            error = String::Format(TEXT("Schema.PoseBones[{}] is the root bone '{}'; its root-relative features are always zero."), i, node);
+            return false;
+        }
+        for (int32 j = 0; j < i; j++)
+        {
+            if (PoseBones[j].Node == node)
             {
-                error = String::Format(TEXT("Feature channel '{}' disagrees with GetPoseNormalizationGroup."), ch.Name);
+                error = String::Format(TEXT("Schema.PoseBones declares node '{}' twice."), node);
                 return false;
             }
-            if (poseUsed[ch.Offset + k])
-            {
-                error = String::Format(TEXT("Feature channel '{}' overlaps another pose channel."), ch.Name);
-                return false;
-            }
-            poseUsed[ch.Offset + k] = true;
         }
     }
-    for (int32 i = 0; i < poseSize; i++)
+    const int32 contactCount = ContactBones.Count();
+    if (contactCount > FeatureLayout::MaxContacts)
     {
-        if (!poseUsed[i])
-        {
-            error = String::Format(TEXT("Pose dimension {} is not covered by any feature channel."), i);
-            return false;
-        }
-    }
-
-    bool trajectoryUsed[TrajectoryPointCount * TrajectoryFloatsPerPoint];
-    for (int32 i = 0; i < trajectorySize; i++)
-        trajectoryUsed[i] = false;
-    for (int32 i = 0; i < trajectory.Count(); i++)
-    {
-        const FeatureChannel& ch = trajectory[i];
-        if (ch.Block != 1 || ch.Dimension <= 0 ||
-            ch.Offset < 0 || ch.Offset + ch.Dimension > trajectorySize)
-        {
-            error = String::Format(TEXT("Feature channel '{}' is outside the trajectory block."), ch.Name);
-            return false;
-        }
-        for (int32 k = 0; k < ch.Dimension; k++)
-        {
-            if (GetTrajectoryNormalizationGroup(ch.Offset + k) != ch.NormalizationGroup)
-            {
-                error = String::Format(TEXT("Feature channel '{}' disagrees with GetTrajectoryNormalizationGroup."), ch.Name);
-                return false;
-            }
-            if (trajectoryUsed[ch.Offset + k])
-            {
-                error = String::Format(TEXT("Feature channel '{}' overlaps another trajectory channel."), ch.Name);
-                return false;
-            }
-            trajectoryUsed[ch.Offset + k] = true;
-        }
-    }
-    for (int32 i = 0; i < trajectorySize; i++)
-    {
-        if (!trajectoryUsed[i])
-        {
-            error = String::Format(TEXT("Trajectory dimension {} is not covered by any feature channel."), i);
-            return false;
-        }
-    }
-
-    // Contact channels must sit exactly at the metadata offsets.
-    int32 contactSeen = 0;
-    for (int32 i = 0; i < pose.Count(); i++)
-    {
-        const FeatureChannel& ch = pose[i];
-        if (ch.ContactRole == FeatureContactRole::None)
-            continue;
-        const int32 expected = GetContactFeatureOffset(static_cast<int32>(ch.ContactRole));
-        if (ch.Dimension != 1 || ch.Offset != expected || ch.Kind != FeatureChannelKind::Scalar)
-        {
-            error = String::Format(TEXT("Contact channel '{}' is not at GetContactFeatureOffset."), ch.Name);
-            return false;
-        }
-        contactSeen++;
-    }
-    if (contactSeen != PoseExtraCount ||
-        GetContactFeatureOffset(0) != poseSize - PoseExtraCount ||
-        GetContactFeatureOffset(1) != poseSize - PoseExtraCount + 1 ||
-        GetContactFeatureOffset(-1) != -1 ||
-        GetContactFeatureOffset(PoseExtraCount) != -1)
-    {
-        error = TEXT("Contact feature offsets are inconsistent.");
+        error = String::Format(TEXT("Schema.ContactBones declares {} contacts; at most {} are supported."),
+            contactCount, FeatureLayout::MaxContacts);
         return false;
     }
 
+    const int32 pointCount = TrajectorySampleTimes.Count();
+    if (pointCount <= 0 || pointCount > FeatureLayout::MaxTrajectoryPoints)
+    {
+        error = String::Format(TEXT("TrajectorySampleTimes must contain 1 to {} values (has {})."),
+            FeatureLayout::MaxTrajectoryPoints, pointCount);
+        return false;
+    }
+    int32 zeroPoint = -1;
+    for (int32 i = 0; i < pointCount; i++)
+    {
+        const float time = TrajectorySampleTimes[i];
+        if (!std::isfinite(time) || (i > 0 && time <= TrajectorySampleTimes[i - 1]))
+        {
+            error = TEXT("TrajectorySampleTimes must be finite and strictly ascending.");
+            return false;
+        }
+        if (zeroPoint < 0 && std::fabs(time) <= TimeZeroTolerance)
+            zeroPoint = i;
+    }
+    if (TrajectorySampleTimes[0] >= 0.0f ||
+        TrajectorySampleTimes[pointCount - 1] <= 0.0f ||
+        zeroPoint < 0)
+    {
+        error = TEXT("TrajectorySampleTimes must span past and future around time zero.");
+        return false;
+    }
+
+    layout.PoseBoneCount = boneCount;
+    layout.ContactCount = contactCount;
+    layout.TrajectoryPointCount = pointCount;
+    layout.PoseFeatureSize = boneCount * FeatureLayout::PoseFloatsPerBone + contactCount;
+    layout.TrajectoryFeatureSize = pointCount * FeatureLayout::TrajectoryFloatsPerPoint;
+    layout.ZeroTimePoint = zeroPoint;
+    layout.PoseBoneNames.Resize(boneCount);
+    layout.PoseBoneGroupLabels.Resize(boneCount);
+    for (int32 i = 0; i < boneCount; i++)
+    {
+        layout.PoseBoneNames[i] = PoseBones[i].Node;
+        layout.PoseBoneGroupLabels[i] = PoseBones[i].Group.HasChars() ? PoseBones[i].Group : PoseBones[i].Node;
+    }
+
+    layout.ContactPoseBones.Resize(contactCount);
+    for (int32 c = 0; c < contactCount; c++)
+    {
+        const String& node = ContactBones[c].Node;
+        int32 bone = -1;
+        for (int32 i = 0; i < boneCount; i++)
+        {
+            if (PoseBones[i].Node == node)
+            {
+                bone = i;
+                break;
+            }
+        }
+        if (node.IsEmpty() || bone < 0)
+        {
+            error = String::Format(TEXT("Schema.ContactBones[{}] ('{}') must name one of Schema.PoseBones: the planted flag uses that bone's position and velocity."), c, node);
+            layout.Clear();
+            return false;
+        }
+        for (int32 j = 0; j < c; j++)
+        {
+            if (layout.ContactPoseBones[j] == bone)
+            {
+                error = String::Format(TEXT("Schema.ContactBones declares node '{}' twice."), node);
+                layout.Clear();
+                return false;
+            }
+        }
+        layout.ContactPoseBones[c] = bone;
+    }
+
+    // Normalization groups come from the declared labels, never from bone
+    // names or indices: a solo bone (empty label) gets its own id, a label
+    // gets one id at its first use. Positions first, then velocities
+    // (separate ids: a position and a velocity never share a deviation),
+    // then one id shared by every contact flag. The reference biped
+    // declaration (pelvis, Foot, Foot, spine, head, Hand, Hand + two foot
+    // contacts) yields positions 0,1,1,2,3,4,4, velocities 5,6,6,7,8,9,9 and
+    // contacts 10.
+    layout.PoseGroups.Resize(layout.PoseFeatureSize);
+    int32 nextGroup = 0;
+    Array<int32> boneGroup;
+    boneGroup.Resize(boneCount);
+    for (int32 block = 0; block < 2; block++)
+    {
+        for (int32 i = 0; i < boneCount; i++)
+        {
+            const String& label = PoseBones[i].Group;
+            int32 group = -1;
+            if (label.HasChars())
+            {
+                for (int32 j = 0; j < i; j++)
+                {
+                    if (PoseBones[j].Group == label)
+                    {
+                        group = boneGroup[j];
+                        break;
+                    }
+                }
+            }
+            if (group < 0)
+                group = nextGroup++;
+            boneGroup[i] = group;
+            const int32 offset = block * boneCount * 3 + i * 3;
+            layout.PoseGroups[offset] = group;
+            layout.PoseGroups[offset + 1] = group;
+            layout.PoseGroups[offset + 2] = group;
+        }
+    }
+    if (contactCount > 0)
+    {
+        const int32 contactGroup = nextGroup++;
+        for (int32 c = 0; c < contactCount; c++)
+            layout.PoseGroups[layout.GetContactFeatureOffset(c)] = contactGroup;
+    }
+
+    if (!layout.Validate(error))
+    {
+        layout.Clear();
+        return false;
+    }
     return true;
+}
+
+bool PoseSearchSchema::TryResolveNodes(SkinnedModel* model, NodeIndices& result, String& error) const
+{
+    result = NodeIndices();
+    error = String::Empty;
+    if (model == nullptr || model->WaitForLoaded())
+    {
+        error = TEXT("the skinned model is not loaded.");
+        return false;
+    }
+    if (RootBone.IsEmpty() || PoseBones.IsEmpty())
+    {
+        error = TEXT("the schema declares no feature layout. "
+            "Declare RootBone and PoseBones for your rig (scene -> MotionMatchingController -> Schema).");
+        return false;
+    }
+
+    result.Root = model->FindNode(RootBone);
+    result.PoseBones.Resize(PoseBones.Count());
+    String missing;
+    auto append = [&missing](const String& name)
+    {
+        if (missing.HasChars())
+            missing += TEXT(", ");
+        missing += name.HasChars() ? name : String(TEXT("<empty>"));
+    };
+    if (result.Root < 0)
+        append(RootBone);
+    for (int32 i = 0; i < PoseBones.Count(); i++)
+    {
+        result.PoseBones[i] = model->FindNode(PoseBones[i].Node);
+        if (result.PoseBones[i] < 0)
+            append(PoseBones[i].Node);
+    }
+    if (missing.HasChars())
+    {
+        error = String::Format(
+            TEXT("declared skeleton nodes are missing in model '{}': {}. "
+                "Fix Schema.RootBone/PoseBones for this rig (a declared bone is never baked as zeros)."),
+            model->GetPath(), missing);
+        result = NodeIndices();
+        return false;
+    }
+    return true;
+}
+
+void PoseSearchSchema::ApplyLegacySkeleton(const LegacySkeletonNames& legacy)
+{
+    RootBone = legacy.Root;
+    PoseBones.Clear();
+    ContactBones.Clear();
+    auto addBone = [this](const String& node, const Char* group)
+    {
+        if (node.IsEmpty())
+            return;
+        PoseFeatureBone bone;
+        bone.Node = node;
+        bone.Group = String(group);
+        PoseBones.Add(bone);
+    };
+    // The v2-v4 fixed order and groups: pelvis, feet ("Foot"), spine, head,
+    // hands ("Hand"); contacts on the two feet.
+    addBone(legacy.Pelvis, TEXT(""));
+    addBone(legacy.LeftFoot, TEXT("Foot"));
+    addBone(legacy.RightFoot, TEXT("Foot"));
+    addBone(legacy.Spine, TEXT(""));
+    addBone(legacy.Head, TEXT(""));
+    addBone(legacy.LeftHand, TEXT("Hand"));
+    addBone(legacy.RightHand, TEXT("Hand"));
+    auto addContact = [this](const String& node)
+    {
+        if (node.IsEmpty())
+            return;
+        ContactFeatureBone contact;
+        contact.Node = node;
+        ContactBones.Add(contact);
+    };
+    addContact(legacy.LeftFoot);
+    addContact(legacy.RightFoot);
 }
 
 bool PoseSearchSchema::TryGetNormalizedUpAxis(Float3 &up) const
@@ -468,6 +400,16 @@ bool PoseSearchSchema::operator==(const PoseSearchSchema &other) const
         if (!(BoneAliases[i] == other.BoneAliases[i]))
             return false;
 
+    if (PoseBones.Count() != other.PoseBones.Count() ||
+        ContactBones.Count() != other.ContactBones.Count())
+        return false;
+    for (int32 i = 0; i < PoseBones.Count(); i++)
+        if (!(PoseBones[i] == other.PoseBones[i]))
+            return false;
+    for (int32 i = 0; i < ContactBones.Count(); i++)
+        if (!(ContactBones[i] == other.ContactBones[i]))
+            return false;
+
     return SampleRate == other.SampleRate &&
            Float3::NearEqual(Float3::Normalize(RootForwardAxis), Float3::Normalize(other.RootForwardAxis), AxisTolerance) &&
            Float3::NearEqual(Float3::Normalize(RootUpAxis), Float3::Normalize(other.RootUpAxis), AxisTolerance) &&
@@ -475,86 +417,163 @@ bool PoseSearchSchema::operator==(const PoseSearchSchema &other) const
            TrajectoryWeight == other.TrajectoryWeight &&
            ContactMaxSpeed == other.ContactMaxSpeed &&
            ContactMaxHeight == other.ContactMaxHeight &&
-           Skeleton.Root == other.Skeleton.Root &&
-           Skeleton.Pelvis == other.Skeleton.Pelvis &&
-           Skeleton.Spine == other.Skeleton.Spine &&
-           Skeleton.Head == other.Skeleton.Head &&
-           Skeleton.LeftFoot == other.Skeleton.LeftFoot &&
-           Skeleton.RightFoot == other.Skeleton.RightFoot &&
-           Skeleton.LeftHand == other.Skeleton.LeftHand &&
-           Skeleton.RightHand == other.Skeleton.RightHand;
+           RootBone == other.RootBone;
+}
+
+namespace
+{
+    // Bounded: a corrupt count must not allocate unbounded memory; the
+    // stream error flag fails the load.
+    int32 ReadBoundedCount(ReadStream& stream, int32 limit)
+    {
+        int32 count = 0;
+        stream.ReadInt32(&count);
+        if (count < 0 || count > limit)
+        {
+            stream.SetPosition(stream.GetLength());
+            return 0;
+        }
+        return count;
+    }
+
+    void WriteAliases(WriteStream& stream, const Array<BoneAlias>& aliases)
+    {
+        stream.WriteInt32(aliases.Count());
+        for (const BoneAlias& alias : aliases)
+        {
+            stream.Write(alias.Channel);
+            stream.Write(alias.Node);
+        }
+    }
+
+    void ReadAliases(ReadStream& stream, Array<BoneAlias>& aliases)
+    {
+        aliases.Clear();
+        const int32 count = ReadBoundedCount(stream, 4096);
+        for (int32 i = 0; i < count && !stream.HasError(); i++)
+        {
+            BoneAlias alias;
+            stream.Read(alias.Channel);
+            stream.Read(alias.Node);
+            aliases.Add(alias);
+        }
+    }
+
+    void WriteLegacySkeleton(WriteStream& stream, const LegacySkeletonNames& legacy)
+    {
+        stream.Write(legacy.Root);
+        stream.Write(legacy.Pelvis);
+        stream.Write(legacy.Spine);
+        stream.Write(legacy.Head);
+        stream.Write(legacy.LeftFoot);
+        stream.Write(legacy.RightFoot);
+        stream.Write(legacy.LeftHand);
+        stream.Write(legacy.RightHand);
+    }
+
+    void ReadLegacySkeleton(ReadStream& stream, LegacySkeletonNames& legacy)
+    {
+        stream.Read(legacy.Root);
+        stream.Read(legacy.Pelvis);
+        stream.Read(legacy.Spine);
+        stream.Read(legacy.Head);
+        stream.Read(legacy.LeftFoot);
+        stream.Read(legacy.RightFoot);
+        stream.Read(legacy.LeftHand);
+        stream.Read(legacy.RightHand);
+    }
 }
 
 void PoseSearchSchema::Serialize(WriteStream &stream) const
 {
-    // v4: v3 fields first (unchanged order), new fields appended.
-    SerializeV3(stream);
-    stream.WriteFloat(ContactMaxSpeed);
-    stream.WriteFloat(ContactMaxHeight);
-    stream.WriteInt32(BoneAliases.Count());
-    for (const BoneAlias& alias : BoneAliases)
-    {
-        stream.Write(alias.Channel);
-        stream.Write(alias.Node);
-    }
-}
-
-void PoseSearchSchema::Deserialize(ReadStream &stream)
-{
-    DeserializeV3(stream);
-    stream.ReadFloat(&ContactMaxSpeed);
-    stream.ReadFloat(&ContactMaxHeight);
-    int32 aliasCount = 0;
-    stream.ReadInt32(&aliasCount);
-    BoneAliases.Clear();
-    // Bounded: a corrupt count must not allocate unbounded memory; the
-    // stream error flag fails the load below.
-    if (aliasCount < 0 || aliasCount > 4096)
-    {
-        aliasCount = 0;
-        stream.SetPosition(stream.GetLength());
-    }
-    for (int32 i = 0; i < aliasCount && !stream.HasError(); i++)
-    {
-        BoneAlias alias;
-        stream.Read(alias.Channel);
-        stream.Read(alias.Node);
-        BoneAliases.Add(alias);
-    }
-}
-
-void PoseSearchSchema::SerializeV3(WriteStream &stream) const
-{
+    // v5: the declared layout replaces the eight named skeleton roles of v2-v4.
     stream.WriteInt32(SampleRate);
     stream.Write(RootForwardAxis);
     stream.Write(RootUpAxis);
     stream.WriteFloat(PoseWeight);
     stream.WriteFloat(TrajectoryWeight);
-    stream.Write(Skeleton.Root);
-    stream.Write(Skeleton.Pelvis);
-    stream.Write(Skeleton.Spine);
-    stream.Write(Skeleton.Head);
-    stream.Write(Skeleton.LeftFoot);
-    stream.Write(Skeleton.RightFoot);
-    stream.Write(Skeleton.LeftHand);
-    stream.Write(Skeleton.RightHand);
     stream.Write(TrajectorySampleTimes);
+    stream.WriteFloat(ContactMaxSpeed);
+    stream.WriteFloat(ContactMaxHeight);
+    WriteAliases(stream, BoneAliases);
+    stream.Write(RootBone);
+    stream.WriteInt32(PoseBones.Count());
+    for (const PoseFeatureBone& bone : PoseBones)
+    {
+        stream.Write(bone.Node);
+        stream.Write(bone.Group);
+    }
+    stream.WriteInt32(ContactBones.Count());
+    for (const ContactFeatureBone& contact : ContactBones)
+        stream.Write(contact.Node);
 }
 
-void PoseSearchSchema::DeserializeV3(ReadStream &stream)
+void PoseSearchSchema::Deserialize(ReadStream &stream)
 {
     stream.ReadInt32(&SampleRate);
     stream.Read(RootForwardAxis);
     stream.Read(RootUpAxis);
     stream.ReadFloat(&PoseWeight);
     stream.ReadFloat(&TrajectoryWeight);
-    stream.Read(Skeleton.Root);
-    stream.Read(Skeleton.Pelvis);
-    stream.Read(Skeleton.Spine);
-    stream.Read(Skeleton.Head);
-    stream.Read(Skeleton.LeftFoot);
-    stream.Read(Skeleton.RightFoot);
-    stream.Read(Skeleton.LeftHand);
-    stream.Read(Skeleton.RightHand);
+    stream.Read(TrajectorySampleTimes);
+    stream.ReadFloat(&ContactMaxSpeed);
+    stream.ReadFloat(&ContactMaxHeight);
+    ReadAliases(stream, BoneAliases);
+    stream.Read(RootBone);
+    PoseBones.Clear();
+    const int32 boneCount = ReadBoundedCount(stream, 4096);
+    for (int32 i = 0; i < boneCount && !stream.HasError(); i++)
+    {
+        PoseFeatureBone bone;
+        stream.Read(bone.Node);
+        stream.Read(bone.Group);
+        PoseBones.Add(bone);
+    }
+    ContactBones.Clear();
+    const int32 contactCount = ReadBoundedCount(stream, 4096);
+    for (int32 i = 0; i < contactCount && !stream.HasError(); i++)
+    {
+        ContactFeatureBone contact;
+        stream.Read(contact.Node);
+        ContactBones.Add(contact);
+    }
+}
+
+void PoseSearchSchema::SerializeV4(WriteStream &stream, const LegacySkeletonNames& legacy) const
+{
+    // v4: the v3 fields in their original order, then the contact gate and aliases.
+    SerializeV3(stream, legacy);
+    stream.WriteFloat(ContactMaxSpeed);
+    stream.WriteFloat(ContactMaxHeight);
+    WriteAliases(stream, BoneAliases);
+}
+
+void PoseSearchSchema::DeserializeV4(ReadStream &stream, LegacySkeletonNames& legacy)
+{
+    DeserializeV3(stream, legacy);
+    stream.ReadFloat(&ContactMaxSpeed);
+    stream.ReadFloat(&ContactMaxHeight);
+    ReadAliases(stream, BoneAliases);
+}
+
+void PoseSearchSchema::SerializeV3(WriteStream &stream, const LegacySkeletonNames& legacy) const
+{
+    stream.WriteInt32(SampleRate);
+    stream.Write(RootForwardAxis);
+    stream.Write(RootUpAxis);
+    stream.WriteFloat(PoseWeight);
+    stream.WriteFloat(TrajectoryWeight);
+    WriteLegacySkeleton(stream, legacy);
+    stream.Write(TrajectorySampleTimes);
+}
+
+void PoseSearchSchema::DeserializeV3(ReadStream &stream, LegacySkeletonNames& legacy)
+{
+    stream.ReadInt32(&SampleRate);
+    stream.Read(RootForwardAxis);
+    stream.Read(RootUpAxis);
+    stream.ReadFloat(&PoseWeight);
+    stream.ReadFloat(&TrajectoryWeight);
+    ReadLegacySkeleton(stream, legacy);
     stream.Read(TrajectorySampleTimes);
 }

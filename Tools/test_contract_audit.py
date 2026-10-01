@@ -55,6 +55,18 @@ def main():
             "Register(MotionMatchingDatabase::LegacyTypeName);", "", 1),
     )
     expect_failure(
+        "v4 -> v5 upgrader step",
+        "Source/MotionMatching/Database/MotionMatchingDatabase.cpp",
+        lambda text: text.replace("{ 4, 5, &Upgrade_4_To_5 },", "", 1),
+    )
+    expect_failure(
+        "declared pose bones field",
+        "Source/MotionMatching/Schema/PoseSearchSchema.h",
+        lambda text: text.replace(
+            "API_FIELD() Array<PoseFeatureBone> PoseBones;",
+            "API_FIELD() Array<String> PoseBones;", 1),
+    )
+    expect_failure(
         "forbidden game coupling",
         "Source/MotionMatching/MotionMatchingController.cs",
         lambda text: text + "\nPlayerCoordinator hostLeak;\n",
@@ -64,7 +76,7 @@ def main():
         "README.md",
         lambda text: text.replace("docs/LIFECYCLE.md", "docs/REMOVED.md", 1),
     )
-    print("contract audit mutation tests: PASS (6/6)")
+    print("contract audit mutation tests: PASS (8/8)")
     return 0
 
 
