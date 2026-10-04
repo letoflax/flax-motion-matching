@@ -593,3 +593,9 @@ void PoseSearchSchema::DeserializeV3(ReadStream &stream, LegacySkeletonNames& le
     ReadLegacySkeleton(stream, legacy);
     stream.Read(TrajectorySampleTimes);
 }
+
+// C++14 (Flax Linux/clang): ODR-used static constexpr members need an out-of-class definition (undefined symbol at load otherwise).
+#if __cplusplus < 201703L
+constexpr int32 PoseSearchSchema::NormalizationRevision;
+constexpr float PoseSearchSchema::AxisTolerance;
+#endif

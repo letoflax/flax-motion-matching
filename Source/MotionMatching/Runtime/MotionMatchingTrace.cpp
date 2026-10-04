@@ -1002,3 +1002,9 @@ bool MotionMatchingTraceLog::VerifyReplay(MotionMatchingDatabase* database, int3
     const bool pass = mismatches == 0 && checkedTotal > 0 && skippedDbChanged == 0;
     return pass;
 }
+
+// C++14 (Flax Linux/clang): ODR-used static constexpr members need an out-of-class definition (undefined symbol at load otherwise).
+#if __cplusplus < 201703L
+constexpr int32 MotionMatchingTraceLog::Capacity;
+constexpr int32 MotionMatchingTraceLog::SchemaVersion;
+#endif

@@ -1316,7 +1316,7 @@ MotionMatchingDatabase::ValidationStatus MotionMatchingDatabase::ValidateDataSta
             String(layoutInvalid ? TEXT("baked schema declares no valid feature layout")
                 : legacyLayout ? TEXT("legacy feature layout") : TEXT("provenance mismatch")),
             _normalizationRevision,
-            PoseSearchSchema::NormalizationRevision,
+            int32(PoseSearchSchema::NormalizationRevision),
             _featureLayoutHash,
             currentLayoutHash,
             _schemaContractRevision,
@@ -1771,3 +1771,11 @@ AssetChunksFlag MotionMatchingDatabase::getChunksToPreload() const
 {
     return GET_CHUNK_FLAG(0);
 }
+
+// C++14 (Flax Linux/clang): ODR-used static constexpr members need an out-of-class definition (undefined symbol at load otherwise).
+#if __cplusplus < 201703L
+constexpr int32 MotionMatchingDatabase::SchemaContractRevision;
+constexpr int32 MotionMatchingDatabase::SamplingContractRevision;
+constexpr int32 MotionMatchingDatabase::BakeToolBuildId;
+constexpr Char MotionMatchingDatabase::TagSeparator;
+#endif

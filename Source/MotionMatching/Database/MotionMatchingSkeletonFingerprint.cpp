@@ -411,3 +411,9 @@ bool MotionMatchingSkeletonFingerprint::Build(
 }
 
 #endif
+
+// C++14 (Flax Linux/clang): ODR-used static constexpr members need an out-of-class definition (undefined symbol at load otherwise).
+#if __cplusplus < 201703L
+constexpr float MotionMatchingSkeletonFingerprint::TranslationQuantum;
+constexpr float MotionMatchingSkeletonFingerprint::ProportionTolerance;
+#endif

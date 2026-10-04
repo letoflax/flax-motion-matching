@@ -264,3 +264,16 @@ bool FeatureLayout::Validate(String& error) const
     }
     return true;
 }
+
+// C++14 (Flax Linux/clang): ODR-used static constexpr members need an out-of-class definition (undefined symbol at load otherwise).
+#if __cplusplus < 201703L
+constexpr int32 FeatureLayout::PoseFloatsPerBone;
+constexpr int32 FeatureLayout::TrajectoryFloatsPerPoint;
+constexpr int32 FeatureLayout::MaxPoseBones;
+constexpr int32 FeatureLayout::MaxContacts;
+constexpr int32 FeatureLayout::MaxTrajectoryPoints;
+constexpr int32 FeatureLayout::MaxPoseFeatureSize;
+constexpr int32 FeatureLayout::MaxTrajectoryFeatureSize;
+constexpr int32 FeatureLayout::ReferencePoseFeatureSize;
+constexpr int32 FeatureLayout::ReferenceTrajectoryFeatureSize;
+#endif
