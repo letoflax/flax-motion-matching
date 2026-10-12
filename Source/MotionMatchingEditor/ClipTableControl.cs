@@ -1,11 +1,3 @@
-// Clip table control (editor tooling).
-//
-// Purpose: owner-drawn, single-control clip list for the registration window.
-// Ownership: editor tooling, hosted by RegisterClipsWindow.
-// Tick/lifecycle role: edit-mode only; paints visible rows on demand and
-// reports selection/loop/remove clicks through events; holds no database state.
-// This file must never reference game/player/sample types.
-
 using System;
 using System.Collections.Generic;
 using FlaxEngine;
@@ -22,6 +14,7 @@ public class ClipTableRow
     public string Name;
     public string Tag;
     public bool Loop;
+    public int Group;
     public bool Dirty;
 }
 
@@ -93,7 +86,7 @@ public class ClipTableControl : Control
             var row = Rows[r];
             string name = row.Dirty ? "* " + row.Name : row.Name;
             DrawCell(font, name, 0.0f, TagEdge, y, fg, false);
-            DrawCell(font, row.Tag, TagEdge, LoopEdge, y, fg, false);
+            DrawCell(font, row.Group != 0 ? row.Tag + "  [g" + row.Group + "]" : row.Tag, TagEdge, LoopEdge, y, fg, false);
             DrawCell(font, row.Loop ? "[x]" : "[ ]", LoopEdge, RemoveEdge, y, fg, false);
             DrawCell(font, "x", RemoveEdge, 1.0f, y, fg, false);
         }

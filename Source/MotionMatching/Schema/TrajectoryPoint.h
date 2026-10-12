@@ -1,6 +1,3 @@
-// TrajectoryPoint.h: single trajectory point value type (TrajectoryPoint: Position, Facing).
-// Ownership: plugin runtime, no game/host references.
-// Key invariants: plain character-local data (X = right, Z = forward); Position is the planar point and Facing its planar direction defaulting to forward; POD (TIsPODType) so arrays stay trivially copyable.
 #pragma once
 
 #include "Engine/Core/Math/Vector3.h"

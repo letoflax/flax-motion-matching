@@ -1,7 +1,5 @@
-// MotionMatchingRuntimePolicy.cpp: per-tick policy (Tick/RunQuery/TryFastPath, ForcePlayClip, ExportClipAudit, SelectPlayRate, HashTagSet/CaptureFastPathSignature).
-// Ownership: plugin runtime, no game/host references.
-// Key invariants: Tick samples the live pose and builds the trajectory every tick, then dispatches pure search (cadence-gated) or the cheap continuation; RunQuery applies the provider caller filter verbatim with LoopOnly reseed after teleports and a loop-only end-recovery retry; the fast-path signature (tags, filters, clip/time, database identity) invalidates the hold on any scope change; telemetry/trace recording never steers the winner.
 #include "MotionMatchingRuntimePolicy.h"
+#include "../Schema/PlanarFrame.h"
 
 #include "../Database/MotionMatchingDatabase.h"
 #include "../Search/MotionMatchingSearch.h"
@@ -21,17 +19,6 @@
 
 namespace
 {
-    constexpr float WarmupTime = 0.5f;
-    constexpr float TeleportDistance = 2000.0f;
-    constexpr float TravelingDistance = 50.0f;
-    constexpr float MaxFastPathAge = 0.5f;
-    constexpr int32 MaxFastPathFrames = 5;
-    constexpr float ReselectHistoryDuration = 0.6f;
-    constexpr float ReselectSampleWindow = 0.35f;
-    constexpr bool EnableReselectBan = true;
-    constexpr bool EnableLoopTailExclusion = false;
-    constexpr float SameSegmentTwinBan = 0.25f;
-    constexpr float NonLoopTailExclusion = 0.3f;
     constexpr float PiF = 3.14159265358979323846f;
 
     void FormatFloatText(float value, char* buffer, int32 capacity)
@@ -54,9 +41,8 @@ namespace
         }
     }
 
-    // pack the seven boolean request flags into MotionMatchingTraceEntry
+    // Pack the seven boolean request flags into MotionMatchingTraceEntry
     // bitmask (see TraceFlag_* in MotionMatchingTrace.h). Record-only.
-    // FirmLockL/R died with the foot-lock search prior (always false).
     int32 PackTraceFlags(bool forcedEdge, bool reseeded, bool fairFight, bool oneshotWindow,
         bool useIndexed, bool verifyIndexed, bool exclTail)
     {
@@ -137,14 +123,14 @@ void MotionMatchingRuntimePolicy::Initialize(
     MotionMatchingDatabase* database,
     AnimatedModel* body,
     const PoseSearchSchema& schema,
-    const String& cacheFolder,
-    float defaultInertial)
+    float defaultInertial,
+    bool allowBindingMismatch)
 {
     Shutdown();
+    BindingReport = String::Empty;
     _database = database;
     _body = body;
     _liveSchema = schema;
-    _cacheFolder = cacheFolder;
     _playback = New<MotionMatchingPlayback>();
     _playback->InertializationDuration = defaultInertial > 0.01f ? defaultInertial : 0.25f;
     _trace = New<MotionMatchingTraceLog>();
@@ -153,11 +139,11 @@ void MotionMatchingRuntimePolicy::Initialize(
     if (body != nullptr)
     {
         fallbackModel = body->SkinnedModel.Get();
-        _playback->Setup(database, fallbackModel, schema.Skeleton, schema.RootUpAxis);
+        _playback->Setup(database, fallbackModel, schema.RootBone);
     }
     else
     {
-        _playback->Setup(database, nullptr, schema.Skeleton, schema.RootUpAxis);
+        _playback->Setup(database, nullptr, schema.RootBone);
     }
     _queryTimer = 0.0f;
     _timeSinceSwitch = 999.0f;
@@ -201,7 +187,7 @@ void MotionMatchingRuntimePolicy::Initialize(
     }
 
     String resolveError;
-    if (!MotionMatchingSkeleton::TryResolve(schema.Skeleton, model, _nodes, resolveError))
+    if (!schema.TryResolveNodes(model, _nodes, resolveError))
     {
         const StringAnsi errorAnsi(resolveError);
         char message[512];
@@ -210,27 +196,57 @@ void MotionMatchingRuntimePolicy::Initialize(
         return;
     }
 
-    _prevPositions.Resize(21);
-    for (int32 i = 0; i < 21; i++)
+    // Bind-time checks: a database baked for another schema or skeleton must
+    // never run silently (it produces wrong poses, not errors).
+    {
+        String report;
+        const bool bound = CheckSchemaBinding(model, report);
+        BindingReport = report;
+        if (!bound)
+        {
+            if (!allowBindingMismatch)
+            {
+                LOG(Error, "Motion matching controller not ready: the database does not fit this character. {} "
+                    "(Set AllowBindingMismatch to bind anyway, debug only.)", report);
+                return;
+            }
+            LOG(Warning, "Motion matching binding mismatch ALLOWED by AllowBindingMismatch (poses may be wrong): {}", report);
+        }
+        else
+        {
+            LOG(Info, "Motion matching binding: {}", report);
+        }
+    }
+
+    // Scratch sized from the baked layout (CheckSchemaBinding above proved
+    // the live declaration equals the baked one).
+    const FeatureLayout& layout = database->GetLayout();
+    const int32 prevCount = layout.GetPositionBlockSize();
+    const int32 packedCount = layout.TrajectoryPointCount * 6;
+    if (prevCount <= 0 || packedCount <= 0 ||
+        layout.PoseBoneCount != _nodes.PoseBones.Count())
+    {
+        LOG(Warning, "Motion matching policy disabled: the database has no usable feature layout (rebake required).");
+        return;
+    }
+    _prevPositions.Resize(prevCount);
+    for (int32 i = 0; i < prevCount; i++)
         _prevPositions[i] = 0.0f;
-    _packedTrajectory.Resize(36);
-    for (int32 i = 0; i < 36; i++)
+    _packedTrajectory.Resize(packedCount);
+    for (int32 i = 0; i < packedCount; i++)
         _packedTrajectory[i] = 0.0f;
+    _packedTrajectoryMismatchLogged = false;
     _hasPrevPositions = false;
     _usedSearchSnapshot = false;
     _searchSnapshotLength = 0;
-    // init caches only the per-clip tag SETS (cheap, per-clip copy for
+    // Init caches only the per-clip tag SETS (cheap, per-clip copy for
     // the fast-path incumbent check). The full motion scan (travel/turn/net
-    // over every sample) and the audit file write moved to the explicit
-    // GenerateClipAudit editor/tool command below — init never scans the DB
-    // or touches MMClipAudit.txt.
+    // over every sample) and the audit file write only happen in the explicit
+    // GenerateClipAudit editor/tool command - init never scans the DB.
     EnsureClipTagCache();
     _samplingReady = true;
-    PolicyState = String(TEXT("Locomotion"));
+    PolicyState = String(TEXT("Active"));
     _trace->Clear();
-    _telemetryHead = 0;
-    _telemetryCount = 0;
-    _telemetryDropped = 0;
     _lastEntry = MotionMatchingTraceEntry();
     LastSwitchReason = String(TEXT("init"));
     ChooserStatusText = String::Empty;
@@ -242,7 +258,6 @@ void MotionMatchingRuntimePolicy::Shutdown()
     _database = nullptr;
     _body = nullptr;
     _liveSchema = PoseSearchSchema();
-    _cacheFolder = String::Empty;
     _nodes = NodeIndices();
     _prevPositions.Clear();
     _packedTrajectory.Clear();
@@ -273,9 +288,6 @@ void MotionMatchingRuntimePolicy::Shutdown()
     _clipTags.Clear();
     _clipSpeeds.Clear();
     _clipSpeedsDbId = 0;
-    _telemetryHead = 0;
-    _telemetryCount = 0;
-    _telemetryDropped = 0;
     _queryTagsKey = String::Empty;
     _queryTagsCache.Clear();
     _queryExcludedKey = String::Empty;
@@ -291,7 +303,7 @@ void MotionMatchingRuntimePolicy::Shutdown()
 
 void MotionMatchingRuntimePolicy::EnsureClipTagCache()
 {
-    // init-time cache only — per-clip tag SET copies, no sample scan.
+    // Init-time cache only — per-clip tag SET copies, no sample scan.
     // Every per-clip/per-frame reader goes through ClipTags() and never
     // touches native strings again. The motion scan (travel/turn/net over
     // every sample) lives in GenerateClipAudit below and never runs at init.
@@ -305,23 +317,21 @@ void MotionMatchingRuntimePolicy::EnsureClipTagCache()
         _clipTags[c] = db->GetClipTags(c);
 }
 
-bool MotionMatchingRuntimePolicy::ExportClipAudit(MotionMatchingDatabase* db, const String& cacheFolder, float sampleRate, String& error)
+bool MotionMatchingRuntimePolicy::ExportClipAudit(MotionMatchingDatabase* db, const String& filePath, float sampleRate, String& error)
 {
-    // explicit editor/tool command (the ONLY writer of MMClipAudit.txt).
+    // Explicit editor/tool command: writes the audit table to filePath.
     // Static: runs in edit mode with no policy/playback instance. Init/play
-    // never call this — tools run it on demand (editor service / bridge
-    // clip_audit op). Same file format as the old init-time write
-    // (index|name|tags|loop|turn|travel|net|yaw|len|speed), computed into
-    // locals — no scan arrays survive on the runtime.
+    // never call this. Columns: index|name|tags|loop|turn|travel|net|yaw|len|speed,
+    // computed into locals (no scan arrays survive on the runtime).
     error = String::Empty;
     if (db == nullptr || !db->IsBaked())
     {
         error = String(TEXT("Clip audit stopped: database is not baked."));
         return false;
     }
-    if (cacheFolder.IsEmpty())
+    if (filePath.IsEmpty())
     {
-        error = String(TEXT("Clip audit stopped: cache folder is not set."));
+        error = String(TEXT("Clip audit stopped: no output file path."));
         return false;
     }
     const int32 clipCount = db->GetClipCount();
@@ -333,6 +343,8 @@ bool MotionMatchingRuntimePolicy::ExportClipAudit(MotionMatchingDatabase* db, co
         error = String(TEXT("Clip audit stopped: database motion arrays are empty."));
         return false;
     }
+    // Ground plane of the baked root motion (Y-up keeps the (x, z) formulas).
+    const Float3 planarUp = db->GetPlanarUpAxis();
     Array<float> travel;
     Array<float> turnAngle;
     Array<float> net;
@@ -350,10 +362,10 @@ bool MotionMatchingRuntimePolicy::ExportClipAudit(MotionMatchingDatabase* db, co
         for (int32 i = 1; i < n && cursor + i < positions.Count() && cursor + i < forwards.Count(); i++)
         {
             const Float3 dp = positions[cursor + i] - positions[cursor + i - 1];
-            path += Float2(dp.X, dp.Z).Length();
+            path += PlanarFrame::Project(dp, planarUp).Length();
             last = positions[cursor + i];
-            const Float2 a(forwards[cursor + i - 1].X, forwards[cursor + i - 1].Z);
-            const Float2 b(forwards[cursor + i].X, forwards[cursor + i].Z);
+            const Float2 a = PlanarFrame::Project(forwards[cursor + i - 1], planarUp);
+            const Float2 b = PlanarFrame::Project(forwards[cursor + i], planarUp);
             if (a.LengthSquared() > 0.000001f && b.LengthSquared() > 0.000001f)
             {
                 // Signed yaw travel (radians, engine convention): same
@@ -368,14 +380,14 @@ bool MotionMatchingRuntimePolicy::ExportClipAudit(MotionMatchingDatabase* db, co
                 yaw += dy;
             }
         }
-        const float netDist = Float2(last.X - first.X, last.Z - first.Z).Length();
+        const float netDist = PlanarFrame::Project(last - first, planarUp).Length();
         travel[c] = path;
         turnAngle[c] = yaw;
         net[c] = netDist;
         cursor += n;
     }
     LOG(Info, "Motion matching clip audit: {} clips measured.", clipCount);
-    // Accel audit (was LogAccelAudit at init): per-tag peak/avg planar
+    // Accel audit: per-tag peak/avg planar
     // acceleration from baked root velocities, log only.
     {
         const Array<Float3>& velocities = db->GetRootVelocities();
@@ -396,7 +408,7 @@ bool MotionMatchingRuntimePolicy::ExportClipAudit(MotionMatchingDatabase* db, co
                 for (int32 i = 1; i < n && vcursor + i < velocities.Count(); i++)
                 {
                     const Float3 dv = velocities[vcursor + i] - velocities[vcursor + i - 1];
-                    const float a = Float2(dv.X, dv.Z).Length() / dt;
+                    const float a = PlanarFrame::Project(dv, planarUp).Length() / dt;
                     for (const String& tag : tagSet)
                     {
                         int32 found = -1;
@@ -474,7 +486,7 @@ bool MotionMatchingRuntimePolicy::ExportClipAudit(MotionMatchingDatabase* db, co
         // Audit file tag column is '+'-joined (tools split it back).
         const String tag = MotionMatchingDatabase::JoinTags(db->GetClipTags(c));
         const bool loop = db->GetClipLoop(c);
-        const bool turnLike = db->GetClipTurnLike(c);
+        const int32 group = db->GetClipGroup(c);
         const StringAnsi nameAnsi(name);
         const StringAnsi tagAnsi(tag);
         char fTravel[32], fNet[32], fYaw[32], fLen[32], fSpd[32];
@@ -483,22 +495,21 @@ bool MotionMatchingRuntimePolicy::ExportClipAudit(MotionMatchingDatabase* db, co
         FormatFloatText(turnAngle[c], fYaw, sizeof(fYaw));
         FormatFloatText(len, fLen, sizeof(fLen));
         FormatFloatText(spd, fSpd, sizeof(fSpd));
-        snprintf(line, sizeof(line), "%d|%s|%s|%s|%s|%s|%s|%s|%s|%s\n",
+        // Columns: index|name|tags|loop|group|travel|net|yaw|length|speed.
+        snprintf(line, sizeof(line), "%d|%s|%s|%s|%d|%s|%s|%s|%s|%s\n",
             c, nameAnsi.GetText(), tagAnsi.GetText(),
-            loop ? "loop" : "once", turnLike ? "turn" : "-",
+            loop ? "loop" : "once", group,
             fTravel, fNet, fYaw, fLen, fSpd);
         sb.Append(line);
     }
     String text;
     sb.ToString(text);
-    const StringAnsi folderAnsi(cacheFolder);
-    char path[1024];
-    snprintf(path, sizeof(path), "%s/MMClipAudit.txt", folderAnsi.GetText());
+    const StringAnsi pathAnsi(filePath);
     const StringAnsi bodyAnsi(text);
-    FILE* file = fopen(path, "wb");
+    FILE* file = fopen(pathAnsi.GetText(), "wb");
     if (file == nullptr)
     {
-        error = String(TEXT("Clip audit stopped: cannot write MMClipAudit.txt."));
+        error = String(TEXT("Clip audit stopped: cannot write ")) + filePath + String(TEXT("."));
         return false;
     }
     fwrite(bodyAnsi.GetText(), 1, (size_t)bodyAnsi.Length(), file);
@@ -508,9 +519,9 @@ bool MotionMatchingRuntimePolicy::ExportClipAudit(MotionMatchingDatabase* db, co
 
 void MotionMatchingRuntimePolicy::ResetOnTeleport()
 {
-    // Teleport rule: pose history + playback SURVIVE teleports. Bone poses are
+    // Phase 3: pose history + playback SURVIVE teleports. Bone poses are
     // root-relative (recomputed fresh against the current root every
-    // tick), so a teleport changes neither positions nor velocities; zeroing them poisoned the first query (pose cost in the thousands on 44 dims) and stopping playback discarded continuity for nothing.
+    // tick), so a teleport changes neither positions nor velocities -
     // zeroing them poisoned the first query (pose cost in the thousands
     // on 44 dims) and stopping playback discarded continuity for
     // nothing. Only trajectory (world-frame) and chooser state reset;
@@ -528,7 +539,7 @@ void MotionMatchingRuntimePolicy::ResetOnTeleport()
     _hasLastActorPos = false;
     _chooserReseed = true;
     ActiveTag = String::Empty;
-    // invalidate the change-only scope caches (both RunQuery's pair and
+    // Invalidate the change-only scope caches (both RunQuery's pair and
     // the fast-path-only pair) so the first post-reset query rebuilds the
     // splits AND the ActiveTag/ChooserStatus diagnostics even when the scope
     // string is unchanged across the reset. Keys AND caches are cleared
@@ -565,37 +576,65 @@ void MotionMatchingRuntimePolicy::ResetOnTeleport()
     if (_playback != nullptr)
         _playback->SetPlayRate(1.0f);
     LastSwitchReason = String(TEXT("teleport-reset"));
-    // teleport/reset is effective input (it reseeds the chooser to
+    // Teleport/reset is effective input (it reseeds the chooser to
     // LoopOnly on the next query). Record it as a structural command entry
     // so replay accounts for every discontinuity. Record-only: playback and
     // chooser state above are untouched.
     if (_trace != nullptr)
         RecordPolicyEvent("reset", _currentClip, String(TEXT("teleport-reset")));
     // Playback keeps playing (see above): same clip, same time, root
-    // stripped — the picture never jumps. Only timers/locks release.
+    // stripped - the picture never jumps. Only timers/locks release.
 }
 
-void MotionMatchingRuntimePolicy::CheckSchemaBinding()
+bool MotionMatchingRuntimePolicy::CheckSchemaBinding(SkinnedModel* model, String& report) const
 {
-    if (_bindingWarned || _database == nullptr || !_database->IsBaked())
-        return;
-    _bindingWarned = true;
-    // Scene weights are live tuning (allowed to differ); skeleton names,
-    // axes, sample rate and trajectory times must match the baked snapshot
-    // or the query frame silently disagrees with the database.
+    report = String::Empty;
+    if (_database == nullptr || !_database->IsBaked())
+    {
+        report = TEXT("database is not baked");
+        return false;
+    }
+    // Scene weights are live tuning (allowed to differ). Everything else of
+    // the schema shaped the baked features: a different value means the
+    // query frame or the sampled skeleton disagrees with the database.
     const PoseSearchSchema& live = _liveSchema;
     const PoseSearchSchema& baked = _database->GetSchema();
-    const bool mismatch =
-        live.Skeleton.Root != baked.Skeleton.Root ||
-        live.Skeleton.Pelvis != baked.Skeleton.Pelvis ||
-        live.Skeleton.LeftFoot != baked.Skeleton.LeftFoot ||
-        live.Skeleton.RightFoot != baked.Skeleton.RightFoot ||
-        live.SampleRate != baked.SampleRate ||
-        !AxesNear(live.RootForwardAxis, baked.RootForwardAxis) ||
-        !AxesNear(live.RootUpAxis, baked.RootUpAxis) ||
-        !TimesEqual(live.TrajectorySampleTimes, baked.TrajectorySampleTimes);
-    if (mismatch)
-        LOG(Warning, "Motion matching schema differs from the baked database snapshot (skeleton/axes/rate/times). Query uses baked axes; rebake to reconcile. Scene weights remain live.");
+    String schemaDiff;
+    auto differs = [&schemaDiff](bool different, const Char* field)
+    {
+        if (!different)
+            return;
+        if (schemaDiff.HasChars())
+            schemaDiff += TEXT(", ");
+        schemaDiff += field;
+    };
+    differs(live.SampleRate != baked.SampleRate, TEXT("SampleRate"));
+    differs(!AxesNear(live.RootForwardAxis, baked.RootForwardAxis), TEXT("RootForwardAxis"));
+    differs(!AxesNear(live.RootUpAxis, baked.RootUpAxis), TEXT("RootUpAxis"));
+    differs(!TimesEqual(live.TrajectorySampleTimes, baked.TrajectorySampleTimes), TEXT("TrajectorySampleTimes"));
+    differs(live.ContactMaxSpeed != baked.ContactMaxSpeed || live.ContactMaxHeight != baked.ContactMaxHeight, TEXT("ContactMaxSpeed/ContactMaxHeight"));
+    differs(live.RootBone != baked.RootBone, TEXT("RootBone"));
+    bool poseBonesDiffer = live.PoseBones.Count() != baked.PoseBones.Count();
+    for (int32 i = 0; !poseBonesDiffer && i < live.PoseBones.Count(); i++)
+        poseBonesDiffer = !(live.PoseBones[i] == baked.PoseBones[i]);
+    differs(poseBonesDiffer, TEXT("PoseBones"));
+    bool contactBonesDiffer = live.ContactBones.Count() != baked.ContactBones.Count();
+    for (int32 i = 0; !contactBonesDiffer && i < live.ContactBones.Count(); i++)
+        contactBonesDiffer = !(live.ContactBones[i] == baked.ContactBones[i]);
+    differs(contactBonesDiffer, TEXT("ContactBones"));
+    bool aliasesDiffer = live.BoneAliases.Count() != baked.BoneAliases.Count();
+    for (int32 i = 0; !aliasesDiffer && i < live.BoneAliases.Count(); i++)
+        aliasesDiffer = !(live.BoneAliases[i] == baked.BoneAliases[i]);
+    differs(aliasesDiffer, TEXT("BoneAliases"));
+
+    String skeletonReport;
+    const bool skeletonOk = _database->CheckSkeleton(model, skeletonReport);
+    if (schemaDiff.HasChars())
+    {
+        report = String::Format(TEXT("schema differs from the baked snapshot ({}); rebake with this schema or restore it. "), schemaDiff);
+    }
+    report += skeletonReport;
+    return schemaDiff.IsEmpty() && skeletonOk;
 }
 
 bool MotionMatchingRuntimePolicy::AxesNear(const Float3& a, const Float3& b)
@@ -662,18 +701,17 @@ void MotionMatchingRuntimePolicy::WarnOnce(const String& message)
     LOG(Warning, "{}", message);
 }
 
-float MotionMatchingRuntimePolicy::SelectPlayRate(float characterPlanarSpeed)
+float MotionMatchingRuntimePolicy::SelectPlayRate(float targetSpeed)
 {
-    // Bend clip time to match world speed: characterPlanar / clipRootSpeed,
-    // clamped to the playback [0.85, 1.15] window (SetPlayRate clamps again).
-    // Clip speed reuses the audit path (planar travel / length from baked
-    // root positions + clip lengths), cached once per database in
-    // EnsureClipSpeedCache — never a per-tick DB scan. Character speed is
-    // the Game-side planar speed (explicit Tick param, teleport-clean).
-    // Missing metadata for a clip returns 1.0 for that tick.
+    // Bend clip time to match a host-supplied speed: targetSpeed / clipRootSpeed,
+    // clamped to [PlayRateMin, PlayRateMax] (playback clamps again).
+    // Clip speed is the planar travel / length from baked root positions,
+    // cached once per database in EnsureClipSpeedCache, never a per-tick DB
+    // scan. A target speed at or below PlayRateMinSpeed (0 = off) or missing
+    // metadata for a clip returns 1.0 for that tick.
     if (_database == nullptr || !_database->IsBaked() || _currentClip < 0)
         return 1.0f;
-    if (characterPlanarSpeed <= 10.0f)
+    if (targetSpeed <= _tuning.PlayRateMinSpeed)
         return 1.0f;
     EnsureClipSpeedCache();
     if (_currentClip >= _clipSpeeds.Count())
@@ -681,11 +719,11 @@ float MotionMatchingRuntimePolicy::SelectPlayRate(float characterPlanarSpeed)
     const float clipSpeed = _clipSpeeds[_currentClip];
     if (clipSpeed <= 1.0f)
         return 1.0f;
-    const float rate = characterPlanarSpeed / clipSpeed;
-    if (rate < 0.85f)
-        return 0.85f;
-    if (rate > 1.15f)
-        return 1.15f;
+    const float rate = targetSpeed / clipSpeed;
+    if (rate < _tuning.PlayRateMin)
+        return _tuning.PlayRateMin;
+    if (rate > _tuning.PlayRateMax)
+        return _tuning.PlayRateMax;
     return rate;
 }
 
@@ -711,6 +749,7 @@ void MotionMatchingRuntimePolicy::EnsureClipSpeedCache()
     if (counts.Count() != clipCount || positions.Count() == 0)
         return;
     _clipSpeeds.Resize(clipCount);
+    const Float3 planarUp = db->GetPlanarUpAxis();
     int32 cursor = 0;
     for (int32 c = 0; c < clipCount; c++)
     {
@@ -722,8 +761,8 @@ void MotionMatchingRuntimePolicy::EnsureClipSpeedCache()
             float path = 0.0f;
             for (int32 i = 1; i < n; i++)
             {
-                const Float3 dp = positions[cursor + i] - positions[cursor + i - 1];
-                path += Math::Sqrt(dp.X * dp.X + dp.Z * dp.Z);
+                const Float2 dp = PlanarFrame::Project(positions[cursor + i] - positions[cursor + i - 1], planarUp);
+                path += Math::Sqrt(dp.X * dp.X + dp.Y * dp.Y);
             }
             speed = path / len;
         }
@@ -741,17 +780,18 @@ void MotionMatchingRuntimePolicy::Tick(
     const Array<float>& trajectorySampleTimes,
     const MotionMatchingPolicyTuning& tuning,
     int32 callerLoopFilter,
-    int32 callerCandidateBand,
+    int32 callerClipGroup,
     float callerYawRate,
-    float callerPlanarSpeed)
+    float callerTargetSpeed,
+    bool holdReseedFilter)
 {
     if (!_samplingReady || _database == nullptr || _body == nullptr || _playback == nullptr || _trace == nullptr)
         return;
 
-    // profiling (record-only): whole-Tick wall time. One chrono pair per
+    // Profiling (record-only): whole-Tick wall time. One chrono pair per
     // tick is nanoseconds; it never steers search or playback.
     const auto tickStart = std::chrono::high_resolution_clock::now();
-    // field-wise change-only snapshot copy. MotionMatchingPlayerSnapshot
+    // Field-wise change-only snapshot copy. MotionMatchingPlayerSnapshot
     // carries two native Strings; a blind struct copy reallocates both every
     // tick. Scope strings only change on transitions, so steady-state ticks
     // copy nothing (plain == compares, no allocation).
@@ -760,14 +800,14 @@ void MotionMatchingRuntimePolicy::Tick(
     if (state.ExcludedTagSet != _snapshot.ExcludedTagSet)
         _snapshot.ExcludedTagSet = state.ExcludedTagSet;
     _tuning = tuning;
-    // caller filter (Game selection policy output): the ONLY LoopFilter /
-    // CandidateBand / YawRate the core uses. Clamped to the valid range;
+    // Caller filter (Game selection policy output): the ONLY LoopFilter /
+    // ClipGroup / YawRate the core uses. Clamped to the valid range;
     _callerLoopFilter = callerLoopFilter >= 0 && callerLoopFilter <= 2 ? callerLoopFilter : 0;
-    _callerCandidateBand = callerCandidateBand >= 0 && callerCandidateBand <= 3 ? callerCandidateBand : 0;
+    _callerClipGroup = callerClipGroup >= 0 ? callerClipGroup : 0;
     _callerYawRate = callerYawRate >= 0.0f && callerYawRate < 1e29f ? callerYawRate : 0.0f;
-    _callerPlanarSpeed = callerPlanarSpeed >= 0.0f && callerPlanarSpeed < 1e29f ? callerPlanarSpeed : 0.0f;
-    // _trajectoryPoints/_sampleTimes dead copies deleted (were written
-    // every tick but never read; RunQuery uses its params + _tickTrajectory).
+    _callerTargetSpeed = callerTargetSpeed >= 0.0f && callerTargetSpeed < 1e29f ? callerTargetSpeed : 0.0f;
+    _holdReseedFilter = holdReseedFilter;
+    // RunQuery reads its params + _tickTrajectory; no per-tick member copies.
 
     const float frameDt = MaxF(deltaTime, 0.000001f);
     _timeSinceSwitch += frameDt;
@@ -778,7 +818,7 @@ void MotionMatchingRuntimePolicy::Tick(
     // otherwise leave stale previous positions and a locked continuity
     // winner. Threshold is far above any legitimate per-frame travel.
     const Float3 actorPos(actorWorld.M41, actorWorld.M42, actorWorld.M43);
-    if (_hasLastActorPos && (actorPos - _lastActorPos).LengthSquared() > TeleportDistance * TeleportDistance)
+    if (_hasLastActorPos && (actorPos - _lastActorPos).LengthSquared() > _tuning.TeleportDistance * _tuning.TeleportDistance)
     {
         ResetOnTeleport();
         // Re-accumulate this frame after the reset so warmup restarts cleanly.
@@ -788,19 +828,17 @@ void MotionMatchingRuntimePolicy::Tick(
     _lastActorPos = actorPos;
     _hasLastActorPos = true;
 
-    CheckSchemaBinding();
-
     // Sample the live pose EVERY tick. Velocity = (pos - prev) / frameDt,
     // so the time basis always matches the sampling rate. Seeding happens
     // only after a successful sample (zero-velocity first frame).
-    // Query-source rule: prefer the playback
+    // PLAN 5.3 source: prefer the playback's pre-layer/pre-IK search
     // snapshot over the displayed pose, so the layer and foot IK never feed
     // back into the next frame's candidate costs. Displayed-pose
-    // sampling stays as the fallback (no snapshot before the first
+    // sampling is the fallback (no snapshot before the first
     // playback tick). A source switch reseeds velocities (one
     // zero-velocity frame) because the two poses differ by layer/IK.
     bool justSeeded = false;
-    // const reference (no Array-by-value copy; GetSearchLocals stays for
+    // Const reference (no Array-by-value copy; GetSearchLocals stays for
     // diagnostics/tools, Tick uses the ref).
     const Array<Matrix>& searchLocals = _playback->GetSearchLocalsRef();
     const bool haveSnapshot = searchLocals.Count() > 0;
@@ -813,20 +851,20 @@ void MotionMatchingRuntimePolicy::Tick(
     }
     const float sampleDt = _hasPrevPositions ? frameDt : 0.0f;
     bool sampled = false;
-    // member scratch instead of per-tick locals (Resize only when the
+    // Member scratch instead of per-tick locals (Resize only when the
     // feature size changes; schema-fixed 44/prev sizes, so steady-state
     // reuses without native reallocation).
     Matrix rootWorld;
     String poseError;
     if (haveSnapshot)
     {
-        sampled = MotionMatchingQuery::SampleSearchPose(_body, searchLocals, _nodes, sampleDt,
+        sampled = MotionMatchingQuery::SampleSearchPose(_body, searchLocals, _nodes, _database->GetLayout(), sampleDt,
             _prevPositions, _database->GetSchema(), _poseScratch, _prevScratch, rootWorld, poseError);
     }
     else
     {
-        sampled = MotionMatchingQuery::SampleLivePose(_body, _nodes, sampleDt, _prevPositions,
-            _poseScratch, _prevScratch, rootWorld, poseError);
+        sampled = MotionMatchingQuery::SampleLivePose(_body, _nodes, _database->GetLayout(), sampleDt, _prevPositions,
+            _database->GetSchema(), _poseScratch, _prevScratch, rootWorld, poseError);
     }
     if (sampled)
     {
@@ -855,16 +893,27 @@ void MotionMatchingRuntimePolicy::Tick(
         }
     }
 
-    // Trajectory rule: trajectory is built EVERY tick (cheap), not just on query
+    // Phase 3: trajectory is built EVERY tick (cheap), not just on query
     // ticks, so the continuing fast-path can score each frame. Failures
     // null the cache; RunQuery treats null like today's trajError path.
-    // no intent signals — the Game owns onset/fair-fight and passes only
+    // No intent signals — the host owns onset/fair-fight and passes only
     // the resulting filter per tick (Tick params above). The fast-path yields
     // to a changed caller filter via the signature check inside TryFastPath.
     _tickTrajectory.Clear();
-    if (_poseValid && trajectoryPoints.Count() == 6)
+    const int32 trajectoryPointCount = _database->GetTrajectoryPointCount();
+    // The packed scratch was sized at Initialize from the layout then bound;
+    // a database rebaked with another point count since then must not be
+    // written past that size: skip the trajectory (no query) until re-init.
+    const bool packedFits = _packedTrajectory.Count() == trajectoryPointCount * 6;
+    if (!packedFits && !_packedTrajectoryMismatchLogged)
     {
-        for (int32 i = 0; i < 6; i++)
+        _packedTrajectoryMismatchLogged = true;
+        LOG(Warning, "Motion matching trajectory skipped: the database has {} trajectory points but the controller was initialized for {}; re-initialize the controller.",
+            trajectoryPointCount, _packedTrajectory.Count() / 6);
+    }
+    if (_poseValid && packedFits && trajectoryPointCount > 0 && trajectoryPoints.Count() == trajectoryPointCount)
+    {
+        for (int32 i = 0; i < trajectoryPointCount; i++)
         {
             _packedTrajectory[i * 6] = trajectoryPoints[i].Position.X;
             _packedTrajectory[i * 6 + 1] = trajectoryPoints[i].Position.Y;
@@ -873,7 +922,7 @@ void MotionMatchingRuntimePolicy::Tick(
             _packedTrajectory[i * 6 + 4] = trajectoryPoints[i].Facing.Y;
             _packedTrajectory[i * 6 + 5] = trajectoryPoints[i].Facing.Z;
         }
-        // build into member scratch (no per-tick local Array).
+        // Build into member scratch (no per-tick local Array).
         String trajError;
         if (!MotionMatchingQuery::BuildLiveTrajectory(_packedTrajectory, actorWorld, _latestRootWorld,
                 _database->GetSchema(), _tickTrajScratch, trajError))
@@ -884,24 +933,23 @@ void MotionMatchingRuntimePolicy::Tick(
 
 
     _queryTimer += frameDt;
-    const bool warmed = !justSeeded && _timeSinceInit >= WarmupTime;
+    const bool warmed = !justSeeded && _timeSinceInit >= _tuning.WarmupTime;
     // Per-frame search: when enabled, every warmed tick may scan (the
     // budget/stride caps the cost, intent changes scan unstrided). The
     // cadence path below stays for SearchEveryFrame=false.
     const bool queryDue = warmed && (_tuning.SearchEveryFrame ||
         _queryTimer >= MaxF(_tuning.QueryInterval, 0.01f));
-    // pure search dispatch (machine holds deleted).
+    // Pure search dispatch.
     if (queryDue && warmed)
     {
         _queryTimer = 0.0f;
-        // pure search dispatch (machine holds deleted). Cadence ticks
-        // may run a full scan on continuation miss; off-cadence ticks below
+        // Cadence ticks may run a full scan on continuation miss; off-cadence ticks below
         // only try the cheap continuation.
         _fastPathFrames++;
         if (!TryFastPath(frameDt))
             RunQuery(trajectoryPoints, actorWorld, frameDt);
     }
-    else if (queryDue && (_timeSinceInit < WarmupTime || justSeeded))
+    else if (queryDue && (_timeSinceInit < _tuning.WarmupTime || justSeeded))
     {
         // Warmup/seeding ticks consume the timer without searching so the
         // first real query sees settled pose velocity and trajectory past.
@@ -909,27 +957,25 @@ void MotionMatchingRuntimePolicy::Tick(
     }
     else if (warmed && _poseValid)
     {
-        // Off-cadence rule: cheap continuation only. A miss is
+        // PLAN 7.1/18.8 off-cadence tick: cheap continuation only. A miss is
         // recorded (and forces the full scan at the next cadence tick), but
-        // no scan runs here — a jittering frame time can no longer turn
+        // no scan runs here - a jittering frame time can no longer turn
         // every off-cadence frame into a full search (scan storm).
         TryFastPath(frameDt);
     }
 
     // Play-rate applies to the NEXT tick's advance: it is computed from this
     // tick's winning clip (_currentClip just decided above) against the
-    // Game-side planar speed, so a start one-shot never slow-plays its first
+    // host-supplied target speed, so a start one-shot never slow-plays its first
     // frames on the stale rate of the previous clip (observed: idle rate
     // 1.0 -> start plays slow while char outruns it = start slide; the clip
     // then fast-forwards to catch up once its own speed is known).
-    _playback->SetPlayRate(SelectPlayRate(_callerPlanarSpeed));
-    // Tick-order rule: stamp this tick's search decision on playback before it
+    _playback->SetPlayRateRange(_tuning.PlayRateMin, _tuning.PlayRateMax);
+    _playback->SetPlayRate(SelectPlayRate(_callerTargetSpeed));
+    // §18.9: stamp this tick's search decision on playback before it
     // asserts intra-tick ordering (sample <= search <= save < layer < IK).
     NotifySearch();
-    // playback never steers on gameplay state (grounded param unused
-    // inside Tick); the Game owns airborne meaning and passes only the
-    // trajectory + filter. Neutral true keeps the signature stable.
-    _playback->Tick(frameDt, _body, true);
+    _playback->Tick(frameDt, _body);
     // Keep the search stamp mirror in lockstep with playback's tick
     // counter: it advances only on a successful playback Tick, so early
     // outs never desync the stamp.
@@ -945,7 +991,7 @@ void MotionMatchingRuntimePolicy::Tick(
     if (_playback->IsAtEnd)
         _timeSinceSwitch = 999.0f;
 
-    // profiling tail: record whole-Tick time (see tickStart above).
+    // Profiling tail: record whole-Tick time (see tickStart above).
     {
         const auto tickEnd = std::chrono::high_resolution_clock::now();
         const float tickMs = (float)std::chrono::duration<double, std::milli>(tickEnd - tickStart).count();
@@ -955,17 +1001,16 @@ void MotionMatchingRuntimePolicy::Tick(
     }
 }
 
-// gait-band helper + intent-signal updater deleted (were here). Gait
-// bands, onset windows, fair-fight accumulators and all derived loop /
-// one-shot candidate decisions live Game-side in LocomotionSelectionPolicy;
-// the core uses only the per-tick caller filter (Tick params).
+// Gait bands, onset windows and all derived loop / one-shot candidate
+// decisions belong to the host; the core uses only the per-tick caller filter
+// (Tick params).
 
 void MotionMatchingRuntimePolicy::RecordPolicyEvent(const char* kind, int32 clipIndex, const String& reason)
 {
     if (_trace == nullptr)
         return;
-    // policy events carry no movement diagnostics (the core never sees
-    // velocity/yaw/grounded/sprint; the Game owns them). Speed/yaw/des
+    // Policy events carry no movement diagnostics (the core never sees
+    // velocity/yaw/grounded/sprint; the host owns them). Speed/yaw/des
     // record 0, grounded true — keys stay for contract stability, values are
     // intentionally neutral. Yaw-rate-driven search uses _callerYawRate on
     // search/fastpath entries (RecordTrace), never here.
@@ -984,7 +1029,7 @@ void MotionMatchingRuntimePolicy::RecordPolicyEvent(const char* kind, int32 clip
     entry.Reason = reason;
     entry.Chooser = ChooserStatusText;
     entry.QueryMs = 0.0f;
-    // reset/command entries carry the reseed flag and the surviving
+    // Reset/command entries carry the reseed flag and the surviving
     // clip so replay can check them structurally. Vectors stay empty by
     // design (no search ran on these ticks).
     entry.TraceFlags = PackTraceFlags(false, _chooserReseed, false, false, false, false, false);
@@ -1002,35 +1047,34 @@ void MotionMatchingRuntimePolicy::RunQuery(const Array<TrajectoryPoint>& traject
     if (!_poseValid || _latestPose.Count() == 0)
         return;
 
-    // Tick-order rule: this tick's search decision is a real full scan.
+    // §18.9: this tick's search decision is a real full scan.
     NotifySearch();
 
-    // the core executes the caller filter verbatim. No airborne/policy
+    // The core executes the caller filter verbatim. No airborne/policy
     // state, no speeds, no yaw gates, no intent windows here — the Game
-    // selection policy owns all of that and passes LoopFilter/CandidateBand/
+    // selection policy owns all of that and passes LoopFilter/ClipGroup/
     // YawRate per tick (Tick params). Diagnostics that used movement record
     // neutral values (speed/des 0); yaw rides the caller value for the turn
     // prior + replay.
-    // PolicyState is set once at Initialize ("Locomotion"); the per-query
-    // re-assignment of the same literal is deleted (no String alloc per scan).
+    // PolicyState is set once at Initialize (no String alloc per scan).
     const float yawRate = _callerYawRate;
     bool forced = false;
 
-    // Reseed query (first query after a teleport runs neutral): the first query after a teleport/
+    // Reseed query (M3, neutral): the first query after a teleport/
     // discontinuity runs on a zero-velocity reseed pose that cannot honestly
     // match a transition (all bone velocities read zero). Loops only —
     // otherwise a planted one-shot (pivot) wins the poisoned query and the
     // playing pose then looks like itself forever. No gait read.
     const bool reseeded = _chooserReseed;
-    // Keep the reseed LoopOnly guard armed until the Game-side planar speed
-    // settles (teleport frames report ~0 while the spring spins up; the
-    // first query after teleport otherwise plants a one-shot on a
-    // zero-velocity poisoned pose and continuity holds it all phase).
-    // _chooserReseed clears on the first settled scan below, not here.
-    bool keepReseedArmed = _chooserReseed && _callerPlanarSpeed <= 5.0f;
+    // Keep the reseed LoopOnly guard armed while the host asks for it
+    // (HoldReseedFilter): right after a teleport the host's own motion state
+    // is still spinning up, and a query on the zero-velocity reseed pose
+    // would otherwise plant a one-shot that continuity then holds.
+    // _chooserReseed clears on the first scan without the hold, below.
+    bool keepReseedArmed = _chooserReseed && _holdReseedFilter;
     // match, no Split per query in steady-state). Bound: <=8 tags; rebuilt
     // only on scope change. Semantics unchanged: same tags array as Split.
-    // twins: this RunQuery pair (_queryTagsKey/_queryTagsCache) is
+    // Twins: this RunQuery pair (_queryTagsKey/_queryTagsCache) is
     // SEPARATE from TryFastPath's pair (_fastAllowedKey/_fastAllowedCache,
     // see the header + GetFastAllowed) on purpose, so the incumbent check
     // never consumes RunQuery's scope-change signal. A const reference is
@@ -1049,7 +1093,7 @@ void MotionMatchingRuntimePolicy::RunQuery(const Array<TrajectoryPoint>& traject
     }
     if (tags.Count() == 0)
     {
-        // the empty markers are set on EVERY empty tick (not only on a
+        // The empty markers are set on EVERY empty tick (not only on a
         // scope change): an empty tick must report empty even when the scope
         // did not change since the last query. Empty scope never occurs in
         // steady play (suite scopes are always non-empty), so these small
@@ -1058,7 +1102,7 @@ void MotionMatchingRuntimePolicy::RunQuery(const Array<TrajectoryPoint>& traject
         ActiveTag = String::Empty;
         ChooserStatusText = String(TEXT("ext:empty (no-match)"));
         LastSwitchReason = String(TEXT("no-result:empty-scope"));
-        // the explicit-empty short-circuit is effective input (a whole
+        // The explicit-empty short-circuit is effective input (a whole
         // tick decided with no search). Record it with the vectors on hand
         // so replay checks the no-match structurally. Record-only: the
         // early return below is unchanged. No retry may widen the scope:
@@ -1070,11 +1114,11 @@ void MotionMatchingRuntimePolicy::RunQuery(const Array<TrajectoryPoint>& traject
             emptySettings.ContinuityWeight = _tuning.ContinuityWeight;
             emptySettings.MinSwitchTime = _tuning.MinSwitchTime;
             emptySettings.LoopFilter = (MotionLoopFilter)_callerLoopFilter;
-            emptySettings.OneShotBand = _callerCandidateBand;
+            emptySettings.OneShotGroup = _callerClipGroup;
             emptySettings.QueryYawRate = yawRate;
             emptySettings.TurnPenaltyWeight = _tuning.TurnPenaltyWeight;
             emptySettings.TurnPenaltyYawScale = _tuning.TurnPenaltyYawScale;
-            // change-only excluded split (same shared cache as the main
+            // Change-only excluded split (same shared cache as the main
             // path below; empty ExcludedTagSet disables with no Split).
             if (!_snapshot.ExcludedTagSet.IsEmpty())
                 emptySettings.ExcludeTags = GetCachedExcluded();
@@ -1090,13 +1134,14 @@ void MotionMatchingRuntimePolicy::RunQuery(const Array<TrajectoryPoint>& traject
         return;
     }
 
-    if (trajectoryPoints.Count() != 6)
+    if (trajectoryPoints.Count() != _database->GetTrajectoryPointCount())
     {
-        WarnOnce(String(TEXT("Motion matching query skipped: trajectory has 6 points.")));
+        WarnOnce(String::Format(TEXT("Motion matching query skipped: the host passed {} trajectory points, the schema declares {} sample times."),
+            trajectoryPoints.Count(), _database->GetTrajectoryPointCount()));
         return;
     }
 
-    // Trajectory rule: trajectory is built every tick in Tick (see _tickTrajectory);
+    // Phase 3: trajectory is built every tick in Tick (see _tickTrajectory);
     // a null cache means the build failed and matches today's trajError path.
     const Array<float>& trajectory = _tickTrajectory;
     if (trajectory.Count() == 0)
@@ -1109,10 +1154,10 @@ void MotionMatchingRuntimePolicy::RunQuery(const Array<TrajectoryPoint>& traject
     // weights are never baked into features, so tuning them here applies
     // immediately with no rebake (edit them in the inspector, even mid-play).
     const float currentTime = (_currentClip >= 0 && _playback != nullptr) ? _playback->CurrentTime : -1.0f;
-    // Play-rate rule: ExpectedTime = playback time + THIS frame
+    // PLAN 6.1 / 18.10: ExpectedTime = playback time + THIS frame's
     // upcoming advance (frameDt * PlayRate). The decision takes effect in
     // this frame's _playback.Tick below, so the continuity anchor is the
-    // post-advance position — never CurrentTime + the full inter-query
+    // post-advance position - never CurrentTime + the full inter-query
     // interval (that double-counts: CurrentTime already contains every
     // intermediate frame's advance). Matches TryFastPath's prediction.
     const float playRate = _playback != nullptr ? _playback->GetPlayRate() : 1.0f;
@@ -1128,10 +1173,9 @@ void MotionMatchingRuntimePolicy::RunQuery(const Array<TrajectoryPoint>& traject
                 expectedTime = fmodf(expectedTime, len);
         }
     }
-    // rest/settle/recovery intent branches deleted (were here). The Game
-    // selection policy owns them and passes the resulting caller filter per
-    // tick. The core applies the caller filter verbatim below — never
-    // inferred from movement.
+    // Rest/settle/recovery intent belongs to the host selection policy, which
+    // passes the resulting caller filter per tick. The core applies the
+    // caller filter verbatim below - never inferred from movement.
     // End-recovery RETRY (same scope, loop-only, below) is the only surviving
     // structural recovery: it reads playback IsAtEnd only, never gait, and
     // never widens the tag scope.
@@ -1148,63 +1192,58 @@ void MotionMatchingRuntimePolicy::RunQuery(const Array<TrajectoryPoint>& traject
     settings.ContinuingWindow = _tuning.ContinuingWindow;
     settings.SwitchMargin = _tuning.SwitchMargin;
     settings.LoopPreference = 0.0f;
-    // Exclusion bans: reselect lives on a wall-clock lifetime owned here
+    // Wave 1 bans: reselect lives on a wall-clock lifetime owned here
     // (the search is stateless); twin + tail are always-on structural
     // scope cuts, replayed bit-exactly from the trace entry.
     {
-        const bool banLive = EnableReselectBan && _reselectClip >= 0 &&
-            Time::GetGameTime() - _reselectStartTime < ReselectHistoryDuration;
+        const bool banLive = _tuning.ReselectBanHistory > 0.0f && _reselectClip >= 0 &&
+            Time::GetGameTime() - _reselectStartTime < _tuning.ReselectBanHistory;
         settings.ReselectClip = banLive ? _reselectClip : -1;
         settings.ReselectSampleTime = _reselectSampleTime;
-        settings.ReselectBanWindow = banLive ? ReselectSampleWindow : 0.0f;
+        settings.ReselectBanWindow = banLive ? _tuning.ReselectBanWindow : 0.0f;
     }
-    settings.TwinBanWindow = SameSegmentTwinBan;
-    settings.LoopTailExclusion = EnableLoopTailExclusion ? NonLoopTailExclusion : 0.0f;
-    // Structural-validity rule: non-loop candidates whose
+    settings.TwinBanWindow = _tuning.SameSegmentTwinBan;
+    settings.LoopTailExclusion = _tuning.LoopTailExclusion;
+    // PLAN 7.2/18.6 structural validity: non-loop candidates whose
     // future horizon passes the clip end baked a clamped fake-stopped
-    // future — never rank them (measured: start-tail samples winning
+    // future - never rank them (measured: start-tail samples winning
     // releases on exactly such fakes). C# bools default false, so this
     // must be set explicitly; the C++ default never reaches runtime.
     settings.ExcludeNonLoopTail = true;
     // Per-frame budgeted search: every query scores a rotating subset
     // (FrameSearchBudget samples). QueryFrame rotates the stride cursor
     // (policy frame, reset per session). No intent-change unstrided
-    // bypass — the Game owns intent and expresses urgency through the
+    // bypass — the host owns intent and expresses urgency through the
     // caller filter; the core budgets uniformly.
     settings.MaxCandidates = MaxI(_tuning.FrameSearchBudget, 0);
     settings.QueryFrame = _policyFrame;
-    // Indexed search (default off; brute force reference).
-    // Verify audit file-harness also forces both flags (no default
-    // or scene change needed to measure divergence).
-    settings.UseIndexedSearch = _tuning.UseIndexedSearch || _tuning.IndexedVerifyAuto;
+    settings.UseIndexedSearch = _tuning.UseIndexedSearch;
     settings.TopKCandidates = MaxI(1, _tuning.TopKCandidates);
-    settings.VerifyIndexedSearch = _tuning.VerifyIndexedSearch || _tuning.IndexedVerifyAuto;
+    settings.VerifyIndexedSearch = _tuning.VerifyIndexedSearch;
     settings.QueryYawRate = yawRate;
     settings.TurnPenaltyWeight = _tuning.TurnPenaltyWeight;
     settings.TurnPenaltyYawScale = _tuning.TurnPenaltyYawScale;
-    // foot-lock search prior deleted (was hard-zeroed here since the
-    // plugin solver died; Game-side IK owns its own contact state). Contact
-    // channels + feature extraction + DB stay untouched.
-    // caller filter (Game selection policy output): reseed forces LoopOnly
+    // Contact channels are plain search features; the plugin has no foot-lock
+    // prior (the host IK owns its own contact state).
+    // Caller filter (host selection policy output): reseed forces LoopOnly
     // (neutral structural rule, no gait read); otherwise the caller filter
-    // rides verbatim. The core never derives LoopFilter/OneShotBand from
+    // rides verbatim. The core never derives LoopFilter/OneShotGroup from
     // movement, grounded, sprint or yaw.
     settings.LoopFilter = (reseeded || keepReseedArmed) ? MotionLoopFilter::LoopOnly :
         (MotionLoopFilter)_callerLoopFilter;
-    settings.OneShotBand = _callerCandidateBand;
+    settings.OneShotGroup = _callerClipGroup;
     // Controller-decided exclusions ride the snapshot (plain-String
     // transport, split here). Independent of the include scope above.
-    // change-only split via the shared cache (steady-state reuses).
+    // Change-only split via the shared cache (steady-state reuses).
     if (!_snapshot.ExcludedTagSet.IsEmpty())
         settings.ExcludeTags = GetCachedExcluded();
-    settings.CollectClassDiagnostics = _tuning.EffectiveTelemetry;
+    settings.CollectClassDiagnostics = _tuning.Diagnostics;
 
-    // Fast-path signature rule: capture the query signature this full scan anchors the fast
+    // §18.8: capture the query signature this full scan anchors the fast
     // path against (clip/time cannot change until Play below).
     const FastPathSignature scanSignature = CaptureFastPathSignature();
 
-    // no forced edge (take-off/landing bypass deleted with the gameplay
-    // state). Continuity always anchors on the current clip; end-recovery
+    // No forced edge: continuity always anchors on the current clip; end-recovery
     // below bypasses via its own retry call (continuity -1 there).
     const int32 continuityClip = _currentClip;
     const float sinceSwitch = _timeSinceSwitch;
@@ -1250,17 +1289,14 @@ void MotionMatchingRuntimePolicy::RunQuery(const Array<TrajectoryPoint>& traject
 
     const auto watchEnd = std::chrono::high_resolution_clock::now();
     LastQueryMs = (float)std::chrono::duration<double, std::milli>(watchEnd - watchStart).count();
-    // profiling: LastQueryMs is the full-scan block (FindBest + retries).
+    // Profiling: LastQueryMs is the full-scan block (FindBest + retries).
     TotalFullSearchMs += LastQueryMs;
     FullSearchCount++;
 
-    // onset-fallback retry DELETED (was here): it re-ran the search with
-    // LoopFilter Any whenever the onset window found nothing, reading the
-    // gameplay intent window to widen the caller filter. Empty stays empty;
-    // no-match holds with no silent retry in another scope. Only the neutral
-    // end-recovery retry above survives.
+    // No silent retry in another scope: an empty result stays empty and holds
+    // the current clip. Only the neutral end-recovery retry above re-searches.
 
-    // Fast-path signature rule: a completed full scan re-anchors the fast-path baseline and
+    // PLAN 18.8: a completed full scan re-anchors the fast-path baseline and
     // clears reseed once planar settles (see keepReseedArmed above: clearing
     // on the poisoned zero-velocity query plants a one-shot all phase).
     // An invalid result invalidates the cost baseline so
@@ -1283,7 +1319,7 @@ void MotionMatchingRuntimePolicy::RunQuery(const Array<TrajectoryPoint>& traject
         snprintf(message, sizeof(message), "Motion matching search produced nothing: %s", errorAnsi.GetText());
         WarnOnce(String(message));
         LastSwitchReason = String(TEXT("no-result:hold"));
-        // reuse the reason just stored (same literal, no second build).
+        // Reuse the reason just stored (same literal, no second build).
         RecordTrace(0.0f, yawRate, tags, trajectory, settings,
             continuityClip, sinceSwitch, retryKind, forced, reseeded, false, false, frameDt, playRate,
             false, result, LastSwitchReason);
@@ -1312,7 +1348,7 @@ void MotionMatchingRuntimePolicy::RunQuery(const Array<TrajectoryPoint>& traject
     OneShotScoredCount = result.OneShotScoredCount;
     LoopTotalCount = result.LoopTotalCount;
     OneShotTotalCount = result.OneShotTotalCount;
-    // Play-rate rule: Compute timeError against ExpectedTime for continuity/telemetry trace
+    // PLAN 18.10: Compute timeError against ExpectedTime for continuity/telemetry trace
     float timeError = 0.0f;
     if (settings.ExpectedTime >= 0.0f && result.ClipIndex == continuityClip)
     {
@@ -1332,15 +1368,13 @@ void MotionMatchingRuntimePolicy::RunQuery(const Array<TrajectoryPoint>& traject
         timeError = diff;
     }
     LastTimeError = timeError;
-    RecordTelemetry(yawRate, tags, result,
-        Float3(actorWorld.M41, actorWorld.M42, actorWorld.M43), timeError);
 
     const bool didSwitch = result.ClipIndex != _currentClip;
     // Cost fuse: one absurd-cost winner never overturns steady tracking.
     // Corrupted query poses (~1-in-2000 frame glitches, e.g. cost 600+
     // mid-walk) self-heal next query; switching on them cascades. End
     // recovery always goes through, and with no current clip there is
-    // nothing to hold. (no take-off/landing forced edges anymore.)
+    // nothing to hold.
     const bool fused = didSwitch && !forced && !recovered && _currentClip >= 0 &&
         result.Cost > _tuning.CostFuseThreshold && result.Cost < 1e29f;
     if (fused)
@@ -1350,7 +1384,7 @@ void MotionMatchingRuntimePolicy::RunQuery(const Array<TrajectoryPoint>& traject
     else if (didSwitch)
     {
         // Arm the reselect ban on the pose we just left (single slot):
-        // it cannot re-win for ReselectHistoryDuration. Captured before
+        // it cannot re-win for ReselectBanHistory seconds. Captured before
         // the switch from live playback state.
         const int32 leftClip = _currentClip;
         const float leftTime = _playback != nullptr ? _playback->CurrentTime : -1.0f;
@@ -1382,8 +1416,7 @@ void MotionMatchingRuntimePolicy::RunQuery(const Array<TrajectoryPoint>& traject
         // already bars far same-clip one-shot wins; this is the playback
         // backstop for stale winners). A finished one-shot holds its end
         // pose here; the next tick's same-scope search (or its loop-only
-        // end-recovery retry) selects the exit clip. Explicit ForcePlayClip
-        // stays the only seek path for one-shots.
+        // end-recovery retry) selects the exit clip.
         const bool winnerIsLoop = _database != nullptr && result.ClipIndex >= 0 &&
             result.ClipIndex < _database->GetClipCount() &&
             _database->GetClipLoop(result.ClipIndex);
@@ -1418,7 +1451,7 @@ void MotionMatchingRuntimePolicy::RunQuery(const Array<TrajectoryPoint>& traject
         }
     }
     // Anomaly watchdog (throttled): only a switched anomaly is a visible
-    // pop — spikes the continuity lock absorbs are the system working.
+    // pop - spikes the continuity lock absorbs are the system working.
     {
         const float now = Time::GetGameTime();
         if (didSwitch && !fused && result.Cost > 0.5f && result.Cost < 1e29f && now - _lastSpikeWarn > 5.0f)
@@ -1441,19 +1474,18 @@ void MotionMatchingRuntimePolicy::RunQuery(const Array<TrajectoryPoint>& traject
 
 bool MotionMatchingRuntimePolicy::TryFastPath(float frameDt)
 {
-    // Tick-order rule: evaluating the continuation is itself a search decision.
+    // §18.9: evaluating the continuation is itself a search decision.
     NotifySearch();
     ForcedReason = String::Empty;
 
-    // no intent bypass (onset/fair-fight deleted with the gameplay
-    // state). Fresh Game intent arrives as a changed caller filter and is
-    // caught by the signature check below on the same tick.
+    // No intent bypass: fresh host intent arrives as a changed caller filter
+    // and is caught by the signature check below on the same tick.
     // Reseed/teleport: the incumbent was measured against the old
     // baseline; the first continuation check after a reset must scan.
     // Also miss while the reseed LoopOnly guard is armed (keepReseedArmed):
     // holding a pre-teleport loop continuation through the poisoned window
     // re-plants the cascade just as a one-shot win would.
-    if (_fastPathReseed || (_chooserReseed && _callerPlanarSpeed <= 5.0f))
+    if (_fastPathReseed || (_chooserReseed && _holdReseedFilter))
         return MissFastPath("forced:reseed");
     // MaxValue as threshold would hold ANYTHING, freezing the pre-reset
     // clip forever (observed: whole phases stuck in idle). Force a scan.
@@ -1467,12 +1499,12 @@ bool MotionMatchingRuntimePolicy::TryFastPath(float frameDt)
     if (!db->GetClipLoop(_currentClip))
         return MissFastPath("miss:non-loop");
 
-    // Fast-path signature rule query signature: compare against the signature stored at the
+    // §18.8 query signature: compare against the signature stored at the
     // last full scan. The signature carries the full candidate-set
-    // inputs (allowed/excluded tags, loop filter, candidate band) plus
+    // inputs (allowed/excluded tags, loop filter, clip group) plus
     // clip/time/database identity. A changed filter invalidates immediately
     // — the core can never hold a continuation from a previous filter after
-    // the Game changed it. A changed database identity (rebake/reload) also
+    // the host changed it. A changed database identity (rebake/reload) also
     // invalidates the baseline.
     const FastPathSignature sig = CaptureFastPathSignature();
     if (_hasLastScanSignature && sig.DatabaseId != _lastScanSignature.DatabaseId)
@@ -1484,7 +1516,7 @@ bool MotionMatchingRuntimePolicy::TryFastPath(float frameDt)
     // a scope change that keeps the same hash (impossible by construction,
     // but cheap to enforce) or a LoopOnly<->OneShotOnly flip must never
     // hold a clip the new filter forbids. Empty scope never holds.
-    // change-only splits via the fast-path-only caches (separate keys
+    // Change-only splits via the fast-path-only caches (separate keys
     // from RunQuery's pair, so this check never consumes the scope-change
     // signal); steady-state ticks reuse with no Split per tick. Semantics
     // unchanged: the same arrays Split would return.
@@ -1524,10 +1556,10 @@ bool MotionMatchingRuntimePolicy::TryFastPath(float frameDt)
     // query opportunities; the frame cap scales with the query rate so it
     // still means ~MaxFastPathAge under per-frame search (at 10Hz cadence
     // this reduces to the original constant 5).
-    if (Time::GetGameTime() - _lastFullScanTime > MaxFastPathAge)
+    if (Time::GetGameTime() - _lastFullScanTime > _tuning.FastPathMaxAge)
         return MissFastPath("forced:age");
-    const int32 frameCap = MaxI(MaxFastPathFrames,
-        (int32)ceilf(MaxFastPathAge / MaxF(frameDt, 1e-4f)));
+    const int32 frameCap = MaxI(_tuning.FastPathMaxFrames,
+        (int32)ceilf(_tuning.FastPathMaxAge / MaxF(frameDt, 1e-4f)));
     if (_fastPathFrames > frameCap)
         return MissFastPath("forced:age-frames");
     // A streak of continuation misses means the incumbent keeps looking
@@ -1567,7 +1599,7 @@ bool MotionMatchingRuntimePolicy::TryFastPath(float frameDt)
     const float yawRate = _callerYawRate;
     float fast = 0.0f;
     String sampleError;
-    // profiling (record-only): time the continuation SampleCost block.
+    // Profiling (record-only): time the continuation SampleCost block.
     const auto fastStart = std::chrono::high_resolution_clock::now();
     const bool sampleOk = MotionMatchingSearch::SampleCost(db, _latestPose, _tickTrajectory, sample,
             _tuning.PoseWeight, _tuning.TrajectoryWeight,
@@ -1591,18 +1623,18 @@ bool MotionMatchingRuntimePolicy::TryFastPath(float frameDt)
     FastPathHits++;
     LastFastPathAge = Time::GetGameTime() - _lastFullScanTime;
     LastSwitchReason = String(TEXT("fast:continuing-good"));
-    // build + record the hit entry only when the trace is enabled.
+    // Build + record the hit entry only when the trace is enabled.
     // When disabled the hold above is unchanged and no entry Strings are
     // built (steady-state shipping ticks allocate nothing here). The
     // fast-path-only excluded join is used (never touches RunQuery's key).
     if (_trace != nullptr && _trace->Enabled)
     {
         MotionMatchingTraceEntry entry;
-        // fast-path hits are first-class trace entries (Kind fastpath)
+        // Fast-path hits are first-class trace entries (Kind fastpath)
         // WITH the feature vectors they scored, so replay re-runs the same
         // SampleCost instead of skipping them. Record-only: the hold above
         // is unchanged.
-        // no movement diagnostics (speed/des 0, grounded true); the
+        // No movement diagnostics (speed/des 0, grounded true); the
         // caller filter + turn-prior tuning ride explicitly for replay.
         entry.Kind = String(TEXT("fastpath"));
         entry.Time = Time::GetGameTime();
@@ -1623,7 +1655,7 @@ bool MotionMatchingRuntimePolicy::TryFastPath(float frameDt)
         entry.SwitchMargin = _tuning.SwitchMargin;
         entry.LoopPreference = 0.0f;
         entry.LoopFilter = _callerLoopFilter;
-        entry.OneShotBand = _callerCandidateBand;
+        entry.OneShotGroup = _callerClipGroup;
         entry.MaxCandidates = MaxI(_tuning.FrameSearchBudget, 0);
         entry.QueryFrame = _policyFrame;
         entry.TraceFlags = PackTraceFlags(false, false, false, false,
@@ -1690,11 +1722,10 @@ int32 MotionMatchingRuntimePolicy::HashTagSet(const String& tagSet)
 
 MotionMatchingRuntimePolicy::FastPathSignature MotionMatchingRuntimePolicy::CaptureFastPathSignature() const
 {
-    // the signature carries every input that can change the valid
+    // The signature carries every input that can change the valid
     // candidate set: allowed/excluded tags (hashed), loop filter, candidate
-    // band, current clip/time and database identity. Movement-derived bits
-    // (speed/intent/yaw/contacts) died with the gameplay state — trajectory
-    // drift is caught by the continuation cost check itself.
+    // group, current clip/time and database identity. No movement-derived
+    // bits: trajectory drift is caught by the continuation cost check itself.
     int32 dbId = 0;
     if (_database != nullptr)
         dbId = (int32)(((uintptr_t)_database) & 0xFFFFFFFF) ^ (_database->GetClipCount() * 397);
@@ -1702,7 +1733,7 @@ MotionMatchingRuntimePolicy::FastPathSignature MotionMatchingRuntimePolicy::Capt
     sig.AllowedHash = HashTagSet(_snapshot.AllowedTagSet);
     sig.ExcludedHash = HashTagSet(_snapshot.ExcludedTagSet);
     sig.LoopFilter = _callerLoopFilter;
-    sig.CandidateBand = _callerCandidateBand;
+    sig.ClipGroup = _callerClipGroup;
     sig.Clip = _currentClip;
     sig.ClipTime = Quantize(_playback != nullptr ? _playback->CurrentTime : 0.0f, 0.5f);
     sig.DatabaseId = dbId;
@@ -1712,11 +1743,11 @@ MotionMatchingRuntimePolicy::FastPathSignature MotionMatchingRuntimePolicy::Capt
 bool MotionMatchingRuntimePolicy::FastPathSignaturesDiffer(const FastPathSignature& a, const FastPathSignature& b)
 {
     return a.AllowedHash != b.AllowedHash || a.ExcludedHash != b.ExcludedHash ||
-        a.LoopFilter != b.LoopFilter || a.CandidateBand != b.CandidateBand ||
+        a.LoopFilter != b.LoopFilter || a.ClipGroup != b.ClipGroup ||
         a.Clip != b.Clip || a.ClipTime != b.ClipTime || a.DatabaseId != b.DatabaseId;
 }
 
-// shared change-only scope caches: Split/Join run only when the joined
+// Shared change-only scope caches: Split/Join run only when the joined
 // snapshot string differs from the cached key (exact match). Steady-state
 // (same scope every tick) returns the stored arrays/strings with no
 // allocation; a scope transition rebuilds once. Content-identical to
@@ -1748,7 +1779,7 @@ const String& MotionMatchingRuntimePolicy::GetCachedExcludedJoin()
     return _queryExcludedJoin;
 }
 
-// fast-path-only twins: identical change-only rule on separate keys so
+// Fast-path-only twins: identical change-only rule on separate keys so
 // the incumbent check never consumes RunQuery's scope-change signal (see
 // the header member comment). Content-identical to Split/Join.
 const Array<String>& MotionMatchingRuntimePolicy::GetFastAllowed()
@@ -1812,7 +1843,7 @@ void MotionMatchingRuntimePolicy::RecordTrace(float speed, float yawRate, const 
     bool fairFight, bool oneshotWindow, float frameDt, float playRate,
     bool valid, const MotionMatchingResult& result, const String& reason)
 {
-    // no record work (and no entry String builds) when the trace is
+    // No record work (and no entry String builds) when the trace is
     // disabled. The hold/search decision above is unchanged; only the
     // diagnostics entry is skipped. _lastEntry then keeps the last
     // enabled-tick value (test sessions always enable the trace via
@@ -1833,7 +1864,7 @@ void MotionMatchingRuntimePolicy::RecordTrace(float speed, float yawRate, const 
     }
     entry.Speed = speed;
     entry.YawRate = yawRate;
-    // the core never sees grounded/sprinting/desired velocity (Game
+    // The core never sees grounded/sprinting/desired velocity (Game
     // owns them). Keys stay for contract stability; values are neutral.
     entry.Grounded = true;
     entry.Sprinting = false;
@@ -1855,13 +1886,13 @@ void MotionMatchingRuntimePolicy::RecordTrace(float speed, float yawRate, const 
     entry.ReselectBanWindow = settings.ReselectBanWindow;
     entry.TwinBanWindow = settings.TwinBanWindow;
     entry.LoopTailExclusion = settings.LoopTailExclusion;
-    entry.OneShotBand = settings.OneShotBand;
+    entry.OneShotGroup = settings.OneShotGroup;
     entry.MaxCandidates = settings.MaxCandidates;
     entry.QueryFrame = settings.QueryFrame;
     entry.TraceFlags = PackTraceFlags(forcedEdge, reseeded, fairFight, oneshotWindow,
         settings.UseIndexedSearch, settings.VerifyIndexedSearch, settings.ExcludeNonLoopTail);
     entry.TopKCandidates = settings.TopKCandidates;
-    // settings.ExcludeTags is always the shared change-only cache (all
+    // Settings.ExcludeTags is always the shared change-only cache (all
     // three RunQuery call sites assign GetCachedExcluded()), so the joined
     // form is the cached join — no Join per query. Content-identical.
     entry.ExcludedTags = GetCachedExcludedJoin();
@@ -1921,240 +1952,3 @@ float MotionMatchingRuntimePolicy::Wrap180(float a)
 
 
 
-
-// Unconstrained fallback chooser deleted (was here).
-
-void MotionMatchingRuntimePolicy::ForcePlayClip(int32 clipIndex, float startTime, const String& reason)
-{
-    if (_database == nullptr || _playback == nullptr || _trace == nullptr)
-        return;
-    if (clipIndex < 0 || clipIndex >= _database->GetClipCount())
-        return;
-    // Single authoritative hatch: playback advances the clip (arming
-    // inertialization via Play), then every policy mirror follows in the
-    // same call so playback and policy can never disagree for a frame.
-    const int32 leftClip = _currentClip;
-    _playback->Play(clipIndex, startTime, true);
-    _currentClip = clipIndex;
-    _timeSinceSwitch = 0.0f;
-    // Continuity baseline: the forced clip is the new anchor. Invalidate the
-    // fast-path cost baseline so the next continuation check scans instead
-    // of holding stale data; clear reseed (force is not a teleport) and the
-    // reselect ban (it must not immediately ban the forced clip).
-    _lastScanTotal = MAX_float;
-    _hasLastScanSignature = false;
-    _fastPathReseed = false;
-    _fastPathFrames = 0;
-    _consecutiveContinuationMisses = 0;
-    _reselectClip = -1;
-    _reselectStartTime = -99.0f;
-    // Winner mirrors follow the forced clip (costs unknown until the next
-    // scan; reason carries the hatch label for telemetry/trace).
-    WinnerClip = clipIndex;
-    WinnerClipName = GetClipName(clipIndex);
-    WinnerSample = -1;
-    WinnerCost = MAX_float;
-    SecondBestCost = MAX_float;
-    LastSwitchReason = String(TEXT("force:")) + reason;
-    (void)leftClip;
-    // Structural command entry (no feature vectors by design): replay checks
-    // the clip/time/reason structurally. Search resumes immediately on the
-    // next tick with the caller filter (no hold).
-    RecordPolicyEvent("command", clipIndex, LastSwitchReason);
-    // Stamp the command clip/time on the last entry for the structural check
-    // (RecordPolicyEvent stores clip in CommandClip; time follows).
-    _lastEntry.CommandClip = clipIndex;
-    _lastEntry.CommandTime = startTime;
-}
-
-
-void MotionMatchingRuntimePolicy::RecordTelemetry(float yawRate, const Array<String>& tags,
-    const MotionMatchingResult& result, const Float3& actorPos, float timeError)
-{
-    // bounded enqueue only: no JSON formatting, no file I/O in Tick.
-    // Gated by EffectiveTelemetry (caller checks before calling? No — check
-    // here so off-ticks are a single branch with zero allocation).
-    if (!_tuning.EffectiveTelemetry)
-        return;
-    // tags rides ActiveTag now (see below); the array param is kept for
-    // signature stability (bridge/tools call sites + header decl).
-    (void)tags;
-    const auto ioStart = std::chrono::high_resolution_clock::now();
-    TelemetryRecord rec;
-    rec.Time = Time::GetGameTime();
-    rec.YawRate = yawRate;
-    rec.ClipIndex = result.ClipIndex;
-    rec.SampleIndex = result.SampleIndex;
-    rec.Cost = result.Cost;
-    rec.PoseCost = result.PoseCost;
-    rec.TrajectoryCost = result.TrajectoryCost;
-    rec.ContinuityCost = result.ContinuityCost;
-    rec.LoopCost = result.LoopCost;
-    rec.SecondBestCost = result.SecondBestCost;
-    rec.QueryMs = LastQueryMs;
-    rec.SwitchCount = SwitchCount;
-    rec.SeekCount = SeekCount;
-    rec.CurrentClip = _currentClip;
-    rec.PlaybackTime = _playback != nullptr ? _playback->CurrentTime : -1.0f;
-    rec.PlayRate = _playback != nullptr ? _playback->GetPlayRateAfter() : 1.0f;
-    rec.EffectiveDt = _playback != nullptr ? _playback->LastEffectiveDt : 0.0f;
-    rec.Cycle = _playback != nullptr ? _playback->ClipCycle : 0;
-    rec.TimeError = timeError;
-    rec.BestLoopClip = result.BestLoopClip;
-    rec.BestLoopCost = result.BestLoopCost;
-    rec.BestOneShotClip = result.BestOneShotClip;
-    rec.BestOneShotCost = result.BestOneShotCost;
-    rec.LoopScored = result.LoopScoredCount;
-    rec.OneShotScored = result.OneShotScoredCount;
-    rec.LoopTotal = result.LoopTotalCount;
-    rec.OneShotTotal = result.OneShotTotalCount;
-    rec.LoopPreference = LoopPreferenceApplied;
-    rec.ActorPos = actorPos;
-    // single copy of the already-joined scope instead of a per-tag
-    // concat loop. Content-identical: the only RecordTelemetry call site
-    // passes the allowed-tags array whose Join is ActiveTag (non-empty
-    // valid-result path; ActiveTag is rebuilt on every scope change).
-    rec.Tags = ActiveTag;
-    _telemetryRing[_telemetryHead] = rec;
-    _telemetryHead = (_telemetryHead + 1) % TelemetryCapacity;
-    if (_telemetryCount < TelemetryCapacity)
-        _telemetryCount++;
-    else
-        _telemetryDropped++;
-    {
-        const auto ioEnd = std::chrono::high_resolution_clock::now();
-        const float ioMs = (float)std::chrono::duration<double, std::milli>(ioEnd - ioStart).count();
-        LastTelemetryMs = ioMs;
-        TotalTelemetryMs += ioMs;
-    }
-    // Telemetry must never break gameplay: enqueue above cannot fail
-    // (fixed ring, no file I/O). No silent file errors anymore — export
-    // failures surface via FlushTelemetry (explicit tooling).
-}
-
-int32 MotionMatchingRuntimePolicy::GetTelemetryCount() const
-{
-    return _telemetryCount;
-}
-
-int32 MotionMatchingRuntimePolicy::GetTelemetryDropped() const
-{
-    return _telemetryDropped;
-}
-
-void MotionMatchingRuntimePolicy::ClearTelemetry()
-{
-    _telemetryHead = 0;
-    _telemetryCount = 0;
-    _telemetryDropped = 0;
-    LastTelemetryMs = 0.0f;
-}
-
-bool MotionMatchingRuntimePolicy::FlushTelemetry(String& error)
-{
-    // explicit tooling flush (the ONLY writer of MMTelemetry.jsonl).
-    // Formats the bounded ring as JSONL + writes the file. Never called
-    // from Tick/RunQuery/TryFastPath/Initialize — only from the C#
-    // controller FlushTelemetry at session end (or bridge/tooling).
-    // path fix: CacheFolder already IS the Cache dir (project/Cache),
-    // so the file is CacheFolder/MMTelemetry.jsonl (single). The old
-    // per-tick writer used CacheFolder/Cache/... (double Cache bug).
-    error = String::Empty;
-    if (_telemetryCount == 0)
-    {
-        error = String(TEXT("Telemetry flush skipped: no records (telemetry was off or no queries ran)."));
-        return false;
-    }
-    if (_cacheFolder.IsEmpty())
-    {
-        error = String(TEXT("Telemetry flush stopped: cache folder is not set."));
-        return false;
-    }
-    const auto flushStart = std::chrono::high_resolution_clock::now();
-    StringBuilder sb;
-    char line[2048];
-    char tagBuf[128];
-    for (int32 n = 0; n < _telemetryCount; n++)
-    {
-        const TelemetryRecord& r = _telemetryRing[(_telemetryHead - _telemetryCount + n + TelemetryCapacity * 2) % TelemetryCapacity];
-        tagBuf[0] = '\0';
-        if (!r.Tags.IsEmpty())
-        {
-            const StringAnsi tagsAnsi(r.Tags);
-            strncpy(tagBuf, tagsAnsi.GetText(), sizeof(tagBuf) - 1);
-            tagBuf[sizeof(tagBuf) - 1] = '\0';
-        }
-        const String clipName = GetClipName(r.ClipIndex);
-        const String bestLoopName = GetClipName(r.BestLoopClip);
-        const String bestOneName = GetClipName(r.BestOneShotClip);
-        const StringAnsi clipAnsi(clipName);
-        const StringAnsi loopAnsi(bestLoopName);
-        const StringAnsi oneAnsi(bestOneName);
-        char fCost[32], fPose[32], fTraj[32], fCont[32], fLoop[32], fSecond[32];
-        char fBl[32], fBo[32], fQms[32], fPt[32], fRate[32], fDt[32], fErr[32];
-        char fYaw[32], fT[32], fPx[32], fPy[32], fPz[32], fPref[32];
-        FormatFloatText(r.Cost, fCost, sizeof(fCost));
-        FormatFloatText(r.PoseCost, fPose, sizeof(fPose));
-        FormatFloatText(r.TrajectoryCost, fTraj, sizeof(fTraj));
-        FormatFloatText(r.ContinuityCost, fCont, sizeof(fCont));
-        FormatFloatText(r.LoopCost, fLoop, sizeof(fLoop));
-        FormatFloatText(r.SecondBestCost, fSecond, sizeof(fSecond));
-        FormatFloatText(r.BestLoopCost, fBl, sizeof(fBl));
-        FormatFloatText(r.BestOneShotCost, fBo, sizeof(fBo));
-        FormatFloatText(r.QueryMs, fQms, sizeof(fQms));
-        FormatFloatText(r.PlaybackTime, fPt, sizeof(fPt));
-        FormatFloatText(r.PlayRate, fRate, sizeof(fRate));
-        FormatFloatText(r.EffectiveDt, fDt, sizeof(fDt));
-        FormatFloatText(r.TimeError, fErr, sizeof(fErr));
-        FormatFloatText(r.YawRate, fYaw, sizeof(fYaw));
-        FormatFloatText(r.Time, fT, sizeof(fT));
-        FormatFloatText(r.ActorPos.X, fPx, sizeof(fPx));
-        FormatFloatText(r.ActorPos.Y, fPy, sizeof(fPy));
-        FormatFloatText(r.ActorPos.Z, fPz, sizeof(fPz));
-        FormatFloatText(r.LoopPreference, fPref, sizeof(fPref));
-        snprintf(line, sizeof(line),
-            "{\"t\":%s,\"state\":\"Locomotion\",\"tags\":\"%s\",\"speed\":0.0,\"yaw\":%s,\"grounded\":1,"
-            "\"clip\":%d,\"name\":\"%s\",\"sample\":%d,\"cost\":%s,\"pose\":%s,\"traj\":%s,\"cont\":%s,\"loop\":%s,"
-            "\"second\":%s,\"bestLoop\":\"%s:%s\",\"bestOne\":\"%s:%s\",\"loopN\":%d,\"oneN\":%d,"
-            "\"loopT\":%d,\"oneT\":%d,"
-            "\"pref\":%s,\"switches\":%d,\"seeks\":%d,\"cur\":%d,\"ptime\":%s,\"atEnd\":0,"
-            "\"px\":%s,\"py\":%s,\"pz\":%s,\"des\":0.0,"
-            "\"rateB\":1.000,\"rateA\":%s,\"effDt\":%s,\"cycle\":%d,\"tErr\":%s}\n",
-            fT, tagBuf, fYaw,
-            r.ClipIndex, clipAnsi.GetText(), r.SampleIndex, fCost, fPose, fTraj, fCont, fLoop,
-            fSecond, loopAnsi.GetText(), fBl, oneAnsi.GetText(), fBo,
-            r.LoopScored, r.OneShotScored,
-            r.LoopTotal, r.OneShotTotal,
-            fPref, r.SwitchCount, r.SeekCount, r.CurrentClip, fPt,
-            fPx, fPy, fPz,
-            fRate, fDt, r.Cycle, fErr);
-        sb.Append(line);
-    }
-    String text;
-    sb.ToString(text);
-    const StringAnsi folderAnsi(_cacheFolder);
-    char path[1024];
-    snprintf(path, sizeof(path), "%s/MMTelemetry.jsonl", folderAnsi.GetText());
-    const StringAnsi bodyAnsi(text);
-    FILE* file = fopen(path, "wb");
-    if (file == nullptr)
-    {
-        error = String(TEXT("Telemetry flush stopped: cannot write MMTelemetry.jsonl."));
-        LOG(Warning, "Motion matching telemetry flush failed: cannot write MMTelemetry.jsonl ({} records, {} dropped).", _telemetryCount, _telemetryDropped);
-        return false;
-    }
-    const size_t written = fwrite(bodyAnsi.GetText(), 1, (size_t)bodyAnsi.Length(), file);
-    fclose(file);
-    if ((int32)written != bodyAnsi.Length())
-    {
-        error = String(TEXT("Telemetry flush incomplete: file write truncated."));
-        LOG(Warning, "Motion matching telemetry flush incomplete: {}/{} bytes ({} records, {} dropped).", (int32)written, bodyAnsi.Length(), _telemetryCount, _telemetryDropped);
-        return false;
-    }
-    {
-        const auto flushEnd = std::chrono::high_resolution_clock::now();
-        const double flushMs = std::chrono::duration<double, std::milli>(flushEnd - flushStart).count();
-        LOG(Info, "Motion matching telemetry flushed: {} records, {} dropped, {:.1f} ms -> MMTelemetry.jsonl.", _telemetryCount, _telemetryDropped, flushMs);
-    }
-    return true;
-}

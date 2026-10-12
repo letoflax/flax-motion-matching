@@ -1,6 +1,3 @@
-// MotionMatchingSearch.SelfTest.cpp: editor search self-test (MotionMatchingSearch::RunSelfTest, phases A-R).
-// Ownership: plugin runtime, no game/host references.
-// Key invariants: the file-local reference duplicates TurnPenalty/FullSampleCost and the shared cost terms (no ODR issue) and every phase compares FindBest against it; exact queries copy raw baked samples; probe phases fail loudly on missing fixture classes and never pass on zero probes.
 #include "MotionMatchingSearch.h"
 
 #include "../Database/MotionMatchingDatabase.h"
@@ -15,42 +12,40 @@
 
 #if USE_EDITOR
 
-// editor-only self-test. Live search helpers (TurnPenalty/FullSampleCost/
+// Editor-only self-test. Live search helpers (TurnPenalty/FullSampleCost/
 // Horizon + cost terms) are duplicated here as file-local test reference
 // (anonymous namespace, no ODR issue). The live definitions in
 // MotionMatchingSearch.cpp are untouched (zero search behavior change).
-// Phase K (prior-term parity) compares FindBest (live) against this
+// Phase K (prior term parity) compares FindBest (live) against this
 // reference every run — if the two ever drift, the test fails loudly.
-// New phases M-Q replace the deleted FootLock probes with
-// filter/empty-scope/contact/fastpath/replay probes (counts reported real,
-// never forced to 1357).
+// Phases M-Q cover filter/empty-scope/contact/fastpath/replay probes (counts
+// are reported as measured, never forced).
 
 namespace
 {
-    // Revision 3: baked and query features are RAW. The only stored stat is a
+    // N1b rev 3: baked and query features are RAW. The only stored stat is a
     // positive per-dim deviation (baker floors it at `dev > 0.1 ? dev : 1.0`),
     // so the divide floor below is only a last-resort guard and never
     // participates for valid databases.
     constexpr float MinimumStandardDeviation = 0.000001f;
     constexpr float SelfTestMaxCost = 0.0001f;
 
-    // Straightness prior (Game-owned tuning via settings, values preserved
-    // from the 0.03/4.0 calibration): penalty = |clipTurnAngle| * Weight /
+    // Straightness prior (host-owned tuning via settings): penalty = |clipTurnAngle| * Weight /
     // (1 + yawRate * YawScale). Recorded in the trace; brute-force, indexed
     // and replay share this one definition.
-    // Measured verdict: grouped L/R normalization did
+    // Phase 2 UE-parity verdict (measured): grouped L/R normalization did
     // NOT retire this — with weight 0, turn one-shots flood steady strafe/
     // diagonal phases (suite 2/12 vs 5-6/12). The penalty is load-bearing
     // for pool purity beyond asymmetry compensation, so it stays (rescaled
     // to rev-3 cost units below: same ratio against typical dissimilarity).
     // (Attempt 1 of the penalty-0 retune failed cleanly; code path kept.)
-    // Rev-3 scale (Revision-3 shrank dissimilarity ~100x, measured mean 0.095):
+    // Rev-3 scale (N1b shrank dissimilarity ~100x, measured mean 0.095):
     // 180deg -> +0.094 straight — same blocking ratio as the old +9.4.
 
     // Straightness prior, SINGLE definition shared by the hot loop, the
     // bit-exact verifier and the test gate below. Always >= 0 (fabs), so
     // block pruning stays valid with no extra headroom anywhere it is used.
-    // weight/scale ride the per-query settings (Game tuning, trace-
+    // Weight/scale ride the per-query settings (Game tuning, trace-
     // recorded); callers pass settings fields verbatim, never literals.
     float TurnPenalty(float clipAngle, float queryYawRate, float weight, float yawScale)
     {
@@ -60,13 +55,10 @@ namespace
         return a * w / (1.0f + Math::Max(queryYawRate, 0.0f) * s);
     }
 
-    // foot-lock search prior deleted (FootLockCost + FootLockL/R +
-    // FirmLockL/R). The runtime always fed it zero (verified: 4004/4004
-    // trace entries flock=(0,0) firm=(0,0)), so removal is query-identical.
-    // Baked contact channels + feature extraction + DB stay untouched;
-    // Game-side IK owns its own contact state.
+    // The search has no foot-lock prior. Baked contact channels are plain
+    // features; the host IK owns its own contact state.
 
-    // Weight contract: schema weights are stored, never baked. The search
+    // N1 weight contract: schema weights are stored, never baked. The search
     // applies each block weight exactly ONCE. Negative inputs clamp to 0;
     // non-finite settings are rejected by the FindBest gate before the hot
     // loop.
@@ -107,7 +99,7 @@ namespace
         }
     }
 
-    // Revision 3 weight pipeline (per-dimension scale pipeline): per-dim
+    // N1b rev 3 weight pipeline (UE PoseSearchDerivedData analogue): per-dim
     // base weight = PoseWeight for pose dims, TrajectoryWeight for trajectory
     // dims; sum-normalize across ALL dims; sqrt each; divide by the stored
     // per-dim deviation. The raw query and raw baked values are then scored as
@@ -147,11 +139,11 @@ namespace
         return Math::Min(distance, length - distance);
     }
 
-    // ---- Shared cost terms (shared cost terms) ----
+    // ---- S1 shared cost terms (PLAN �7.2, �16 Search, �18.7) ----
     // One definition per term. SearchPass (FindBest), FindTopCandidates,
     // FullSampleCost (SampleCost + the brute-force verifier) all build their
     // costs from these helpers, so no path can drift from another. The turn
-    // term is the existing TurnPenalty above (foot-lock prior deleted).
+    // term is the existing TurnPenalty above.
     //
     // Pruning invariant kept: every prior is non-negative (turn +
     // continuity switch penalty) so a pruned candidate can never earn cost
@@ -238,7 +230,7 @@ namespace
             TimeDistance(database, clipIndex, settings.ExpectedTime, sampleTime) <= biasWindow;
     }
 
-    // Horizon rule: furthest future trajectory target from the schema. A non-loop
+    // S1 �18.6: furthest future trajectory target from the schema. A non-loop
     // sample whose future stencil reaches past the clip end baked a clamped
     // "stopped" future for playback; search must not rank it (see
     // MotionMatchingSampler::IsNonLoopFutureOutside). Loop clips return 0.
@@ -275,17 +267,17 @@ namespace
 
         // One scale pass per reference call: weight pipeline is O(dims) and
         // this path is used by the exact verifier/SampleCost only.
-        float stackPoseScale[PoseSearchSchema::GetPoseFeatureSize()];
-        float stackTrajectoryScale[PoseSearchSchema::GetTrajectoryFeatureSize()];
+        float stackPoseScale[FeatureLayout::MaxPoseFeatureSize];
+        float stackTrajectoryScale[FeatureLayout::MaxTrajectoryFeatureSize];
         Array<float> heapPoseScale, heapTrajectoryScale;
         float* poseScale = stackPoseScale;
         float* trajectoryScale = stackTrajectoryScale;
-        if (poseFeatureSize > PoseSearchSchema::GetPoseFeatureSize())
+        if (poseFeatureSize > FeatureLayout::MaxPoseFeatureSize)
         {
             heapPoseScale.Resize(poseFeatureSize);
             poseScale = heapPoseScale.Get();
         }
-        if (trajectoryFeatureSize > PoseSearchSchema::GetTrajectoryFeatureSize())
+        if (trajectoryFeatureSize > FeatureLayout::MaxTrajectoryFeatureSize)
         {
             heapTrajectoryScale.Resize(trajectoryFeatureSize);
             trajectoryScale = heapTrajectoryScale.Get();
@@ -382,7 +374,7 @@ bool MotionMatchingSearch::RunSelfTest(
     settings.TrajectoryWeight = database->GetSchema().TrajectoryWeight;
     settings.ContinuityWeight = 0.0f;
     settings.MinSwitchTime = 0.0f;
-    // Explicit self-test exemption from the exclusion bans: exact-query
+    // Explicit self-test exemption from the Wave 1 runtime bans: exact-query
     // probes must see the full database (a banned tail sample could never
     // re-verify itself). The runtime policy opts in per query instead.
     settings.ReselectClip = -1;
@@ -390,7 +382,7 @@ bool MotionMatchingSearch::RunSelfTest(
     settings.ReselectBanWindow = 0.0f;
     settings.TwinBanWindow = 0.0f;
     settings.LoopTailExclusion = 0.0f;
-    // Horizon rule: exact-query probes copy raw baked samples (including the
+    // S1 �18.6: exact-query probes copy raw baked samples (including the
     // clamped non-loop tail) and must be able to re-find them, so the
     // structural runtime validity cut is disabled here and covered directly
     // by Phase L instead.
@@ -425,7 +417,7 @@ bool MotionMatchingSearch::RunSelfTest(
     // design (straightness prior), while straight probes keep the old
     // behavior (their own penalty is 0). On mismatch, rescan everything
     // before the winner with the SAME penalty-aware math and require
-    // strictly greater cost — otherwise the earlier sample should have won
+    // strictly greater cost � otherwise the earlier sample should have won
     // under strictly-less comparison.
     int32 tieCount = 0;
     auto checkExact = [&](int32 source, const MotionMatchingResult& result, const String& error, const String& phaseLabel) -> bool
@@ -475,7 +467,7 @@ bool MotionMatchingSearch::RunSelfTest(
     };
 
     // Phase A: clip boundaries. First/last samples exercise loop wrap-around
-    // trajectory and clamped endpoint velocities — the riskiest baked data.
+    // trajectory and clamped endpoint velocities � the riskiest baked data.
     // Only failures are logged individually.
     int32 phaseATested = 0;
     int32 phaseAPassed = 0;
@@ -523,7 +515,7 @@ bool MotionMatchingSearch::RunSelfTest(
     }
     log += String::Format(TEXT("Phase B (spread): {}/{} passed.\n"), phaseBPassed, phaseBTested);
 
-    // Phase C: policy behavior on spread samples — continuity lock keeps the
+    // Phase C: policy behavior on spread samples � continuity lock keeps the
     // current clip, tag include/exclude filters steer the winner tag.
     MotionMatchingSearchSettings lockedSettings = settings;
     lockedSettings.ContinuityWeight = 1.0f;
@@ -537,7 +529,7 @@ bool MotionMatchingSearch::RunSelfTest(
         const String sourceTag = MotionMatchingDatabase::JoinTags(sourceTags);
         buildExactQuery(source, queryPose, queryTrajectory);
 
-        // locked on the source clip -> winner must stay in it.
+        // C1: locked on the source clip -> winner must stay in it.
         {
             MotionMatchingResult result;
             String error;
@@ -561,7 +553,7 @@ bool MotionMatchingSearch::RunSelfTest(
             }
         }
 
-        // tag include -> winner overlaps the source set (exactly what
+        // C2: tag include -> winner overlaps the source set (exactly what
         // the overlap filter guarantees; tie twins may carry a subset, so a
         // superset assert would false-alarm on identical-feature ties).
         {
@@ -641,7 +633,7 @@ bool MotionMatchingSearch::RunSelfTest(
 
     // Phase D: temporal exclusion + per-block telemetry. Querying the exact
     // source sample while standing on it (CurrentTime == its time) must NOT
-    // return a nearby frame on the same clip — otherwise playback reseeks
+    // return a nearby frame on the same clip � otherwise playback reseeks
     // every query instead of playing through. The winner must be outside the
     // window or on another clip, and Pose+Trajectory+Continuity must sum to Cost.
     int32 phaseDTest = 0;
@@ -705,7 +697,7 @@ bool MotionMatchingSearch::RunSelfTest(
             }
         }
         // Exclusion disabled (window 0) must recover the exact source sample
-        // with ~zero cost — proves exclusion is the only steering here.
+        // with ~zero cost � proves exclusion is the only steering here.
         for (int32 source = 0; source < sampleCount && probes < 16; source += 19999)
         {
             const int32 sourceClip = sampleClipIndices[source];
@@ -757,8 +749,9 @@ bool MotionMatchingSearch::RunSelfTest(
         }
         // Synthetic actor-local walk line with a large constant offset,
         // simulating a mesh mount 100 units right / 50 forward of the actor.
-        TrajectoryPoint synth[PoseSearchSchema::TrajectoryPointCount];
-        for (int32 i = 0; i < PoseSearchSchema::TrajectoryPointCount; i++)
+        const int32 pointCount = Math::Min(bakedSchema.TrajectorySampleTimes.Count(), FeatureLayout::MaxTrajectoryPoints);
+        TrajectoryPoint synth[FeatureLayout::MaxTrajectoryPoints];
+        for (int32 i = 0; i < pointCount; i++)
         {
             synth[i].Position = Float3(100.0f + i * 20.0f, 0.0f, 50.0f + i * 30.0f);
             synth[i].Facing = Float3(0.0f, 0.0f, 1.0f);
@@ -766,20 +759,20 @@ bool MotionMatchingSearch::RunSelfTest(
         Matrix actorWorld = Matrix::Identity;
         Matrix rootWorld = Matrix::Identity;
         rootWorld.SetTranslation(Float3(100.0f, 0.0f, 50.0f)); // root sits at the offset origin
-        float raw[PoseSearchSchema::GetTrajectoryFeatureSize()];
+        float raw[FeatureLayout::MaxTrajectoryFeatureSize];
         String trajError;
         phaseETest++;
         tested++;
-        if (MotionMatchingQuery::BuildRawTrajectory(synth, actorWorld, rootWorld, bakedSchema, raw, trajError))
+        if (MotionMatchingQuery::BuildRawTrajectory(synth, pointCount, actorWorld, rootWorld, bakedSchema, raw, trajError))
         {
-            const int32 zi = (zeroIdx >= 0 ? zeroIdx : PoseSearchSchema::TrajectoryPointCount / 2) *
-                PoseSearchSchema::TrajectoryFloatsPerPoint;
+            const int32 zi = (zeroIdx >= 0 ? zeroIdx : pointCount / 2) *
+                FeatureLayout::TrajectoryFloatsPerPoint;
             const bool zeroOk = std::fabs(raw[zi]) <= 0.0001f &&
                 std::fabs(raw[zi + 1]) <= 0.0001f &&
                 std::fabs(raw[zi + 2]) <= 0.0001f &&
                 std::fabs(raw[zi + 3] - 1.0f) <= 0.0001f;
             bool allFinite = true;
-            for (int32 i = 0; i < PoseSearchSchema::GetTrajectoryFeatureSize(); i++)
+            for (int32 i = 0; i < pointCount * FeatureLayout::TrajectoryFloatsPerPoint; i++)
                 allFinite &= std::isfinite(raw[i]);
             if (zeroOk && allFinite)
             {
@@ -920,7 +913,7 @@ bool MotionMatchingSearch::RunSelfTest(
             const float t_d = sampleTimesArr[clipFirst[D]];
             buildExactQuery(source, queryPose, queryTrajectory);
 
-            // G1: bias rewards the natural continuation (cost — -bias).
+            // G1: bias rewards the natural continuation (cost � -bias).
             {
                 MotionMatchingSearchSettings g = settings;
                 g.CurrentTime = t_s - 0.1f;
@@ -956,7 +949,7 @@ bool MotionMatchingSearch::RunSelfTest(
                 }
             }
             // G2: huge margin demotes the exact winner to a continuation;
-            // the demoted exact sample must become runner-up ± 0.
+            // the demoted exact sample must become runner-up � 0.
             // Continuity is zeroed: this probes margin mechanics only, and a
             // +0.25 other-clip penalty on the exact sample would pollute the
             // runner-up assertion below.
@@ -1159,7 +1152,7 @@ bool MotionMatchingSearch::RunSelfTest(
             }
             // H3: end-recovery shape (LoopOnly, zero preference, idle tags):
             // exact one-shot end queries must resolve to a loop clip even
-            // with NO bonus helping — the filter alone exits the lock.
+            // with NO bonus helping � the filter alone exits the lock.
             {
                 MotionMatchingSearchSettings g = settings;
                 g.CurrentTime = -1.0f;
@@ -1203,7 +1196,7 @@ bool MotionMatchingSearch::RunSelfTest(
 
     // Phase I: loop filter + class telemetry. Exact queries keep the true
     // class minima near zero so prune can never hide them (pruned members
-    // are invisible to class telemetry by design — see SearchPass).
+    // are invisible to class telemetry by design � see SearchPass).
     int32 phaseITest = 0;
     int32 phaseIPass = 0;
     {
@@ -1305,7 +1298,7 @@ bool MotionMatchingSearch::RunSelfTest(
         }
         // I3: class telemetry on plain exact queries. The tight near-zero
         // bound (which implies a scored member) applies ONLY to the source's
-        // own class — its global-min twin always completes. The opposite
+        // own class � its global-min twin always completes. The opposite
         // class may be legitimately fully pruned (nothing near an exact
         // query survives a collapsed runner-up), so it only needs finite
         // values; I4 below covers both-classes-scored with a blurry query.
@@ -1358,9 +1351,9 @@ bool MotionMatchingSearch::RunSelfTest(
         // family). Unsound premise: in 42-D feature space the midpoint of two
         // distant samples is routinely nearest to a THIRD family (observed:
         // midpoint of loop+oneshot won by an unrelated clip with oneN=0).
-        // That is legitimate search behavior, not a telemetry failure —
+        // That is legitimate search behavior, not a telemetry failure �
         // both-classes-scored is query-dependent by design (see prune
-        // honesty note). I1-I3 already cover filter mechanics deterministically.
+        // honesty note). I1�I3 already cover filter mechanics deterministically.
     }
     log += String::Format(TEXT("Phase I (loop filter/telemetry): {}/{} passed.\n"), phaseIPass, phaseITest);
 
@@ -1448,9 +1441,7 @@ bool MotionMatchingSearch::RunSelfTest(
     // Phase K: prior term parity. The brute-force reference now uses the SAME
     // FullSampleCost all-terms function as the hot pass, so it covers
     // continuity/bias and loop preference — the cases the old raw-block
-    // reference could not see (shared cost terms).
-    // the footlock case died with the foot-lock search prior (it always
-    // ran at zero at runtime; contact features stay in the DB untouched).
+    // reference could not see (PLAN §7.2/§18.7).
     int32 phaseKTest = 0;
     int32 phaseKPass = 0;
     {
@@ -1599,8 +1590,7 @@ bool MotionMatchingSearch::RunSelfTest(
     }
     log += String::Format(TEXT("Phase L (non-loop tail validity): {}/{} passed.\n"), phaseLPass, phaseLTest);
 
-    // Phase M: filter respect (replaces deleted FootLock probes with
-    // caller-filter probes). Exact queries with include/exclude filters.
+    // Phase M: filter respect (caller-filter probes). Exact queries with include/exclude filters.
     int32 phaseMTest = 0;
     int32 phaseMPass = 0;
     {
@@ -1692,7 +1682,7 @@ bool MotionMatchingSearch::RunSelfTest(
             }
             mProbes++;
         }
-        // unknown-only include must be invalid (no candidate).
+        // M3: unknown-only include must be invalid (no candidate).
         {
             Array<String> unknown;
             unknown.Add(String(TEXT("__p4_no_such_tag__")));
@@ -1718,11 +1708,11 @@ bool MotionMatchingSearch::RunSelfTest(
     }
     log += String::Format(TEXT("Phase M (filter respect): {}/{} passed.\n"), phaseMPass, phaseMTest);
 
-    // Empty-scope / unconstrained edge probes: empty include stays unconstrained, exclude-all stays invalid.
+    // Phase N: empty-scope / unconstrained edge.
     int32 phaseNTest = 0;
     int32 phaseNPass = 0;
     {
-        // Empty include (noTags) = unconstrained, must be valid.
+        // N1: empty include (noTags) = unconstrained, must be valid.
         buildExactQuery(sampleCount > 1000 ? 1000 : 0, queryPose, queryTrajectory);
         {
             MotionMatchingResult result;
@@ -1770,14 +1760,18 @@ bool MotionMatchingSearch::RunSelfTest(
     log += String::Format(TEXT("Phase N (empty-scope/unconstrained): {}/{} passed.\n"), phaseNPass, phaseNTest);
 
     // Phase O: contact preservation (baked contact channels stay in the
-    // DB + participate in search; the foot-lock prior is deleted, features kept).
+    // DB + participate in search as plain features).
     int32 phaseOTest = 0;
     int32 phaseOPass = 0;
     {
-        // O1: feature sizes (pose 44 = 7 bones * 6 + 2 contacts, traj 30).
+        // O1: feature sizes follow the declared layout (pose = bones * 6 +
+        // contacts, trajectory = points * 5; 44/30 for the reference biped).
+        const FeatureLayout& layout = database->GetLayout();
+        const int32 wantPose = layout.PoseBoneCount * FeatureLayout::PoseFloatsPerBone + layout.ContactCount;
+        const int32 wantTrajectory = layout.TrajectoryPointCount * FeatureLayout::TrajectoryFloatsPerPoint;
         phaseOTest++;
         tested++;
-        bool sizeOk = poseFeatureSize == 44 && trajectoryFeatureSize == 30;
+        bool sizeOk = layout.IsValid() && poseFeatureSize == wantPose && trajectoryFeatureSize == wantTrajectory;
         if (sizeOk)
         {
             phaseOPass++;
@@ -1786,9 +1780,11 @@ bool MotionMatchingSearch::RunSelfTest(
         else
         {
             log += String::Format(
-                TEXT("Contact-size FAIL: pose={} traj={} (want 44/30).\n"),
+                TEXT("Contact-size FAIL: pose={} traj={} (want {}/{}).\n"),
                 poseFeatureSize,
-                trajectoryFeatureSize);
+                trajectoryFeatureSize,
+                wantPose,
+                wantTrajectory);
         }
         // O2: deviations finite and positive (contact dims included).
         phaseOTest++;
@@ -1813,48 +1809,36 @@ bool MotionMatchingSearch::RunSelfTest(
         {
             log += String(TEXT("Contact-deviation FAIL: non-finite/non-positive deviation.\n"));
         }
-        // O3/O4: flipping contact bits (42/43) must change the reference cost
-        // (proves they participate; exact cost ~0, flipped clearly > 0).
-        const int32 contactL = 42;
-        const int32 contactR = 43;
-        if (poseFeatureSize > contactR && sampleCount > 0)
+        // O3..: flipping each declared contact bit must change the reference
+        // cost (proves it participates; exact cost ~0, flipped clearly > 0).
+        if (layout.IsValid() && sampleCount > 0)
         {
             buildExactQuery(0, queryPose, queryTrajectory);
             const float base = FullSampleCost(*database, queryPose, queryTrajectory, settings, -1, 0, false);
-            queryPose[contactL] += 1.0f;
-            const float flipL = FullSampleCost(*database, queryPose, queryTrajectory, settings, -1, 0, false);
-            phaseOTest++;
-            tested++;
-            bool okL = std::isfinite(flipL) && flipL > base + 0.00001f;
-            if (okL)
+            for (int32 contact = 0; contact < layout.ContactCount; contact++)
             {
-                phaseOPass++;
-                passed++;
-            }
-            else
-            {
-                log += String::Format(
-                    TEXT("Contact-L FAIL: base={:.6f} flipped={:.6f}.\n"),
-                    base,
-                    flipL);
-            }
-            queryPose[contactL] -= 1.0f;
-            queryPose[contactR] += 1.0f;
-            const float flipR = FullSampleCost(*database, queryPose, queryTrajectory, settings, -1, 0, false);
-            phaseOTest++;
-            tested++;
-            bool okR = std::isfinite(flipR) && flipR > base + 0.00001f;
-            if (okR)
-            {
-                phaseOPass++;
-                passed++;
-            }
-            else
-            {
-                log += String::Format(
-                    TEXT("Contact-R FAIL: base={:.6f} flipped={:.6f}.\n"),
-                    base,
-                    flipR);
+                const int32 offset = layout.GetContactFeatureOffset(contact);
+                if (offset < 0 || offset >= poseFeatureSize)
+                    continue;
+                queryPose[offset] += 1.0f;
+                const float flipped = FullSampleCost(*database, queryPose, queryTrajectory, settings, -1, 0, false);
+                queryPose[offset] -= 1.0f;
+                phaseOTest++;
+                tested++;
+                const bool ok = std::isfinite(flipped) && flipped > base + 0.00001f;
+                if (ok)
+                {
+                    phaseOPass++;
+                    passed++;
+                }
+                else
+                {
+                    log += String::Format(
+                        TEXT("Contact {} FAIL: base={:.6f} flipped={:.6f}.\n"),
+                        contact,
+                        base,
+                        flipped);
+                }
             }
         }
     }
@@ -1894,7 +1878,7 @@ bool MotionMatchingSearch::RunSelfTest(
                 c1,
                 c2);
         }
-        // weight sensitivity on an off-exact query (exact cost ~0 stays ~0
+        // Weight sensitivity on an off-exact query (exact cost ~0 stays ~0
         // under any weight, so offset pose[0] first).
         Array<float> offPose;
         offPose.Resize(poseFeatureSize);
@@ -1927,7 +1911,7 @@ bool MotionMatchingSearch::RunSelfTest(
                 cw1,
                 cw2);
         }
-        // invalid index fails gracefully.
+        // Invalid index fails gracefully.
         {
             float badCost = 0.0f;
             String badError;
@@ -1947,7 +1931,7 @@ bool MotionMatchingSearch::RunSelfTest(
                 log += String(TEXT("SampleCost-badindex FAIL: expected graceful failure.\n"));
             }
         }
-        // non-finite query fails gracefully.
+        // Non-finite query fails gracefully.
         {
             Array<float> nanPose;
             nanPose.Resize(poseFeatureSize);
@@ -1975,9 +1959,9 @@ bool MotionMatchingSearch::RunSelfTest(
     }
     log += String::Format(TEXT("Phase P (fastpath scoring): {}/{} passed.\n"), phasePPass, phasePTest);
 
-    // Phase Q: replay determinism (same query twice gives the same winner).
-    // Force-sync is policy-level and is covered by the contract force-hatch
-    // test + auto_test replay gate, not by this search-only self-test.)
+    // Phase Q: replay determinism (same query twice -> same winner). Policy
+    // level replay is covered by the trace replay verifier, not by this
+    // search-only self-test.
     int32 phaseQTest = 0;
     int32 phaseQPass = 0;
     {

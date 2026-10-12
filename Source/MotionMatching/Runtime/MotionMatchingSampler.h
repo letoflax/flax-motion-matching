@@ -1,6 +1,3 @@
-// MotionMatchingSampler.h: pose sampler and shared sample-domain math (MotionMatchingSampler, MotionSamplingStatus).
-// Ownership: plugin runtime, no game/host references.
-// Key invariants: SampleClipPose/SampleClipLocalPose/GetNodeReferenceLocal/GetSkeletonHierarchy/StripRootLocal/BlendLocalPoses/ComposeModelPose share one channel-evaluation copy with the baker (game builds never link editor baker code); GetFrameDt/ComputeSampleCount/ComputeSampleTime/ClassifyClipTime/WrapLoopTime/TimeToSampleIndex/GetCentralDiffIndices/IsEndpointSample/UnwrapYawDelta/ComputeYawRate/YawFromForwardXZ/IsTrajectoryTargetValid/IsNonLoopFutureOutside are the single sample-domain definition (loop wrap to [0, length), interior-central / edge-one-sided stencils over the true dt, snapshot-copy outputs, row-vector childLocal * parentWorld).
 #pragma once
 
 #include "Engine/Core/Collections/Array.h"
@@ -12,7 +9,7 @@ class Animation;
 class SkinnedModel;
 
 /// <summary>
-/// Shared sampling contract.
+/// T1 shared sampling contract (PLAN Phase 2 §3.1, §18.6).
 /// Single definition of the sample-domain semantics used by the editor baker
 /// (MotionMatchingBaker.cpp) and the live query (MotionMatchingQuery.cpp).
 /// Both sides must call MotionMatchingSampler helpers below; duplicating the
@@ -29,7 +26,7 @@ class SkinnedModel;
 ///   frame (no added resampling on top); root-at-time = nearest baked sample
 ///   + cycle transform (bake-side GetRootAtTimeWithStatus).
 /// - finite-difference dt: interior central over two frames, non-loop edges
-///   one-sided over one frame. The dt is always the TRUE
+///   one-sided over one frame (§18.6 option 1). The dt is always the TRUE
 ///   time span of the stencil actually used, never a hardcoded 2*dt against
 ///   a clamped twin.
 /// - endpoint mode: non-loop timestamps outside [0, length] return
@@ -41,7 +38,7 @@ class SkinnedModel;
 ///   stencil resolves its own cycle so seam neighbors come from the adjacent
 ///   cycle, not from a duplicated endpoint.
 ///
-/// Timescale note (bake vs query): pose velocity is central at bake
+/// Timescale note (bake vs query, PLAN §3.3): pose velocity is central at bake
 /// (±1 bake sample, non-causal) but backward at query (causal live frame —
 /// central would need the future), so live velocity lags by half a sample
 /// interval by construction; yaw-rate stencil is ±1 bake sample at bake vs
@@ -50,12 +47,12 @@ class SkinnedModel;
 /// the same thing everywhere. The lag is documented, not numerically
 /// compensated (within trajectory tolerance).
 ///
-/// Non-loop tail validity: baked future targets past the clip end keep
+/// Non-loop tail validity (§18.6): baked future targets past the clip end keep
 /// a clamped endpoint pose for playback, but search must treat them as
 /// invalid/penalized via IsNonLoopFutureOutside (runtime horizon check from
 /// clip lengths + sample times, no rebake — same pattern as the existing
-/// LoopTailExclusion). Search integration lives in the search layer; the sampler
-/// only provides the helper and stops fabricating zero futures.
+/// LoopTailExclusion). Search integration itself belongs to S1; T1 only
+/// provides the helper and stops fabricating zero futures.
 /// </summary>
 enum class MotionSamplingStatus : int32
 {
@@ -65,10 +62,10 @@ enum class MotionSamplingStatus : int32
 };
 
 /// <summary>
-/// Runtime clip pose sampler for motion-matching playback.
-/// Duplicates the baker's channel-evaluation math (kept separate so the game
-/// build never depends on editor-only baker code); outputs actor-space node
-/// transforms ready for AnimatedModel.SetCurrentPose(worldSpace: false).
+/// Runtime clip pose sampler for motion-matching playback. Channel lookup and
+/// evaluation go through MotionMatchingChannelMap.h, the resolver the baker
+/// uses too; outputs actor-space node transforms ready for
+/// AnimatedModel.SetCurrentPose(worldSpace: false).
 /// </summary>
 API_CLASS(Static, Namespace="MotionMatching")
 class MOTIONMATCHING_API MotionMatchingSampler
@@ -79,6 +76,11 @@ public:
     /// <summary>
     /// Samples one clip at the given time and writes per-node actor-space
     /// transforms. Time is clamped into the clip range by the caller.
+    /// Limitation: channels drive the model node with the SAME name only;
+    /// Schema.BoneAliases are NOT applied, so an aliased channel leaves its
+    /// node at the bind pose. For aliased clips, build the table in C++ with
+    /// MotionMatchingChannelMap::Build(nodes, channels, schema.BoneAliases, table)
+    /// and call SampleClipLocalPoseMapped (what playback does).
     /// </summary>
     API_FUNCTION()
     static bool SampleClipPose(
@@ -109,15 +111,15 @@ public:
     /// stay consistent and bone lengths are preserved. Compose with
     /// ComposeModelPose for the final actor-space pose expected by
     /// AnimatedModel.SetCurrentPose(worldSpace: false).
-    /// Snapshot contract: the output array is a FRESH snapshot copy every call —
+    /// C2 contract: the output array is a FRESH snapshot copy every call —
     /// never an alias into baker/clip storage — so playback-side IK/layer may
-    /// mutate it in place while the saved search snapshot stays intact.
-    /// Row-vector convention: ComposeModelPose builds
+    /// mutate it in place while the saved search snapshot stays intact
+    /// (PLAN §16). Row-vector convention: ComposeModelPose builds
     /// childLocal * parentWorld (parent on the RIGHT).
-    /// NOTE: channel evaluation below duplicates the baker's
-    /// math by design (game build must not depend on editor-only baker code).
-    /// The two copies must stay in sync; any change here requires the same
-    /// change in MotionMatchingBaker.cpp plus a golden-vector comparison.
+    /// Limitation: builds the channel map per call WITHOUT Schema.BoneAliases
+    /// (exact channel-to-node names only; an aliased channel leaves its node
+    /// at the bind pose). Playback uses SampleClipLocalPoseMapped with a cached
+    /// map that has the database aliases applied; do the same for aliased clips.
     /// </summary>
     API_FUNCTION()
     static bool SampleClipLocalPose(
@@ -126,6 +128,19 @@ public:
         float time,
         API_PARAM(Out) Array<Matrix>& outLocals,
         API_PARAM(Out) String& error);
+
+    /// <summary>
+    /// SampleClipLocalPose with a prebuilt node-to-channel table
+    /// (MotionMatchingChannelMap::Build, one per clip/model pair, database
+    /// aliases applied). C++ only: playback caches the tables per clip.
+    /// </summary>
+    static bool SampleClipLocalPoseMapped(
+        Animation* clip,
+        SkinnedModel* model,
+        const Array<int32>& nodeToChannel,
+        float time,
+        Array<Matrix>& outLocals,
+        String& error);
 
     /// <summary>
     /// Returns the skeleton hierarchy (parent index per node, -1 for roots)
@@ -179,7 +194,7 @@ public:
         API_PARAM(Out) Array<Matrix>& outModelPose,
         API_PARAM(Out) String& error);
 
-    // ---- Shared sampling contract ----
+    // ---- T1 shared sampling contract (PLAN Phase 2 §3.1, §18.6) ----
     // Pure helpers, no engine state. The baker and the live query must call
     // these instead of copying literals or mirror logic. Deliberately NOT
     // API_FUNCTION (C# scripting does not need them; C++-only keeps Matrix /

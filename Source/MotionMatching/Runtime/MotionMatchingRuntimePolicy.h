@@ -1,6 +1,3 @@
-// MotionMatchingRuntimePolicy.h: per-tick policy interface (MotionMatchingRuntimePolicy::Initialize/Shutdown/Tick/ForcePlayClip, MotionMatchingPlayerSnapshot, MotionMatchingPolicyTuning, FastPathSignature).
-// Ownership: plugin runtime, no game/host references.
-// Key invariants: the core executes the provider caller filter verbatim (tag scope, LoopFilter, CandidateBand, yaw rate) and never infers gameplay; RunQuery anchors a fast-path signature that TryFastPath revalidates every tick; force-play is the only clip hatch besides search winners; ExportClipAudit/FlushTelemetry are explicit tooling-only file writers.
 #pragma once
 
 #include "Engine/Core/Collections/Array.h"
@@ -19,11 +16,11 @@ class AnimatedModel;
 class MotionMatchingDatabase;
 
 /// <summary>
-/// Per-tick caller scope for the policy (plain data, supplied by the provider
+/// Per-tick caller scope for the policy (plain data, supplied by the host
 /// selection policy through the C# frame). The core executes the caller
 /// filter verbatim — it never infers locomotion, gait, intent, rest, or
-/// airborne meaning. The provider computes the trajectory before the call and
-/// owns all gameplay interpretation. Only the tag scope crosses.
+/// airborne meaning. The host computes the trajectory before the call and owns
+/// all gameplay interpretation. Only the tag scope crosses.
 /// </summary>
 API_STRUCT(Namespace="MotionMatching")
 struct MOTIONMATCHING_API MotionMatchingPlayerSnapshot
@@ -32,7 +29,7 @@ struct MOTIONMATCHING_API MotionMatchingPlayerSnapshot
 
     /// <summary>
     /// Provider-decided tag scope, '+'-joined (e.g. "run+turn_travel").
-    /// Always read (no fallback chooser). An EMPTY set is
+    /// Always read. An EMPTY set is
     /// an explicit no-match: no candidate may win and the current clip
     /// holds (never fall back to the full pool). Plain String transport:
     /// the scripting marshaller cannot marshal Array&lt;String&gt; struct
@@ -47,11 +44,11 @@ struct MOTIONMATCHING_API MotionMatchingPlayerSnapshot
 };
 
 /// <summary>
-/// Live tunables pushed by the C# controller every tick (plain data):
-/// neutral search/playback tuning only (weights, budgets, anti-flicker,
-/// straightness prior). The provider selection policy owns onset/fair-fight/
-/// settle/rest and passes only the resulting LoopFilter/CandidateBand per tick
-/// (Tick params, never inferred).
+/// Live tunables pushed by the C# controller every tick (plain data). 
+/// Neutral search/playback tuning only (weights, budgets, anti-flicker,
+/// straightness prior). Onset/settle/rest decisions belong to the host
+/// selection policy, which passes only the resulting LoopFilter/ClipGroup per
+/// tick (Tick params, never inferred).
 /// </summary>
 API_STRUCT(Namespace="MotionMatching")
 struct MOTIONMATCHING_API MotionMatchingPolicyTuning
@@ -73,17 +70,38 @@ struct MOTIONMATCHING_API MotionMatchingPolicyTuning
     API_FIELD() bool UseIndexedSearch = true;
     API_FIELD() int32 TopKCandidates = 16;
     API_FIELD() bool VerifyIndexedSearch = false;
-    API_FIELD() bool IndexedVerifyAuto = false;
-    API_FIELD() bool EffectiveTelemetry = false;
+    /// <summary>Collect per-class search diagnostics (best loop / one-shot cost, counts) for the trace.</summary>
+    API_FIELD() bool Diagnostics = false;
     API_FIELD() float ContinuityWeight = 0.0025f;
     API_FIELD() float CostFuseThreshold = 2.0f;
     API_FIELD() float TurnPenaltyWeight = 0.03f;
     API_FIELD() float TurnPenaltyYawScale = 4.0f;
 
+    /// <summary>Speed matching: lower/upper play-rate multiplier of a clip (1 = authored speed).</summary>
+    API_FIELD() float PlayRateMin = 0.85f;
+    API_FIELD() float PlayRateMax = 1.15f;
+    /// <summary>Speed matching is off at or below this target speed (world units/s).</summary>
+    API_FIELD() float PlayRateMinSpeed = 10.0f;
+    /// <summary>Actor displacement per tick (world units) treated as a teleport and reseeded.</summary>
+    API_FIELD() float TeleportDistance = 2000.0f;
+    /// <summary>Seconds after init or reseed before searches start.</summary>
+    API_FIELD() float WarmupTime = 0.5f;
+    /// <summary>Longest a continuation check may hold the incumbent without a full scan (seconds).</summary>
+    API_FIELD() float FastPathMaxAge = 0.5f;
+    /// <summary>Minimum frame cap of the continuation hold (scaled up for high frame rates).</summary>
+    API_FIELD() int32 FastPathMaxFrames = 5;
+    /// <summary>Seconds a just-left clip stays banned from winning again; 0 disables the ban.</summary>
+    API_FIELD() float ReselectBanHistory = 0.6f;
+    /// <summary>Half-width (seconds of clip time) of the ban around the left pose.</summary>
+    API_FIELD() float ReselectBanWindow = 0.35f;
+    /// <summary>Samples this close (seconds) to the current pose of the same clip are twins and excluded.</summary>
+    API_FIELD() float SameSegmentTwinBan = 0.25f;
+    /// <summary>Seconds at the end of non-loop clips excluded from search; 0 = off.</summary>
+    API_FIELD() float LoopTailExclusion = 0.0f;
 };
 
 /// <summary>
-/// C# animation command layer. Owns when to search, which
+/// C# animation command layer (plan Milestone 4). Owns when to search, which
 /// tags may win, and continuity — but never touches movement authority: it
 /// only tells MotionMatchingPlayback which clip to show.
 /// States are intentionally coarse (Locomotion/Airborne); start/stop/turn
@@ -96,6 +114,12 @@ class MOTIONMATCHING_API MotionMatchingRuntimePolicy : public ScriptingObject
 
 public:
     API_FIELD() String PolicyState = TEXT("Disabled");
+    /// <summary>
+    /// Result of the bind-time checks of the last Initialize (live schema vs
+    /// baked snapshot, skeleton fingerprint vs the body's model). On a refused
+    /// binding it names the cause and the fix; empty before Initialize.
+    /// </summary>
+    API_FIELD() String BindingReport;
     API_FIELD() String ActiveTag;
     API_FIELD() int32 WinnerSample = -1;
     API_FIELD() int32 WinnerClip = -1;
@@ -135,33 +159,29 @@ public:
     API_FIELD() float LastTickMs = 0.0f;
     // Continuation SampleCost block inside TryFastPath (hit path only).
     API_FIELD() float LastFastPathMs = 0.0f;
-    // Synchronous telemetry file I/O (LogTelemetryLine per query).
-    // Runtime query only enqueues a
-    // structured record into a bounded in-memory ring (below); JSON
-    // formatting + file write happen ONLY in the explicit FlushTelemetry
-    // tooling call (session end, never in Tick/RunQuery). Telemetry-off
-    // ticks record nothing (single branch, no allocation beyond the fixed
-    // ring). Telemetry on/off never steers search (enqueue is record-only
-    // after the winner is decided; CollectClassDiagnostics only fills
-    // diagnostics, never changes the winner).
-    API_FIELD() float LastTelemetryMs = 0.0f;
     API_FIELD() int32 TickCount = 0;
     API_FIELD() int32 FullSearchCount = 0;
     API_FIELD() float TotalTickMs = 0.0f;
     API_FIELD() float TotalFullSearchMs = 0.0f;
     API_FIELD() float TotalFastPathMs = 0.0f;
-    API_FIELD() float TotalTelemetryMs = 0.0f;
 
     API_PROPERTY() bool GetIsReady() const;
 
     ~MotionMatchingRuntimePolicy();
 
+    /// <summary>
+    /// Binds the database to the body. Bind-time checks: the live schema must
+    /// equal the baked snapshot (weights excepted) and the database skeleton
+    /// fingerprint must match the body's model. A mismatch logs an error and
+    /// leaves the policy not ready, unless allowBindingMismatch (explicit
+    /// opt-out, debug only) downgrades it to a warning.
+    /// </summary>
     API_FUNCTION() void Initialize(
         MotionMatchingDatabase* database,
         AnimatedModel* body,
         const PoseSearchSchema& schema,
-        const String& cacheFolder,
-        float defaultInertial);
+        float defaultInertial,
+        bool allowBindingMismatch);
     API_FUNCTION() void Shutdown();
     API_FUNCTION() void ResetOnTeleport();
     API_FUNCTION() void Tick(
@@ -172,20 +192,13 @@ public:
         const Array<float>& trajectorySampleTimes,
         const MotionMatchingPolicyTuning& tuning,
         int32 callerLoopFilter,
-        int32 callerCandidateBand,
+        int32 callerClipGroup,
         float callerYawRate,
-        float callerPlanarSpeed);
+        float callerTargetSpeed,
+        bool holdReseedFilter);
     API_FUNCTION() MotionMatchingPlayback* GetPlayback();
     API_FUNCTION() MotionMatchingTraceLog* GetTrace();
     API_FUNCTION() MotionMatchingTraceEntry GetLastEntry() const;
-    /// <summary>
-    /// Single authoritative force-clip path (the only hatch besides the
-    /// search-winner Plays inside RunQuery). Synchronizes playback clip/time,
-    /// policy current clip/time, continuity baseline, fast-path invalidation,
-    /// inertial state (via Play), telemetry reason and trace command entry.
-    /// Search resumes immediately on the next tick with the caller filter.
-    /// </summary>
-    API_FUNCTION() void ForcePlayClip(int32 clipIndex, float startTime, const String& reason);
     /// <summary>
     /// Explicit editor/tool command: scans the baked database and writes
     /// Cache/MMClipAudit.txt on demand (index|name|tags|loop|turn|travel|net|
@@ -195,24 +208,7 @@ public:
     /// folder is unset, or the file cannot be written.
     /// </summary>
     API_FUNCTION() static bool ExportClipAudit(MotionMatchingDatabase* database,
-        const String& cacheFolder, float sampleRate, API_PARAM(Out) String& error);
-    /// <summary>
-    /// Explicit telemetry flush (the ONLY writer of MMTelemetry.jsonl).
-    /// Formats the bounded in-memory ring as JSONL + writes the file.
-    /// Tooling/session-end only: Tick/RunQuery never do file I/O, they only
-    /// RecordTelemetry (enqueue). Returns false with a visible error when
-    /// the ring is empty, the cache folder is unset, or the file cannot be
-    /// written. Overwritten drops are counted in GetTelemetryDropped.
-    /// </summary>
-    API_FUNCTION() bool FlushTelemetry(API_PARAM(Out) String& error);
-    /// <summary>
-    /// Explicit telemetry clear (no file deletion: init never touches
-    /// MMTelemetry.jsonl; tools read whatever the last flush left behind).
-    /// Resets the ring head/count/dropped to the bounded disabled state.
-    /// </summary>
-    API_FUNCTION() void ClearTelemetry();
-    API_FUNCTION() int32 GetTelemetryCount() const;
-    API_FUNCTION() int32 GetTelemetryDropped() const;
+        const String& filePath, float sampleRate, API_PARAM(Out) String& error);
 
 private:
     struct FastPathSignature
@@ -220,7 +216,7 @@ private:
         int32 AllowedHash = 0;
         int32 ExcludedHash = 0;
         int32 LoopFilter = 0;
-        int32 CandidateBand = 0;
+        int32 ClipGroup = 0;
         int32 Clip = -1;
         int32 ClipTime = 0;
         int32 DatabaseId = 0;
@@ -231,7 +227,6 @@ private:
     MotionMatchingPlayback* _playback = nullptr;
     MotionMatchingTraceLog* _trace = nullptr;
     PoseSearchSchema _liveSchema;
-    String _cacheFolder;
     NodeIndices _nodes;
 
     bool _samplingReady = false;
@@ -241,6 +236,9 @@ private:
     int32 _searchSnapshotLength = 0;
     Array<float> _latestPose;
     Array<float> _packedTrajectory;
+    // One-time log when the database's trajectory point count no longer
+    // matches the scratch sized at Initialize (database rebaked while bound).
+    bool _packedTrajectoryMismatchLogged = false;
     Matrix _latestRootWorld = Matrix::Identity;
     bool _poseValid = false;
     Array<float> _tickTrajectory;
@@ -270,17 +268,18 @@ private:
     Array<float> _clipSpeeds;
     int32 _clipSpeedsDbId = 0;
     bool _warnedOnce = false;
-    bool _bindingWarned = false;
 
     bool _chooserReseed = false;
 
-    // Caller filter (provider selection policy output, Tick params): the ONLY
-    // LoopFilter/CandidateBand/YawRate the core uses. Never inferred.
+    // Caller filter (Game selection policy output, Tick params): the ONLY
+    // LoopFilter/ClipGroup/YawRate the core uses. Never inferred.
     int32 _callerLoopFilter = 0;
-    int32 _callerCandidateBand = 0;
+    int32 _callerClipGroup = 0;
     float _callerYawRate = 0.0f;
-    // Play-rate character speed (Game-side planar u/s, explicit Tick param).
-    float _callerPlanarSpeed = 0.0f;
+    // Speed-matching target speed (host-supplied, world units/s, 0 = off).
+    float _callerTargetSpeed = 0.0f;
+    // Host asks to keep the structural reseed LoopOnly filter armed.
+    bool _holdReseedFilter = false;
 
     // Init-time tag cache only (no motion scan, no audit file).
     Array<Array<String>> _clipTags;
@@ -305,12 +304,14 @@ private:
     //   for the ExcludedTagSet split and its '+'-joined form for RunQuery
     //   settings + trace/telemetry entries (TryFastPath uses its own
     //   _fastExcludedKey/_fastExcludedCache/_fastExcludedJoin below).
-    // - _poseScratch/_prevScratch: Tick pose-sample scratch (44/21 floats).
-    //   Passed to the samplers instead of per-tick locals; Resize only when
-    //   the feature size changes (schema-fixed sizes).
-    // - _tickTrajScratch: BuildLiveTrajectory scratch (30 floats). Same rule.
-    // The per-tick member trajectory copies stay deleted (RunQuery uses
-    // its params + _tickTrajectory). _snapshot itself is assigned field-wise
+    // - _poseScratch/_prevScratch: Tick pose-sample scratch (pose feature
+    //   size / pose bones * 3 floats of the baked layout, 44/21 for the
+    //   reference biped). Passed to the samplers instead of per-tick locals;
+    //   Resize only when the baked layout changes.
+    // - _tickTrajScratch: BuildLiveTrajectory scratch (trajectory feature
+    //   size of the baked layout). Same rule.
+    // RunQuery uses its params + _tickTrajectory (no per-tick member copies).
+    // _snapshot itself is assigned field-wise
     // only on change (Tick) so steady-state copies no native Strings.
     String _queryTagsKey;
     Array<String> _queryTagsCache;
@@ -338,13 +339,16 @@ private:
     static float AbsF(float value);
     static int32 MaxI(int32 a, int32 b);
 
-    float SelectPlayRate(float characterPlanarSpeed);
+    float SelectPlayRate(float targetSpeed);
     void EnsureClipSpeedCache();
     // Init caches tag SETS only (EnsureClipTagCache) — the motion scan
     // and accel log live inside the explicit static ExportClipAudit command,
     // never in Initialize/Tick.
     void EnsureClipTagCache();
-    void CheckSchemaBinding();
+    // Bind-time check (Initialize): live schema vs baked snapshot plus the
+    // skeleton fingerprint vs the model. False on any mismatch; report
+    // names every difference and the fix.
+    bool CheckSchemaBinding(SkinnedModel* model, String& report) const;
     static bool AxesNear(const Float3& a, const Float3& b);
     static bool TimesEqual(const Array<float>& a, const Array<float>& b);
     void RecordPolicyEvent(const char* kind, int32 clipIndex, const String& reason);
@@ -376,51 +380,6 @@ private:
         bool valid, const MotionMatchingResult& result, const String& reason);
     static float Wrap180(float a);
     void WarnOnce(const String& message);
-    // Bounded telemetry ring (no per-query file I/O): runtime query only
-    // I/O). Runtime query only copies numbers + one Tags string into the
-    // fixed ring (no JSON formatting, no file I/O in Tick). FlushTelemetry
-    // (explicit tooling) formats + writes. Overflow overwrites the oldest
-    // and counts drops (visible via GetTelemetryDropped + flush log).
-    struct TelemetryRecord
-    {
-        float Time = 0.0f;
-        float YawRate = 0.0f;
-        int32 ClipIndex = -1;
-        int32 SampleIndex = -1;
-        float Cost = MAX_float;
-        float PoseCost = MAX_float;
-        float TrajectoryCost = MAX_float;
-        float ContinuityCost = 0.0f;
-        float LoopCost = 0.0f;
-        float SecondBestCost = MAX_float;
-        float QueryMs = 0.0f;
-        int32 SwitchCount = 0;
-        int32 SeekCount = 0;
-        int32 CurrentClip = -1;
-        float PlaybackTime = -1.0f;
-        float PlayRate = 1.0f;
-        float EffectiveDt = 0.0f;
-        int32 Cycle = 0;
-        float TimeError = 0.0f;
-        int32 BestLoopClip = -1;
-        float BestLoopCost = MAX_float;
-        int32 BestOneShotClip = -1;
-        float BestOneShotCost = MAX_float;
-        int32 LoopScored = 0;
-        int32 OneShotScored = 0;
-        int32 LoopTotal = 0;
-        int32 OneShotTotal = 0;
-        float LoopPreference = 0.0f;
-        Float3 ActorPos = Float3::Zero;
-        String Tags;
-    };
-    static constexpr int32 TelemetryCapacity = 4096;
-    TelemetryRecord _telemetryRing[TelemetryCapacity];
-    int32 _telemetryHead = 0;
-    int32 _telemetryCount = 0;
-    int32 _telemetryDropped = 0;
-    void RecordTelemetry(float yawRate, const Array<String>& tags,
-        const MotionMatchingResult& result, const Float3& actorPos, float timeError);
     String GetClipName(int32 clipIndex);
     // Normalized tag SET snapshot (EnsureClipTagCache at init) with DB fallback.
     const Array<String>& ClipTags(int32 clipIndex);

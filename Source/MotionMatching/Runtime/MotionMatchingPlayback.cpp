@@ -1,9 +1,7 @@
-// MotionMatchingPlayback.cpp: playback implementation (Tick/Play/Stop/Setup, ApplyInertialization/BuildInertialOffsets/CalcInertialFloat, TwistAbout/ApplyRootYawSample).
-// Ownership: plugin runtime, no game/host references.
-// Key invariants: sample/strip/blend/snapshot run in bone-local space before forward kinematics; inertial offsets are pose-space deltas that survive retimes and reset only on Play/Stop/teleport; Tick asserts the sample-search-save order; root yaw comes from the ConjugateQ(prev)*cur delta quaternion measured once per tick after the sample-time update.
 #include "MotionMatchingPlayback.h"
 
 #include "MotionMatchingSampler.h"
+#include "MotionMatchingChannelMap.h"
 #include "../Database/MotionMatchingDatabase.h"
 #include "Engine/Content/Assets/Animation.h"
 #include "Engine/Content/Assets/SkinnedModel.h"
@@ -16,8 +14,6 @@
 
 namespace
 {
-    constexpr float MinPlayRate = 0.85f;
-    constexpr float MaxPlayRate = 1.15f;
     constexpr float PlayRateEpsilon = 1e-4f;
     constexpr float ScaleUnityTolerance = 0.05f;
     constexpr float PiF = 3.14159265358979323846f;
@@ -57,9 +53,17 @@ float MotionMatchingPlayback::GetPlayRate() const
     return _playRate;
 }
 
+void MotionMatchingPlayback::SetPlayRateRange(float minRate, float maxRate)
+{
+    if (!IsFiniteF(minRate) || !IsFiniteF(maxRate) || minRate <= 0.0f || maxRate < minRate)
+        return;
+    _minPlayRate = minRate;
+    _maxPlayRate = maxRate;
+}
+
 void MotionMatchingPlayback::SetPlayRate(float value)
 {
-    const float clamped = ClampF(value, MinPlayRate, MaxPlayRate);
+    const float clamped = ClampF(value, _minPlayRate, _maxPlayRate);
     if (AbsF(clamped - _playRate) > PlayRateEpsilon)
     {
         _playRateBefore = _playRate;
@@ -106,8 +110,7 @@ float MotionMatchingPlayback::GetCurrentClipLength() const
 void MotionMatchingPlayback::Setup(
     MotionMatchingDatabase* database,
     SkinnedModel* fallbackModel,
-    const SkeletonProfile& skeleton,
-    const Float3& controllerUpAxis)
+    const String& rootBone)
 {
     Stop();
     _database = database;
@@ -117,23 +120,20 @@ void MotionMatchingPlayback::Setup(
     _referenceLocals.Clear();
     _referenceRootLocal = Matrix::Identity;
     _hasReferenceRoot = false;
-    // Turn-in-place root yaw: Setup owns up-axis validation exactly once. Keep the
-    // previous axis when the new one is invalid (invalid path reports 0 delta).
-    if (IsValidUpAxis(controllerUpAxis))
-    {
-        _rootUpAxis = controllerUpAxis;
-        const float lenSq = _rootUpAxis.X * _rootUpAxis.X + _rootUpAxis.Y * _rootUpAxis.Y + _rootUpAxis.Z * _rootUpAxis.Z;
-        const float inv = 1.0f / (float)std::sqrt((double)lenSq);
-        _rootUpAxis = Float3(_rootUpAxis.X * inv, _rootUpAxis.Y * inv, _rootUpAxis.Z * inv);
-        _hasRootUpAxis = true;
-    }
     _rootNodeIndex = -1;
     _clips.Clear();
     _lengths.Clear();
     _loops.Clear();
+    _aliases.Clear();
+    _channelMaps.Clear();
+    _channelMapModel = nullptr;
 
     if (_database == nullptr || !_database->IsBaked())
         return;
+
+    // Clips are sampled with the aliases the database was baked with, through
+    // the same channel resolver as the baker.
+    _aliases = _database->GetSchema().BoneAliases;
 
     const int32 count = _database->GetClipCount();
     _lengths = _database->GetClipLengths();
@@ -147,21 +147,22 @@ void MotionMatchingPlayback::Setup(
     // clip's travel through space and must be stripped every frame
     // (see Tick), otherwise the body teleports meters away on walk/run.
     SkinnedModel* resolveModel = _fallbackModel;
-    NodeIndices nodes;
-    String resolveError;
-    if (resolveModel != nullptr && MotionMatchingSkeleton::TryResolve(skeleton, resolveModel, nodes, resolveError))
+    const int32 rootIndex = resolveModel != nullptr && rootBone.HasChars() && !resolveModel->WaitForLoaded()
+        ? resolveModel->FindNode(rootBone)
+        : -1;
+    if (rootIndex >= 0)
     {
-        _rootNodeIndex = nodes.Root;
+        _rootNodeIndex = rootIndex;
     }
     else if (resolveModel != nullptr)
     {
-        // Fail-fast with the resolve reason: an empty profile means the host
-        // never configured the skeleton for its rig (the struct ships empty
-        // with no mannequin fallback); indices stay -1 and travel is NOT
-        // stripped until the host configures it.
-        LOG(Warning, "Motion matching playback skeleton not resolved: {}. "
-            "Configure the SkeletonProfile for your rig "
-            "(scene → MotionMatchingController → Schema → Skeleton).", resolveError);
+        // Fail-fast: an empty or unknown root means the host never declared
+        // the layout for its rig (the schema ships empty, with no mannequin
+        // fallback); the index stays -1 and travel is NOT stripped until the
+        // host configures it.
+        LOG(Warning, "Motion matching playback root node '{}' not found in the model. "
+            "Declare Schema.RootBone for your rig "
+            "(scene -> MotionMatchingController -> Schema).", rootBone);
     }
     EnsureHierarchy(resolveModel);
 }
@@ -175,7 +176,6 @@ void MotionMatchingPlayback::Stop()
     _playRate = 1.0f;
     _playRateBefore = 1.0f;
     IsAtEnd = false;
-    ResetRootYawState();
     _searchLocals.Clear();
     _prevSearchLocals.Clear();
     _tickFrameId = 0;
@@ -197,8 +197,6 @@ void MotionMatchingPlayback::Stop()
 void MotionMatchingPlayback::ResetOnTeleport()
 {
     ClearInertial();
-    // Turn-in-place root yaw: teleport clears delta + baseline alongside inertia.
-    ResetRootYawState();
 }
 
 void MotionMatchingPlayback::Play(int32 clipIndex, float startTime, bool forceSeek)
@@ -218,14 +216,6 @@ void MotionMatchingPlayback::Play(int32 clipIndex, float startTime, bool forceSe
         ArmInertial();
         CurrentTime = target;
         IsAtEnd = false;
-        // Turn-in-place root yaw: Play resets delta/baseline WITHOUT extra sampling
-        // (no allocation, no query-thread touch). Delegated sampling computes
-        // the Play->first-tick baseline on the next Tick, so the first tick
-        // reports the full Play->tick interval, never a skipped frame.
-        _rootYawDelta = 0.0f;
-        _hasPrevRootSample = false;
-        _rootYawPlayStartTime = target;
-        _hasRootYawPlayStart = true;
         return;
     }
 
@@ -234,11 +224,6 @@ void MotionMatchingPlayback::Play(int32 clipIndex, float startTime, bool forceSe
     CurrentTime = MaxF(startTime, 0.0f);
     ClipCycle = 0;
     IsAtEnd = false;
-    // Turn-in-place root yaw: see same-clip branch above for the no-sample reset.
-    _rootYawDelta = 0.0f;
-    _hasPrevRootSample = false;
-    _rootYawPlayStartTime = CurrentTime;
-    _hasRootYawPlayStart = true;
 }
 
 void MotionMatchingPlayback::ArmInertial()
@@ -318,10 +303,8 @@ void MotionMatchingPlayback::AssertTickOrder()
     }
 }
 
-void MotionMatchingPlayback::Tick(float deltaTime, AnimatedModel* body, bool grounded)
+void MotionMatchingPlayback::Tick(float deltaTime, AnimatedModel* body)
 {
-    (void)grounded;
-
     if (_database == nullptr || body == nullptr || CurrentClip < 0 || CurrentClip >= _clips.Count())
         return;
 
@@ -331,7 +314,6 @@ void MotionMatchingPlayback::Tick(float deltaTime, AnimatedModel* body, bool gro
     if (model == nullptr)
     {
         WarnOnce(String(TEXT("Motion matching playback stopped: body has no SkinnedModel.")));
-        _rootYawDelta = 0.0f;
         return;
     }
 
@@ -341,17 +323,11 @@ void MotionMatchingPlayback::Tick(float deltaTime, AnimatedModel* body, bool gro
         char message[128];
         snprintf(message, sizeof(message), "Motion matching playback stopped: clip %d has no length.", CurrentClip);
         WarnOnce(String(message));
-        _rootYawDelta = 0.0f;
         return;
     }
 
-    // Turn-in-place root yaw: remember the pre-advance end state. IsAtEnd from
-    // prior ticks reports 0 delta (stale content), and the wrap branch below
-    // consumes the trailing wrap interval then resets the baseline.
-    const bool wasAtEnd = IsAtEnd;
     LastEffectiveDt = MaxF(deltaTime, 0.0f) * _playRate;
     CurrentTime += LastEffectiveDt;
-    bool wrapped = false;
     if (_loops.Count() > CurrentClip && _loops[CurrentClip])
     {
         if (CurrentTime >= length && length > 0.0f)
@@ -361,7 +337,6 @@ void MotionMatchingPlayback::Tick(float deltaTime, AnimatedModel* body, bool gro
                 CurrentTime -= length;
                 ClipCycle++;
             }
-            wrapped = true;
         }
         IsAtEnd = false;
     }
@@ -375,40 +350,16 @@ void MotionMatchingPlayback::Tick(float deltaTime, AnimatedModel* body, bool gro
     _tickFrameId++;
     Array<Matrix> locals;
     String error;
-    if (!MotionMatchingSampler::SampleClipLocalPose(_clips[CurrentClip], model, CurrentTime, locals, error))
+    const Array<int32>* channelMap = GetChannelMap(CurrentClip, model);
+    if (channelMap == nullptr ||
+        !MotionMatchingSampler::SampleClipLocalPoseMapped(_clips[CurrentClip], model, *channelMap, CurrentTime, locals, error))
     {
+        if (channelMap == nullptr)
+            error = TEXT("clip channel map is unavailable.");
         WarnOnce(String(TEXT("Motion matching playback stopped: ")) + error);
-        _rootYawDelta = 0.0f;
         return;
     }
     SampleFrameId = _tickFrameId;
-
-    // Turn-in-place root yaw: measure ONCE per tick, AFTER the sample-time update
-    // above and BEFORE inertial/strip/pose-snapshot below. The delta takes
-    // the DELTA quaternion (ConjugateQ(prev)*cur), never an absolute pose.
-    // The delegated Play-start baseline sample is skipped on end/wrap/no-axis
-    // ticks (ApplyRootYawSample reports 0 there without needing it).
-    {
-        Quaternion currentRotation(0.0f, 0.0f, 0.0f, 1.0f);
-        const bool currentValid = TryGetRootSampleRotation(locals, currentRotation);
-        bool hasBaseline = _hasPrevRootSample;
-        Quaternion baselineRotation = _prevRootSampleRotation;
-        if (!hasBaseline && _hasRootYawPlayStart && currentValid && !wasAtEnd && !wrapped && _hasRootUpAxis)
-        {
-            // Delegated Play->first-tick baseline: sample the stored Play
-            // start time in the same clip/model (same sampler domain) so the
-            // first tick reports the full Play->tick interval, frame included.
-            Array<Matrix> baselineLocals;
-            String baselineError;
-            if (_rootNodeIndex >= 0 &&
-                MotionMatchingSampler::SampleClipLocalPose(_clips[CurrentClip], model, _rootYawPlayStartTime, baselineLocals, baselineError) &&
-                TryGetRootSampleRotation(baselineLocals, baselineRotation))
-            {
-                hasBaseline = true;
-            }
-        }
-        ApplyRootYawSample(currentValid, currentRotation, deltaTime, wasAtEnd, wrapped, hasBaseline, baselineRotation);
-    }
 
     // Strip in LOCAL space before FK: pinning the composed root alone
     // would leave every child carrying the old travel/yaw.
@@ -434,7 +385,7 @@ void MotionMatchingPlayback::Tick(float deltaTime, AnimatedModel* body, bool gro
     ApplyInertialization(blendedLocals, model, MaxF(deltaTime, 0.000001f));
 
     // Search-pose save: snapshot AFTER inertial. Deep copy (not an alias)
-    // so later game-side post passes cannot mutate the saved snapshot.
+    // so later host post passes cannot mutate the saved snapshot.
     if (_searchLocals.Count() == blendedLocals.Count() && blendedLocals.Count() > 0)
     {
         if (_prevSearchLocals.Count() != _searchLocals.Count())
@@ -450,7 +401,7 @@ void MotionMatchingPlayback::Tick(float deltaTime, AnimatedModel* body, bool gro
     for (int32 i = 0; i < blendedLocals.Count(); i++)
         _searchLocals[i] = blendedLocals[i];
     SaveSearchPoseFrameId = _tickFrameId;
-    // No overlay / compose / IK / pose write here. The provider reads
+    // No overlay / compose / IK / pose write here. The game reads
     // the search locals above via GetSearchLocals, applies its own post
     // passes, composes and writes the final pose itself.
     AssertTickOrder();
@@ -534,7 +485,9 @@ void MotionMatchingPlayback::BuildInertialOffsets(Array<Matrix>& newBase, Skinne
             prevTime = MaxF(prevTime, 0.0f);
         }
         String sampleError;
-        if (MotionMatchingSampler::SampleClipLocalPose(_clips[CurrentClip], model, prevTime, newPrevStorage, sampleError))
+        const Array<int32>* channelMap = GetChannelMap(CurrentClip, model);
+        if (channelMap != nullptr &&
+            MotionMatchingSampler::SampleClipLocalPoseMapped(_clips[CurrentClip], model, *channelMap, prevTime, newPrevStorage, sampleError))
         {
             if (_hasReferenceRoot && _rootNodeIndex >= 0 && _rootNodeIndex < newPrevStorage.Count())
             {
@@ -770,115 +723,30 @@ bool MotionMatchingPlayback::TryDecompose(const Matrix& value, Float3& scl, Quat
         rot.X + rot.Y + rot.Z + rot.W);
 }
 
-// Turn-in-place root-yaw delta helpers. The delta input below is the
-// sampled DELTA quaternion ConjugateQ(prev)*cur, never an absolute pose.
-// TurnPenalty/GetClipTurnAngle are untouched (net signed stays).
-void MotionMatchingPlayback::ResetRootYawState()
+const Array<int32>* MotionMatchingPlayback::GetChannelMap(int32 clipIndex, SkinnedModel* model)
 {
-    _rootYawDelta = 0.0f;
-    _prevRootSampleRotation = Quaternion(0.0f, 0.0f, 0.0f, 1.0f);
-    _hasPrevRootSample = false;
-    _rootYawPlayStartTime = 0.0f;
-    _hasRootYawPlayStart = false;
-}
-
-bool MotionMatchingPlayback::IsValidUpAxis(const Float3& value)
-{
-    if (std::isfinite(value.X) == 0 || std::isfinite(value.Y) == 0 || std::isfinite(value.Z) == 0)
-        return false;
-    const float lenSq = value.X * value.X + value.Y * value.Y + value.Z * value.Z;
-    return lenSq > 1e-12f;
-}
-
-bool MotionMatchingPlayback::TryGetRootSampleRotation(const Array<Matrix>& locals, Quaternion& outRotation) const
-{
-    outRotation = Quaternion(0.0f, 0.0f, 0.0f, 1.0f);
-    if (_rootNodeIndex < 0 || _rootNodeIndex >= locals.Count())
-        return false;
-    Float3 scl;
-    Quaternion rot;
-    Float3 pos;
-    if (!TryDecompose(locals[_rootNodeIndex], scl, rot, pos))
-        return false;
-    if (std::isfinite(rot.X + rot.Y + rot.Z + rot.W) == 0)
-        return false;
-    outRotation = NormalizeQ(rot);
-    return true;
-}
-
-float MotionMatchingPlayback::ClampRootYawDelta(float delta, float deltaTime) const
-{
-    // 720 deg/s cap on the caller-provided effective advance (wall dt * live
-    // play rate). Over-cap reports 0: single branch, no normalize/divide.
-    // Kept for unit symmetry; the live Tick path inlines the same cap with
-    // the effective dt it already holds.
-    if (std::isfinite(delta) == 0 || std::isfinite(deltaTime) == 0 || deltaTime <= 0.0f)
-        return 0.0f;
-    const float limit = 720.0f * 0.01745329252f * deltaTime;
-    return AbsF(delta) <= limit ? delta : 0.0f;
-}
-
-void MotionMatchingPlayback::ApplyRootYawSample(bool currentValid, const Quaternion& currentRotation, float deltaTime, bool wasAtEnd, bool wrapped, bool hasBaseline, const Quaternion& baselineRotation)
-{
-    if (!currentValid)
+    if (model == nullptr || clipIndex < 0 || clipIndex >= _clips.Count() || _clips[clipIndex] == nullptr)
+        return nullptr;
+    // One table per clip/model pair, built on first use: a model swap drops
+    // every cached table.
+    if (_channelMapModel != model)
     {
-        // Invalid/root-missing returns 0 and never seeds a false baseline:
-        // a delegated Play-start stays pending until a valid sample arrives.
-        _rootYawDelta = 0.0f;
-        return;
+        _channelMaps.Clear();
+        _channelMapModel = model;
     }
-    if (wasAtEnd || !_hasRootUpAxis)
+    if (_channelMaps.Count() != _clips.Count())
+        _channelMaps.Resize(_clips.Count());
+    Array<int32>& map = _channelMaps[clipIndex];
+    const int32 nodeCount = model->GetNodes().Count();
+    if (map.Count() != nodeCount)
     {
-        // Stale end content (prior IsAtEnd) and invalid/missing root report 0,
-        // but keep the baseline warm for post-seek events: prev updates on
-        // every successful sample, including IsAtEnd. A pending Play-start
-        // baseline is NOT consumed here (stays pending for the live tick).
-        _rootYawDelta = 0.0f;
-        _prevRootSampleRotation = currentRotation;
-        _hasPrevRootSample = true;
-        return;
+        Animation* clip = _clips[clipIndex];
+        if (clip->WaitForLoaded() || model->WaitForLoaded())
+            return nullptr;
+        MotionMatchingChannelMap::Build(model->GetNodes(), clip->Data.Channels, _aliases, map);
     }
-    if (wrapped)
-    {
-        // Loop wrap: consume the trailing wrap interval, then reset the
-        // baseline so no seam-spanning delta is ever emitted. Runs before
-        // the no-baseline branch: a pending Play-start from pre-wrap time
-        // must NOT survive the seam (it would span it on the next tick).
-        _rootYawDelta = 0.0f;
-        _prevRootSampleRotation = currentRotation;
-        _hasPrevRootSample = true;
-        _hasRootYawPlayStart = false;
-        return;
-    }
-    if (!hasBaseline)
-    {
-        // No baseline yet (first live sample, no Play-start): report 0 once
-        // and seed prev so the NEXT tick measures frame-by-frame. A pending
-        // Play-start whose baseline sample failed stays pending.
-        _rootYawDelta = 0.0f;
-        if (!_hasRootYawPlayStart)
-        {
-            _prevRootSampleRotation = currentRotation;
-            _hasPrevRootSample = true;
-        }
-        return;
-    }
-    const Quaternion prevN = NormalizeQ(baselineRotation);
-    const Quaternion curN = NormalizeQ(currentRotation);
-    // DELTA quaternion via the engine product (same convention as the
-    // inertial qOff above): ConjugateQ(prev) * cur. TwistAbout then takes
-    // this DELTA, never an absolute pose.
-    const Quaternion deltaRot = ConjugateQ(prevN) * curN;
-    const float twist = TwistAbout(deltaRot, _rootUpAxis);
-    // Clamp on the EFFECTIVE advance (wall dt * live play rate): a frozen
-    // tick (dt 0) reports 0 instead of a stale pose delta. Single branch,
-    // no normalize/divide beyond the cap.
-    _rootYawDelta = ClampRootYawDelta(twist, MaxF(deltaTime, 0.0f) * _playRate);
-    _prevRootSampleRotation = currentRotation;
-    _hasPrevRootSample = true;
-    _hasRootYawPlayStart = false;
+    return &map;
 }
-
 
 void MotionMatchingPlayback::EnsureHierarchy(SkinnedModel* model)
 {

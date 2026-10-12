@@ -1,6 +1,3 @@
-// MotionMatchingDatabase.Editor.cpp: editor registry and persistence (MotionMatchingDatabase::AddSourceClips/ClearSourceClips/SetBakedData/Save).
-// Ownership: plugin runtime, no game/host references.
-// Key invariants: SetBakedData copies the source tag sets verbatim, derives turn-like flags and speed bands once via MotionMatchingBakeHeuristics, and stamps the full provenance (NormalizationRevision, layout hash, schema/sampling/source/tool); Save appends revision/hash/band tails last so conditional reads keep older .flax files loadable as registry-only.
 #include "MotionMatchingDatabase.h"
 
 #if USE_EDITOR
@@ -8,12 +5,12 @@
 #include "Engine/Core/Log.h"
 #include "Engine/Serialization/MemoryWriteStream.h"
 #include "Engine/Threading/Threading.h"
-#include "../Baker/MotionMatchingBakeHeuristics.h"
 
 bool MotionMatchingDatabase::AddSourceClips(
     const Array<String>& tags,
     const Array<Animation*>& animations,
-    bool loop)
+    bool loop,
+    int32 group)
 {
     const Array<String> set = NormalizeTags(tags);
     if (set.IsEmpty())
@@ -44,12 +41,18 @@ bool MotionMatchingDatabase::AddSourceClips(
                 _sourceLooping[existingIndex] = loopValue;
                 changed = true;
             }
+            if (_sourceGroups[existingIndex] != group)
+            {
+                _sourceGroups[existingIndex] = group;
+                changed = true;
+            }
             continue;
         }
 
         _sourceAnimations.Add(animation);
         _sourceTags.Add(set);
         _sourceLooping.Add(loop ? 1 : 0);
+        _sourceGroups.Add(group);
         changed = true;
     }
 
@@ -66,6 +69,7 @@ void MotionMatchingDatabase::ClearSourceClips()
     _sourceAnimations.Clear();
     _sourceTags.Clear();
     _sourceLooping.Clear();
+    _sourceGroups.Clear();
     _tagNames.Clear();
     _tagClipCounts.Clear();
     ClearBakedData();
@@ -84,28 +88,30 @@ void MotionMatchingDatabase::SetBakedData(
     const Array<float>& poseFeatures,
     const Array<float>& trajectoryFeatures,
     const Array<float>& poseFeatureDeviations,
-    const Array<float>& trajectoryFeatureDeviations)
+    const Array<float>& trajectoryFeatureDeviations,
+    const MotionMatchingSkeletonFingerprint& skeletonFingerprint,
+    const Float3& planarUpAxis)
 {
     ClearBakedData();
     _schema = schema;
+    RebuildLayout();
+    _planarUpAxis = planarUpAxis;
 
     _clipAnimations.EnsureCapacity(sourceClipIndices.Count());
     _clipTags.EnsureCapacity(sourceClipIndices.Count());
     _clipLooping.EnsureCapacity(sourceClipIndices.Count());
-    _clipTurnLike.EnsureCapacity(sourceClipIndices.Count());
-    _clipSpeedBands.EnsureCapacity(sourceClipIndices.Count());
+    _clipGroups.EnsureCapacity(sourceClipIndices.Count());
     for (int32 sourceIndex : sourceClipIndices)
     {
+        // Registry copy: baked clips carry the tag set, loop flag and group
+        // the source had at bake time (registry edits clear baked data, so
+        // no drift). The baker never derives metadata from asset names.
         _clipAnimations.Add(_sourceAnimations[sourceIndex]);
         _clipTags.Add(_sourceTags[sourceIndex]);
         _clipLooping.Add(_sourceLooping[sourceIndex]);
-        // Tag-set copy: baked clips carry the same set the source had at
-        // bake time (registry edits clear baked data, so no drift).
-        Animation* animation = _sourceAnimations[sourceIndex].Get();
-        const String clipPath = animation != nullptr ? animation->GetPath() : String::Empty;
-        _clipTurnLike.Add(MotionMatchingBakeHeuristics::IsTurnLikePath(clipPath) ? 1 : 0);
-        _clipSpeedBands.Add(static_cast<int32>(MotionMatchingBakeHeuristics::BandFromClipName(clipPath)));
+        _clipGroups.Add(GetSourceClipGroup(sourceIndex));
     }
+    _skeletonFingerprint = skeletonFingerprint;
 
     _clipLengths = clipLengths;
     _clipSampleCounts = clipSampleCounts;
@@ -119,10 +125,10 @@ void MotionMatchingDatabase::SetBakedData(
     _poseFeatureDeviations = poseFeatureDeviations;
     _trajectoryFeatureDeviations = trajectoryFeatureDeviations;
     // Freshly baked by this build: stamp the current statistics revision and
-    // the feature-layout hash.
+    // the feature-layout hash of the baked schema.
     _normalizationRevision = PoseSearchSchema::NormalizationRevision;
-    _featureLayoutHash = static_cast<int32>(PoseSearchSchema::GetFeatureLayoutHash());
-    // Provenance stamps: schema contract revision (class const), sampling
+    _featureLayoutHash = _currentLayoutHash;
+    // D1 §18.5 provenance: schema contract revision (class const), sampling
     // contract hash (schema sampling values + SamplingContractRevision),
     // source manifest identity (registered source asset IDs/tags/loop) and the
     // bake-tool build id. ValidateDataStatus recomputes these and drops the
@@ -177,28 +183,37 @@ bool MotionMatchingDatabase::Save(const StringView& path)
     stream.Write(_rootPositions);
     stream.Write(_rootVelocities);
     stream.Write(_rootForwards);
-    // Revision-3 binary-format compat: the retired value-mean slots stay in the layout
-    // as empty arrays so the byte stream keeps its shape (load() still reads them)
-    // and revision-3 files stay distinguishable from revision-2 by the stored revision.
+    // N1b rev 3: the legacy value-mean slots stay in the layout as empty
+    // arrays so the byte stream keeps its shape (load() still reads them) and
+    // rev-3 files stay distinguishable from rev-2 by the stored revision.
     // Only deviations are persisted as real statistics.
     const Array<float> noMeans;
     stream.Write(noMeans);
     stream.Write(_poseFeatureDeviations);
     stream.Write(noMeans);
     stream.Write(_trajectoryFeatureDeviations);
-    stream.Write(_clipTurnLike);
+    // Legacy turn-like slot (v3), written empty so the layout never reorders.
+    const Array<int32> noTurnLike;
+    stream.Write(noTurnLike);
     stream.WriteInt32(_normalizationRevision);
     stream.WriteInt32(_featureLayoutHash);
-    // Provenance tails (read back conditionally, so files written before the
-    // provenance tails stay loadable as registry-only).
+    // D1 §18.5 provenance tails (read back conditionally, so pre-D1 files stay
+    // loadable as registry-only).
     stream.WriteInt32(_schemaContractRevision);
     stream.WriteInt32(_samplingContractHash);
     stream.WriteInt32(_sourceManifestHash);
     stream.WriteInt32(_bakeToolBuildId);
-    // Per-clip speed bands (rev 2, SchemaContractRevision gate): appended
-    // LAST so every older layout keeps parsing (load reads conditionally).
-    stream.Write(_clipSpeedBands);
+    // Per-clip groups in the v3 speed-band slot, then the v4 tail: per-source
+    // groups and the skeleton fingerprint. New data is only ever appended.
+    stream.Write(_clipGroups);
+    stream.Write(_sourceGroups);
+    _skeletonFingerprint.Serialize(stream);
+    // v5 tail: model-space planar up axis.
+    stream.Write(_planarUpAxis);
 
+    // Every save writes the current type name, also for a file that still carried
+    // the legacy name in its header.
+    _header.TypeName = TypeName;
     FlaxChunk* chunk;
     if (IsVirtual())
     {

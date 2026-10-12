@@ -7,15 +7,10 @@ using FlaxEngine;
 namespace MotionMatching;
 
 /// <summary>
-/// Single management UI for the motion-matching database.
-///
-/// Purpose: one window for register / clear / import / export / bake
-/// pipeline / tuning. Import REPLACES the whole registry (no merge); a
-/// host-selected registry file can restore any authored clip set.
-/// Ownership: editor tooling operating on the host-owned controller object.
-/// Tick/lifecycle role: edit-mode only; bake runs through
-/// MotionMatchingEditorService and reloads the database afterwards.
-/// This window must never reference game/player/sample types.
+/// Single management UI for the motion-matching database. Replaces the old
+/// row of panel buttons: register / clear / import / export / bake pipeline
+/// / tuning live here. Import REPLACES the whole registry (no merge);
+/// a host-selected registry can restore any authored clip set.
 /// </summary>
 public class ManageMotionMatchingWindow : CustomEditorWindow
 {

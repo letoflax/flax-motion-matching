@@ -2,31 +2,26 @@ using FlaxEngine;
 
 namespace MotionMatching;
 
-// Motion-matching input contract: host facade <-> plugin runtime boundary.
+// Plugin-owned input contract (docs/PLUGIN_CONTRACT.md).
 //
-// Purpose: declare the per-tick data the host builds and the plugin consumes.
-// Ownership: this file is plugin runtime owned; the host facade implements
-// IMotionMatchingInputProvider and calls BuildInput itself, then passes the
-// resulting frame to MotionMatchingController.Update.
-// Tick/lifecycle role: BuildInput runs once per tick on the host side; the
-// controller holds no provider slot and never calls BuildInput or Reset
-// itself. Reset runs on teleport/respawn alongside controller.ResetPlayback.
-// This file must never reference game/player types or sample-project paths:
-// it names only plugin types (controller, frame, context, trajectory point).
+// Ownership: everything in this file belongs to the motion-matching side.
+// The host owns and calls IMotionMatchingInputProvider, then passes the frame
+// to MotionMatchingController.Update. The controller has no provider slot and
+// never calls BuildInput or Reset on the host's behalf.
 //
-// Managed data-transfer objects only: MotionMatchingInputContext never
-// crosses the native boundary (C# -> C#), so managed arrays are fine here.
-// Only the plain String/POD fields copied into MotionMatchingPlayerSnapshot /
+// Managed DTOs only: MotionMatchingInputContext never crosses the native
+// boundary (C# -> C#), so managed arrays are fine here. Only the plain
+// String/POD fields copied into MotionMatchingPlayerSnapshot /
 // MotionMatchingPolicyTuning cross into C++.
 
 /// <summary>
-/// The single call the motion-matching side needs from host-side code,
+/// The single call the motion-matching side needs from the host,
 /// once per tick. The provider owns the player snapshot (pushed host-side
 /// via its own Update method), all hysteresis/latch state, and the
-/// trajectory predictor. ctx carries only what the motion-matching side
-/// provides: time, world transform, schema inventory and database inventory.
-/// BuildInput assembles the frame in one call: snapshot, then trajectory,
-/// then scope reads the fresh points, then the frame.
+/// trajectory predictor. ctx carries only what the MM side provides:
+/// time, world transform, schema inventory and database inventory.
+/// Order inside BuildInput is fixed (R6): snapshot -> trajectory ->
+/// scope/driver reads the fresh points -> frame.
 /// </summary>
 public interface IMotionMatchingInputProvider
 {
@@ -41,7 +36,7 @@ public interface IMotionMatchingInputProvider
 }
 
 /// <summary>
-/// Motion-matching-side input to the provider. No raw movement here on purpose:
+/// MM-side input to the provider. No raw movement here on purpose (R5):
 /// movement arrives host-side through the provider's own Update method,
 /// so there is exactly one writer and no push-then-tick staleness.
 /// </summary>
@@ -62,11 +57,11 @@ public struct MotionMatchingInputContext
 
 /// <summary>
 /// Everything motion matching needs for one tick, produced in one call.
-/// Contents: trajectory + scope + caller filter only. All gameplay decisions
-/// (gait roles, speed ceilings, yaw/direction thresholds, driver flags,
-/// overlay angles/gates, velocities, grounded/sprint) live host-side in the
-/// provider/selection policy and never cross into the core. Includes use tag
-/// overlap; exclusions veto any overlap. Empty AllowedTagSet = explicit no-match.
+/// Trajectory + scope + caller filter only. All gameplay decisions (gait
+/// roles, speed ceilings, yaw/direction thresholds, overlay angles/gates,
+/// velocities, grounded/sprint) live host-side in the provider/selection
+/// policy and never cross into the core. Includes use tag overlap;
+/// exclusions veto any overlap. Empty AllowedTagSet = explicit no-match.
 /// Normal queries use the caller filter. Structural reseed/end-recovery
 /// searches override LoopFilter to LoopOnly within the same tag scope and
 /// exclusions, even for OneShotOnly callers (docs/PLUGIN_CONTRACT.md).
@@ -75,31 +70,39 @@ public struct MotionMatchingFrameInput
 {
     // 1. Predicted trajectory, character-local, aligned 1:1 with the
     // sample times from the context. Empty/null = prediction failed;
-    // the core skips the query, same as a failed trajectory build.
+    // the core skips the query exactly like today's trajError path.
     public TrajectoryPoint[] Points;
 
     // 2. Scope: '+'-joined include/exclude tag sets decided provider-side.
     // Empty AllowedTagSet = explicit no-match (hold current, never fall
-    // back to any pool). Every query is provider-scoped; there is no
-    // fallback chooser inside the core.
+    // back to any pool). Every query is provider-scoped.
     public string AllowedTagSet;
     public string ExcludedTagSet;
 
-    // 3. Caller filter (host selection-policy output):
+    // 3. Caller filter, taken verbatim (the core never infers any of it):
     // LoopFilter mirrors MotionLoopFilter (0 Any, 1 LoopOnly, 2 OneShotOnly);
-    // CandidateBand mirrors BakedClipSpeedBand DB ids (0 Any, 1 Walk, 2 Run,
-    // 3 Sprint); QueryYawRate (rad/s, >= 0) scales the straightness prior.
-    // CallerPlanarSpeed (u/s, >= 0) is the host-side character planar speed
-    // for play-rate only (clip time bends to world speed, clamped 0.85-1.15).
-    // The core never infers these from movement.
+    // ClipGroup is the one-shot clip group filter: one-shot clips of another
+    // non-zero group are skipped, loops and group-0 clips never are (0 = any;
+    // groups are authored in the clip registry and the host defines what the
+    // ids mean); QueryYawRate (rad/s, >= 0) scales the straightness prior
+    // (weight 0 turns the prior off).
     public int LoopFilter;
-    public int CandidateBand;
+    public int ClipGroup;
     public float QueryYawRate;
-    public float CallerPlanarSpeed;
+
+    // 4. Speed matching and reseed hold, both host decisions:
+    // TargetSpeed (world units/s, >= 0) is the speed the character really
+    // moves at; the clip time bends to match it within the play-rate range of
+    // the tuning (0 or below PlayRateMinSpeed = authored speed).
+    // HoldReseedFilter keeps the structural reseed recovery (LoopOnly within
+    // the same tag scope) armed while true; it is released by the first scan
+    // after the host clears it. Set it while the host's own motion state is
+    // still settling after ResetPlayback or a teleport.
+    public float TargetSpeed;
+    public bool HoldReseedFilter;
 }
 
-// History note: earlier additive-only filter/tuning DTOs were never read by
-// Tick and are deleted. The live host-side request object carries scope into
-// the core through MotionMatchingFrameInput above (direct path); intent/loop/
-// band mirrors stay host-side. No native struct field is added
-// (MotionMatchingTraceEntry stays 61/64 for the Flax 1.12 bindings cap).
+// Scope crosses into the core only through MotionMatchingFrameInput above;
+// intent, loop and group mirrors stay host-side. No native struct field is
+// added for them (MotionMatchingTraceEntry stays under the Flax 1.12 bindings
+// cap of 64).

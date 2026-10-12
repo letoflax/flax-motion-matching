@@ -1,6 +1,3 @@
-// MotionMatchingTrace.cpp: trace JSON/CSV serialization and replay verify (MotionMatchingTraceLog::Record/ExportJson/ImportJson/ExportCsv/VerifyReplay, FormatFloatText/ParseEntry/FindKey).
-// Ownership: plugin runtime, no game/host references.
-// Key invariants: every lookup guards v1/v2 lines so older files import with documented defaults; a vector-less search/fastpath line is rejected at import (it can never be re-checked); VerifyReplay re-runs search via FindBest, fastpath via SampleCost and command/reset structurally, and passes only with zero mismatches, at least one checked entry, and no skipped entry carrying checkable input.
 #include "MotionMatchingTrace.h"
 
 #include "../Database/MotionMatchingDatabase.h"
@@ -217,7 +214,7 @@ bool MotionMatchingTraceLog::ExportJson(const String& path, String& error)
         sb.Append(",\"xtags\":\"");
         EscapeInto(sb, e.ExcludedTags);
         sb.Append("\",\"band\":");
-        sb.Append(e.OneShotBand);
+        sb.Append(e.OneShotGroup);
         sb.Append(",\"retry\":");
         sb.Append(e.RetryKind);
         // Booleans travel packed in TraceFlags (Flax 1.12 bindings
@@ -459,13 +456,13 @@ bool MotionMatchingTraceLog::ParseEntry(const String& line, MotionMatchingTraceE
     entry.Reason = GetString(text, length, "\"reason\":\"");
     entry.Chooser = GetString(text, length, "\"chooser\":\"");
     entry.QueryMs = GetFloat(text, length, "\"qms\":");
-    // v3 fields: present only in v3 lines; every lookup is guarded so
+    // V3 fields: present only in v3 lines; every lookup is guarded so
     // v1/v2 lines import with documented defaults. Booleans pack into
     // TraceFlags (see bit constants in the header).
     if (isV3)
     {
         entry.ExcludedTags = GetString(text, length, "\"xtags\":\"");
-        entry.OneShotBand = (int32)GetFloat(text, length, "\"band\":");
+        entry.OneShotGroup = (int32)GetFloat(text, length, "\"band\":");
         entry.RetryKind = (int32)GetFloat(text, length, "\"retry\":");
         int32 flags = 0;
         if (GetFloat(text, length, "\"fedge\":") > 0.5f)
@@ -482,8 +479,8 @@ bool MotionMatchingTraceLog::ParseEntry(const String& line, MotionMatchingTraceE
             flags |= TraceFlag_VerifyIndexedSearch;
         if (GetFloat(text, length, "\"excltail\":") > 0.5f)
             flags |= TraceFlag_ExcludeNonLoopTail;
-        // Retired firm-lock trace keys are ignored — the foot-contact search
-        // prior recorded 0, so old keys never steer the parsed entry.
+        // Older traces carry firm-lock keys; they are ignored (the plugin has
+        // no foot-lock prior).
         entry.TraceFlags = flags;
         entry.MaxCandidates = (int32)GetFloat(text, length, "\"maxcand\":");
         entry.QueryFrame = (int32)GetFloat(text, length, "\"qframe\":");
@@ -496,7 +493,7 @@ bool MotionMatchingTraceLog::ParseEntry(const String& line, MotionMatchingTraceE
         entry.FastThreshold = GetFloat(text, length, "\"fthresh\":");
         entry.CommandClip = (int32)GetFloat(text, length, "\"cmdclip\":");
         entry.CommandTime = GetFloat(text, length, "\"cmdtime\":");
-        // Straightness-prior tuning: missing keys (older traces) fall back to
+        // Turn-prior tuning: missing keys (pre-traces) fall back to
         // the preserved 0.03/4.0 calibration so old files still import.
         if (FindKey(text, length, "\"tpw\":") >= 0)
         {
@@ -511,7 +508,7 @@ bool MotionMatchingTraceLog::ParseEntry(const String& line, MotionMatchingTraceE
     }
     // "search" needs feature vectors to re-run FindBest; "fastpath" needs
     // them to re-run SampleCost. "command"/"reset" are structural (no
-    // vectors by design). Historical "hold"/"replay" policy events carry none.
+    // vectors by design). Old "hold"/"replay" policy events carry none.
     // A vector-less search/fastpath line is REJECTED here (it can never be
     // checked) — the old silent skip is what hid incomplete replay.
     const bool isSearch = entry.Kind == String(TEXT("search"));
@@ -745,7 +742,7 @@ bool MotionMatchingTraceLog::VerifyReplay(MotionMatchingDatabase* database, int3
     // Every entry is either CHECKED (search via FindBest, fastpath via
     // SampleCost, command/reset structurally) or SKIPPED with an explicit
     // reason. A vector-less search/fastpath line can never be checked and
-    // is rejected at import; historical hold/replay policy events carry no
+    // is rejected at import; old hold/replay policy events carry no
     // vectors by design. PASS requires zero mismatches, at least one
     // checked entry, and no skipped entry that carried checkable input.
     const int32 start = snap.Count() - total;
@@ -826,7 +823,7 @@ bool MotionMatchingTraceLog::VerifyReplay(MotionMatchingDatabase* database, int3
             settings.TwinBanWindow = e.TwinBanWindow;
             settings.LoopTailExclusion = e.LoopTailExclusion;
             settings.ExcludeNonLoopTail = (e.TraceFlags & TraceFlag_ExcludeNonLoopTail) != 0;
-            settings.OneShotBand = e.OneShotBand;
+            settings.OneShotGroup = e.OneShotGroup;
             settings.MaxCandidates = e.MaxCandidates;
             settings.QueryFrame = e.QueryFrame;
             settings.UseIndexedSearch = (e.TraceFlags & TraceFlag_UseIndexedSearch) != 0;
@@ -899,7 +896,7 @@ bool MotionMatchingTraceLog::VerifyReplay(MotionMatchingDatabase* database, int3
         else if (e.Kind == kindFast)
         {
             // Continuation hold: re-score the recorded sample with the
-            // recorded weights (incl. the straightness-prior tuning) and require
+            // recorded weights (incl. the turn-prior tuning) and require
             // the recorded cost (text round-trip tolerance) plus the recorded
             // threshold to hold.
             float cost = 0.0f;
@@ -910,7 +907,7 @@ bool MotionMatchingTraceLog::VerifyReplay(MotionMatchingDatabase* database, int3
             fastChecked++;
             bool costOk = ok && sampleError.IsEmpty() &&
                 fabsf(cost - e.Cost) <= 0.001f * fmaxf(1.0f, fabsf(e.Cost));
-            // MAX_float threshold = unset (older entries): skip the threshold leg.
+            // MAX_float threshold = unset (legacy): skip the threshold leg.
             bool threshOk = !ok || e.FastThreshold >= 1e29f || cost <= e.FastThreshold + 0.001f * fmaxf(1.0f, fabsf(e.FastThreshold));
             if (!costOk)
             {
@@ -935,10 +932,10 @@ bool MotionMatchingTraceLog::VerifyReplay(MotionMatchingDatabase* database, int3
         }
         else if (e.Kind == kindCommand || e.Kind == kindReset)
         {
-            // Force-clip / teleport-reset: no search ran, so the check is
+            // Command / teleport-reset: no search ran, so the check is
             // structural — the command must name a clip that exists (reset
             // records the surviving clip, which may be -1 = none) and must
-            // carry the non-empty reason recorded at command time.
+            // carry a reason string.
             const bool isCommand = e.Kind == kindCommand;
             bool structural = !e.Reason.IsEmpty();
             if (isCommand)
@@ -961,7 +958,7 @@ bool MotionMatchingTraceLog::VerifyReplay(MotionMatchingDatabase* database, int3
         }
         else
         {
-            // Historical hold/replay policy events: no vectors by design, never
+            // Old hold/replay policy events: no vectors by design, never
             // re-runnable. Counted as skipped with an explicit reason.
             skippedLegacy++;
         }
@@ -1005,3 +1002,9 @@ bool MotionMatchingTraceLog::VerifyReplay(MotionMatchingDatabase* database, int3
     const bool pass = mismatches == 0 && checkedTotal > 0 && skippedDbChanged == 0;
     return pass;
 }
+
+// C++14 (Flax Linux/clang): ODR-used static constexpr members need an out-of-class definition (undefined symbol at load otherwise).
+#if __cplusplus < 201703L
+constexpr int32 MotionMatchingTraceLog::Capacity;
+constexpr int32 MotionMatchingTraceLog::SchemaVersion;
+#endif

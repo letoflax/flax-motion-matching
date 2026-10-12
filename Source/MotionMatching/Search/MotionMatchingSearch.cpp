@@ -1,6 +1,3 @@
-// MotionMatchingSearch.cpp: search backends (FindBest/SearchPass/IndexedSearchPass, FullSampleCost/PoseBlockCost/TrajectoryBlockCost/ContinuityTerm/LoopPreferenceTerm/TurnPenalty, ComputeClassBests, EnsureTagPartition/TagPartitionCache, SampleCost/FindTopCandidates).
-// Ownership: plugin runtime, no game/host references.
-// Key invariants: raw query/baked values score through one per-dimension scale pass (sqrt of sum-normalized weight divided by the stored deviation); every prior except the continuing-bias and loop-preference bonuses stays non-negative so block pruning with explicit headroom is exact; ties break to the lowest sample index; the indexed path retrieves top-K then exact-reranks with shared term helpers and falls back to brute force on any miss.
 #include "MotionMatchingSearch.h"
 
 #include "../Database/MotionMatchingDatabase.h"
@@ -15,30 +12,29 @@
 
 namespace
 {
-    // Revision 3: baked and query features are RAW. The only stored stat is a
+    // N1b rev 3: baked and query features are RAW. The only stored stat is a
     // positive per-dim deviation (baker floors it at `dev > 0.1 ? dev : 1.0`),
     // so the divide floor below is only a last-resort guard and never
     // participates for valid databases.
     constexpr float MinimumStandardDeviation = 0.000001f;
     constexpr float SelfTestMaxCost = 0.0001f;
 
-    // Straightness prior (Game-owned tuning via settings, values preserved
-    // from the 0.03/4.0 calibration): penalty = |clipTurnAngle| * Weight /
+    // Straightness prior (host-owned tuning via settings): penalty = |clipTurnAngle| * Weight /
     // (1 + yawRate * YawScale). Recorded in the trace; brute-force, indexed
     // and replay share this one definition.
-    // Measured verdict: grouped L/R normalization did
+    // Phase 2 UE-parity verdict (measured): grouped L/R normalization did
     // NOT retire this — with weight 0, turn one-shots flood steady strafe/
     // diagonal phases (suite 2/12 vs 5-6/12). The penalty is load-bearing
     // for pool purity beyond asymmetry compensation, so it stays (rescaled
     // to rev-3 cost units below: same ratio against typical dissimilarity).
     // (Attempt 1 of the penalty-0 retune failed cleanly; code path kept.)
-    // Rev-3 scale (Revision-3 shrank dissimilarity ~100x, measured mean 0.095):
+    // Rev-3 scale (N1b shrank dissimilarity ~100x, measured mean 0.095):
     // 180deg -> +0.094 straight — same blocking ratio as the old +9.4.
 
     // Straightness prior, SINGLE definition shared by the hot loop, the
     // bit-exact verifier and the test gate below. Always >= 0 (fabs), so
     // block pruning stays valid with no extra headroom anywhere it is used.
-    // weight/scale ride the per-query settings (Game tuning, trace-
+    // Weight/scale ride the per-query settings (host tuning, trace-
     // recorded); callers pass settings fields verbatim, never literals.
     float TurnPenalty(float clipAngle, float queryYawRate, float weight, float yawScale)
     {
@@ -48,11 +44,8 @@ namespace
         return a * w / (1.0f + Math::Max(queryYawRate, 0.0f) * s);
     }
 
-    // foot-lock search prior deleted (FootLockCost + FootLockL/R +
-    // FirmLockL/R). The runtime always fed it zero (verified: 4004/4004
-    // trace entries flock=(0,0) firm=(0,0)), so removal is query-identical.
-    // Baked contact channels + feature extraction + DB stay untouched;
-    // Game-side IK owns its own contact state.
+    // The search has no foot-lock prior. Baked contact channels are plain
+    // features; the host IK owns its own contact state.
 
     // N1 weight contract: schema weights are stored, never baked. The search
     // applies each block weight exactly ONCE. Negative inputs clamp to 0;
@@ -95,7 +88,7 @@ namespace
         }
     }
 
-    // Revision 3 weight pipeline (per-dimension scale pipeline): per-dim
+    // N1b rev 3 weight pipeline (UE PoseSearchDerivedData analogue): per-dim
     // base weight = PoseWeight for pose dims, TrajectoryWeight for trajectory
     // dims; sum-normalize across ALL dims; sqrt each; divide by the stored
     // per-dim deviation. The raw query and raw baked values are then scored as
@@ -160,11 +153,11 @@ namespace
     // Tag-partitioned sample lists for the coarse prefilter. Built lazily on
     // first query per database (in-memory, no DB format change): one
     // sample-index list per baked tag. The per-tag KD-trees (phase 1-2) were
-    // REMOVED after measurement -- exact 74-D trees barely prune (1.9x) and a
+    // REMOVED after measurement � exact 74-D trees barely prune (1.9x) and a
     // trajectory-only tier regressed recall; the linear block prefilter won
     // (sub-1ms, 0/1500 divergence). Brute force stays the reference backend
     // permanently (fallback + verify harness).
-    // Reference shape: retrieval + exact rerank (per-tag block prefilter, then full scoring)
+    // Reference shape: UE PoseSearch retrieval + exact rerank
     // (PoseSearchDerivedData.cpp / PoseSearchIndex.cpp); orangeduck motion
     // matching (https://github.com/orangeduck/Motion-Matching).
     struct TagPartitionCache
@@ -183,7 +176,7 @@ namespace
         return cache;
     }
 
-    // Scratch scratch buffers: IndexedSearchPass runs per-frame, so it must
+    // Phase 4 scratch buffers: IndexedSearchPass runs per-frame, so it must
     // not allocate per query (GC churn showed up as a fat qms tail). Single
     // game-thread caller (same discipline as the static partition cache);
     // buffers grow once to the high-water mark and are reused.
@@ -205,7 +198,7 @@ namespace
         return scratch;
     }
 
-    // Verify counters: the indexed path
+    // Phase 2 (KDTREE_PLAN.md): parallel-verify counters. The indexed path
     // must reproduce brute-force winners before any flip; during verify the
     // BRUTE-FORCE result always wins (caller overwrites), this only counts.
     // Benchmark (phase 4): verify also accumulates per-path native scan time
@@ -365,11 +358,11 @@ namespace
         return Math::Min(distance, length - distance);
     }
 
-    // ---- Shared cost terms (one definition per term) ----
+    // ---- S1 shared cost terms (PLAN �7.2, �16 Search, �18.7) ----
     // One definition per term. SearchPass (FindBest), FindTopCandidates,
     // FullSampleCost (SampleCost + the brute-force verifier) all build their
     // costs from these helpers, so no path can drift from another. The turn
-    // term is the existing TurnPenalty above (foot-lock prior deleted).
+    // term is the existing TurnPenalty above.
     //
     // Pruning invariant kept: every prior is non-negative (turn +
     // continuity switch penalty) so a pruned candidate can never earn cost
@@ -380,13 +373,37 @@ namespace
     // alone already exceeds the bound (remaining terms are >= 0). The scale
     // array already folds in sqrt(sum-normalized weight)/deviation, so the raw
     // query/baked delta is squared directly.
-    float PoseBlockCost(
+    // The block size comes from the database layout at runtime. The
+    // reference biped size (44) dispatches to a copy with a compile-time trip
+    // count, the code the fixed-layout builds produced; the arithmetic and
+    // the summation order are identical in both paths.
+    template<int32 Size>
+    FORCE_INLINE float PoseBlockCostFixed(
+        const float* queryPose,
+        const float* bakedPose,
+        const float* poseScale,
+        float pruneLimit)
+    {
+        float poseCost = 0.0f;
+        for (int32 i = 0; i < Size; i++)
+        {
+            const float delta = poseScale[i] * (queryPose[i] - bakedPose[i]);
+            poseCost += delta * delta;
+            if (poseCost > pruneLimit)
+                return poseCost;
+        }
+        return poseCost;
+    }
+
+    FORCE_INLINE float PoseBlockCost(
         const float* queryPose,
         const float* bakedPose,
         const float* poseScale,
         int32 poseFeatureSize,
         float pruneLimit)
     {
+        if (poseFeatureSize == FeatureLayout::ReferencePoseFeatureSize)
+            return PoseBlockCostFixed<FeatureLayout::ReferencePoseFeatureSize>(queryPose, bakedPose, poseScale, pruneLimit);
         float poseCost = 0.0f;
         for (int32 i = 0; i < poseFeatureSize; i++)
         {
@@ -398,8 +415,28 @@ namespace
         return poseCost;
     }
 
-    // Trajectory block, pruned against spentPoseCost + the bound.
-    float TrajectoryBlockCost(
+    // Trajectory block, pruned against spentPoseCost + the bound. Same
+    // reference-size dispatch as the pose block (30 floats for the reference layout).
+    template<int32 Size>
+    FORCE_INLINE float TrajectoryBlockCostFixed(
+        const float* queryTrajectory,
+        const float* bakedTrajectory,
+        const float* trajectoryScale,
+        float spentPoseCost,
+        float pruneLimit)
+    {
+        float trajectoryCost = 0.0f;
+        for (int32 i = 0; i < Size; i++)
+        {
+            const float delta = trajectoryScale[i] * (queryTrajectory[i] - bakedTrajectory[i]);
+            trajectoryCost += delta * delta;
+            if (spentPoseCost + trajectoryCost > pruneLimit)
+                return trajectoryCost;
+        }
+        return trajectoryCost;
+    }
+
+    FORCE_INLINE float TrajectoryBlockCost(
         const float* queryTrajectory,
         const float* bakedTrajectory,
         const float* trajectoryScale,
@@ -407,6 +444,11 @@ namespace
         float spentPoseCost,
         float pruneLimit)
     {
+        if (trajectoryFeatureSize == FeatureLayout::ReferenceTrajectoryFeatureSize)
+        {
+            return TrajectoryBlockCostFixed<FeatureLayout::ReferenceTrajectoryFeatureSize>(
+                queryTrajectory, bakedTrajectory, trajectoryScale, spentPoseCost, pruneLimit);
+        }
         float trajectoryCost = 0.0f;
         for (int32 i = 0; i < trajectoryFeatureSize; i++)
         {
@@ -482,7 +524,7 @@ namespace
         return Math::Abs(sampleTime - settings.ExpectedTime) <= window;
     }
 
-    // Horizon rule: furthest future trajectory target from the schema. A non-loop
+    // S1 �18.6: furthest future trajectory target from the schema. A non-loop
     // sample whose future stencil reaches past the clip end baked a clamped
     // "stopped" future for playback; search must not rank it (see
     // MotionMatchingSampler::IsNonLoopFutureOutside). Loop clips return 0.
@@ -519,17 +561,17 @@ namespace
 
         // One scale pass per reference call: weight pipeline is O(dims) and
         // this path is used by the exact verifier/SampleCost only.
-        float stackPoseScale[PoseSearchSchema::GetPoseFeatureSize()];
-        float stackTrajectoryScale[PoseSearchSchema::GetTrajectoryFeatureSize()];
+        float stackPoseScale[FeatureLayout::MaxPoseFeatureSize];
+        float stackTrajectoryScale[FeatureLayout::MaxTrajectoryFeatureSize];
         Array<float> heapPoseScale, heapTrajectoryScale;
         float* poseScale = stackPoseScale;
         float* trajectoryScale = stackTrajectoryScale;
-        if (poseFeatureSize > PoseSearchSchema::GetPoseFeatureSize())
+        if (poseFeatureSize > FeatureLayout::MaxPoseFeatureSize)
         {
             heapPoseScale.Resize(poseFeatureSize);
             poseScale = heapPoseScale.Get();
         }
-        if (trajectoryFeatureSize > PoseSearchSchema::GetTrajectoryFeatureSize())
+        if (trajectoryFeatureSize > FeatureLayout::MaxTrajectoryFeatureSize)
         {
             heapTrajectoryScale.Resize(trajectoryFeatureSize);
             trajectoryScale = heapTrajectoryScale.Get();
@@ -583,7 +625,7 @@ namespace
 
     // Exact per-class minima over the tag+filter scope: full scan, no stride,
     // no pruning, raw pose+trajectory blocks only (no continuity, bias,
-    // preference or margin -- this is the tune surface for those terms, so it
+    // preference or margin � this is the tune surface for those terms, so it
     // must not contain them). Respects the loop filter (a filtered-out class
     // reports untouched init values) and tags; ignores lock, exclusion and
     // stride, which are playback concerns, not tune data. Costs ~one extra
@@ -597,7 +639,7 @@ namespace
         const Array<String>& allowedTags,
         const Array<String>& excludeTags,
         MotionLoopFilter loopFilter,
-        int32 oneShotBand,
+        int32 oneShotGroup,
         float& bestLoopCost,
         int32& bestLoopSample,
         int32& bestLoopClip,
@@ -626,7 +668,7 @@ namespace
 
         int32 cachedClip = -1;
         bool cachedLoop = false;
-        int32 cachedBand = 0;
+        int32 cachedGroup = 0;
         // Tags are per-clip; samples arrive clip-ordered, so resolve the
         // tag check once per clip instead of per sample. Empty include scope
         // AND empty exclude set disable the check outright.
@@ -641,7 +683,7 @@ namespace
             {
                 cachedClip = clipIndex;
                 cachedLoop = database.GetClipLoop(clipIndex);
-                cachedBand = database.GetClipSpeedBand(clipIndex);
+                cachedGroup = database.GetClipGroup(clipIndex);
                 const Array<String>& clipTags = database.GetClipTags(clipIndex);
                 cachedTagOk = !checkTags ||
                     (TagAllowed(allowedTags, clipTags) && !TagExcluded(excludeTags, clipTags));
@@ -650,8 +692,8 @@ namespace
                 continue;
             if (loopFilter == MotionLoopFilter::OneShotOnly && cachedLoop)
                 continue;
-            if (oneShotBand != 0 && !cachedLoop && cachedBand != 0 &&
-                cachedBand != oneShotBand)
+            if (oneShotGroup != 0 && !cachedLoop && cachedGroup != 0 &&
+                cachedGroup != oneShotGroup)
                 continue;
             if (!cachedTagOk)
                 continue;
@@ -694,7 +736,7 @@ namespace
 
     // Lightweight per-query readiness check. Full ValidateData() walks every
     // sample/tag array (62k samples in the GASP DB) and WaitForLoaded() blocks
-    // the game thread by default -- both are wrong on the 10 Hz hot path.
+    // the game thread by default � both are wrong on the 10 Hz hot path.
     // The editor self-test and bake still run full ValidateData().
     bool IsReadyForQuery(const MotionMatchingDatabase& database, String& error)
     {
@@ -760,7 +802,7 @@ namespace
         const float biasWindow = Math::Max(settings.ContinuingWindow, 0.0f);
         const float switchMargin = Math::Max(settings.SwitchMargin, 0.0f);
         const float loopPreference = Math::Max(settings.LoopPreference, 0.0f);
-        // Exclusion bans (all exclusion-only: they can never lower a
+        // Wave 1 UE-parity bans (all exclusion-only: they can never lower a
         // cost, so block pruning needs no extra headroom).
         const float twinBan = Math::Max(settings.TwinBanWindow, 0.0f);
         const float tailExclusion = Math::Max(settings.LoopTailExclusion, 0.0f);
@@ -769,7 +811,7 @@ namespace
         const float reselectWindow = Math::Max(settings.ReselectBanWindow, 0.0f);
         const Array<float>& clipLengths = database.GetClipLengths();
         const bool haveLengths = clipLengths.Count() == clipCount;
-        // Structural-validity rule: non-loop candidates whose future
+        // S1 �7.2/�18.6 structural validity: non-loop candidates whose future
         // stencil reaches past the clip end baked a clamped "stopped" future,
         // so exclude them from ranking. Structural, never a tunable; loop
         // clips are cycle-aware and unaffected.
@@ -779,7 +821,7 @@ namespace
         // subsets ((frame % stride) start) so full coverage completes over
         // `stride` frames instead of quantizing on a cadence. Deterministic:
         // the cursor rides settings.QueryFrame (policy frame counter, reset
-        // per play session). Continuation samples are exempt below -- the hold
+        // per play session). Continuation samples are exempt below � the hold
         // must survive every frame regardless of the cursor. (Rebuild tick.)
         const int32 queryFrame = settings.QueryFrame >= 0 ? settings.QueryFrame : 0;
         const int32 strideOffset = (stride > 1) ? (queryFrame % stride) : 0;
@@ -808,14 +850,14 @@ namespace
         bool cachedLoopFlag = false;
         bool cachedTagOk = true;
         float cachedTurnAngle = 0.0f;
-        int32 cachedSpeedBand = 0;
+        int32 cachedGroup = 0;
         // Start of the non-searchable tail for the cached clip (-1 = none).
         float cachedTailStart = -1.0f;
         const bool wantLoop = settings.LoopFilter == MotionLoopFilter::LoopOnly;
         const bool wantOneShot = settings.LoopFilter == MotionLoopFilter::OneShotOnly;
-        // Onset gait filter: restrict ONE-SHOTs to the intended band (loops
-        // never band-cut). 0 = Any.
-        const int32 oneShotBand = settings.OneShotBand;
+        // One-shot group filter: restrict ONE-SHOTs to the requested clip
+        // group (loops are never cut). 0 = any.
+        const int32 oneShotGroup = settings.OneShotGroup;
         // Scored-member counts per class (completed both blocks). Pruned
         // members never land here. Class MINIMA come from ComputeClassBests
         // (unpruned full scan), never from this loop.
@@ -832,7 +874,7 @@ namespace
                 cachedLoopClip = clipIndex;
                 cachedLoopFlag = database.GetClipLoop(clipIndex);
                 cachedTurnAngle = database.GetClipTurnAngle(clipIndex);
-                cachedSpeedBand = database.GetClipSpeedBand(clipIndex);
+                cachedGroup = database.GetClipGroup(clipIndex);
                 const Array<String>& clipTagSet = database.GetClipTags(clipIndex);
                 cachedTagOk = !checkTags || (TagAllowed(allowedTags, clipTagSet) && !TagExcluded(settings.ExcludeTags, clipTagSet));
                 // Loop-tail cutoff for this clip (non-loop only, runtime from
@@ -845,28 +887,28 @@ namespace
             }
             if ((wantLoop && !cachedLoopFlag) || (wantOneShot && cachedLoopFlag))
                 continue;
-            // Onset gait filter: one-shots outside the intended band never
-            // rank (at the onset instant the features carry almost no gait
-            // information, so walk/run starts would otherwise coin-flip).
-            if (oneShotBand != 0 && !cachedLoopFlag && cachedSpeedBand != 0 &&
-                cachedSpeedBand != oneShotBand)
+            // One-shot group filter: one-shots of another non-zero group
+            // never rank (the host uses it to keep onsets in the intended
+            // gait, where the features carry almost no gait information).
+            if (oneShotGroup != 0 && !cachedLoopFlag && cachedGroup != 0 &&
+                cachedGroup != oneShotGroup)
                 continue;
             if (lockSwitch && clipIndex != currentClipIndex)
                 continue;
             if (!cachedTagOk)
                 continue;
-            // Loop-tail non-searchable (tail exclusion):
+            // Loop-tail non-searchable (UE ExcludeFromDatabase (0,-0.3)):
             // end stances of one-shots can never re-win on exact pose match.
             if (cachedTailStart >= 0.0f && sampleTimes[sampleIndex] > cachedTailStart)
                 continue;
-            // Structural-validity rule: a non-loop future target outside [0, length] is
+            // S1 �7.2/�18.6: a non-loop future target outside [0, length] is
             // excluded (T1 helper), never ranked: the baked feature is a
             // clamped "stopped" future. Loop is unaffected (cycle-aware).
             if (excludeNonLoopTail && haveLengths &&
                 MotionMatchingSampler::IsNonLoopFutureOutside(
                     sampleTimes[sampleIndex], trajectoryHorizon, clipLengths[clipIndex], cachedLoopFlag))
                 continue;
-            // Reselect-history ban (reselect history): the recently
+            // Reselect-history ban (UE PoseReselectHistory): the recently
             // played (clip,sample) neighborhood cannot re-win. Kills A->B->A
             // chatter between near-twins; legitimate returns at another phase
             // (outside the window) still win fairly.
@@ -886,18 +928,18 @@ namespace
             if (stride > 1 && !isContinuation &&
                 (sampleIndex % stride) != strideOffset)
                 continue;
-            // Same-segment twin ban (twin-jump threshold): same-clip
+            // Same-segment twin ban (UE PoseJumpThresholdTime): same-clip
             // non-continuations just outside the continuation core (near-twin
             // frames of where playback is heading) are skipped. The true
             // continuation above stays exempt, so steady play-through is
-            // unaffected -- only hops to your own twin frames die.
+            // unaffected � only hops to your own twin frames die.
             if (useTimeTerms && twinBan > 0.0f && clipIndex == currentClipIndex && !isContinuation &&
                 TimeDistance(database, clipIndex, settings.ExpectedTime, sampleTimes[sampleIndex]) <= biasWindow + twinBan)
                 continue;
             // Temporal exclusion: same-clip samples too close in time to the
             // current playback position can never win. Without this, a query
             // every 0.1s reseeks to a nearby frame on the same clip (often the
-            // same phase +/-1 sample) and playback micro-stutters forever instead
+            // same phase �1 sample) and playback micro-stutters forever instead
             // of playing through. Real discontinuities (large jumps, clip
             // changes, end recovery) are outside the window and unaffected.
             if (useExclusion && clipIndex == currentClipIndex && !isContinuation)
@@ -922,7 +964,7 @@ namespace
             // Bias+margin+loop-aware pruning: a continuation's final cost can
             // dip below its block sum by up to bias, the switch margin lets it
             // win even when it is not top-2 on blocks alone, and loop clips
-            // gain up to loopPreference -- so those prune limits are raised by
+            // gain up to loopPreference � so those prune limits are raised by
             // exactly the applicable bonuses (see margin post-mortem: without
             // headroom an early exact winner drops secondBest near zero and
             // the arbitration never sees the candidates). Others keep tight.
@@ -931,7 +973,7 @@ namespace
                 (cachedLoopFlag && loopPreference > 0.0f ? loopPreference : 0.0f);
             const float* bakedPose = &poseFeatures[sampleIndex * poseFeatureSize];
             const float* bakedTrajectory = &trajectoryFeatures[sampleIndex * trajectoryFeatureSize];
-            // Shared terms: the pose block alone can already disqualify
+            // Shared terms (S1): the pose block alone can already disqualify
             // against the runner-up threshold because every remaining term is
             // non-negative except the bias/loop bonuses, whose headroom is in
             // pruneLimit above.
@@ -1038,7 +1080,7 @@ namespace
                 allowedTags,
                 settings.ExcludeTags,
                 settings.LoopFilter,
-                settings.OneShotBand,
+                settings.OneShotGroup,
                 result.BestLoopCost,
                 result.BestLoopSample,
                 result.BestLoopClip,
@@ -1119,14 +1161,14 @@ namespace
         const bool excludeNonLoopTail = settings.ExcludeNonLoopTail;
         const bool wantLoop = settings.LoopFilter == MotionLoopFilter::LoopOnly;
         const bool wantOneShot = settings.LoopFilter == MotionLoopFilter::OneShotOnly;
-        const int32 oneShotBand = settings.OneShotBand;
+        const int32 oneShotGroup = settings.OneShotGroup;
 
         // Retrieval: trajectory-coarse prefilter (replaces the 74-D tree
-        // query -- exact trees barely prune in high dimensions, measured 1.9x
+        // query � exact trees barely prune in high dimensions, measured 1.9x
         // only). Two cheap linear tiers over allowed-tag members:
         //   tier 1: exact pose+trajectory blocks with LIVE scales, per-tag
         //           top tier1Keep (same ordering as the rerank blocks, so no
-        //           signal is ever dropped early -- a trajectory-only tier was
+        //           signal is ever dropped early � a trajectory-only tier was
         //           tried and REGRESSED recall to 1.7% on flat trajectories);
         //   tier 2: global top retrieve ? unchanged full scoring loop below
         //           applies every filter + term. TopKCandidates keeps its
@@ -1229,7 +1271,7 @@ namespace
         }
         // Compact per-tag tops to the front (writes stay below reads: kept
         // totals never exceed the source range starts), then keep the global
-        // top retrieve by the already-exact block score -- no recompute.
+        // top retrieve by the already-exact block score � no recompute.
         int32 pooled = 0;
         for (int32 r = 0; r < rangeCount; r++)
         {
@@ -1302,7 +1344,7 @@ namespace
         int32 cachedLoopClip = -1;
         bool cachedLoopFlag = false;
         float cachedTurnAngle = 0.0f;
-        int32 cachedSpeedBand = 0;
+        int32 cachedGroup = 0;
         float cachedTailStart = -1.0f;
         // Tags resolve on the clip-change tick below (candidates arrive in
         // ascending sample order, still clip-grouped); empty scope skips it.
@@ -1322,7 +1364,7 @@ namespace
                 cachedLoopClip = clipIndex;
                 cachedLoopFlag = database.GetClipLoop(clipIndex);
                 cachedTurnAngle = database.GetClipTurnAngle(clipIndex);
-                cachedSpeedBand = database.GetClipSpeedBand(clipIndex);
+                cachedGroup = database.GetClipGroup(clipIndex);
                 const Array<String>& clipTagSet = database.GetClipTags(clipIndex);
                 cachedTagOk = !checkTags || (TagAllowed(allowedTags, clipTagSet) && !TagExcluded(settings.ExcludeTags, clipTagSet));
                 cachedTailStart = -1.0f;
@@ -1332,8 +1374,8 @@ namespace
             }
             if ((wantLoop && !cachedLoopFlag) || (wantOneShot && cachedLoopFlag))
                 continue;
-            if (oneShotBand != 0 && !cachedLoopFlag && cachedSpeedBand != 0 &&
-                cachedSpeedBand != oneShotBand)
+            if (oneShotGroup != 0 && !cachedLoopFlag && cachedGroup != 0 &&
+                cachedGroup != oneShotGroup)
                 continue;
             if (lockSwitch && clipIndex != currentClipIndex)
                 continue;
@@ -1457,7 +1499,7 @@ namespace
                 allowedTags,
                 settings.ExcludeTags,
                 settings.LoopFilter,
-                settings.OneShotBand,
+                settings.OneShotGroup,
                 result.BestLoopCost,
                 result.BestLoopSample,
                 result.BestLoopClip,
@@ -1495,7 +1537,7 @@ void MotionMatchingSearch::FindTopCandidates(
     if (!IsReadyForQuery(*database, error))
         return;
 
-    // Partition stats: build (or reuse) the tag-partition stats. Return value unused:
+    // Phase 0: build (or reuse) the tag-partition stats. Return value unused:
     // the hot pass still scans everything; this only counts + logs.
     (void)EnsureTagPartition(*database);
 
@@ -1523,18 +1565,18 @@ void MotionMatchingSearch::FindTopCandidates(
         }
     }
 
-    // Revision 3: raw query + one per-dim scale pass (same pipeline as FindBest).
-    float stackPoseScale[PoseSearchSchema::GetPoseFeatureSize()];
-    float stackTrajectoryScale[PoseSearchSchema::GetTrajectoryFeatureSize()];
+    // N1b: raw query + one per-dim scale pass (same pipeline as FindBest).
+    float stackPoseScale[FeatureLayout::MaxPoseFeatureSize];
+    float stackTrajectoryScale[FeatureLayout::MaxTrajectoryFeatureSize];
     Array<float> heapPoseScale, heapTrajectoryScale;
     float* poseScale = stackPoseScale;
     float* trajectoryScale = stackTrajectoryScale;
-    if (poseFeatureSize > PoseSearchSchema::GetPoseFeatureSize())
+    if (poseFeatureSize > FeatureLayout::MaxPoseFeatureSize)
     {
         heapPoseScale.Resize(poseFeatureSize);
         poseScale = heapPoseScale.Get();
     }
-    if (trajectoryFeatureSize > PoseSearchSchema::GetTrajectoryFeatureSize())
+    if (trajectoryFeatureSize > FeatureLayout::MaxTrajectoryFeatureSize)
     {
         heapTrajectoryScale.Resize(trajectoryFeatureSize);
         trajectoryScale = heapTrajectoryScale.Get();
@@ -1568,7 +1610,7 @@ void MotionMatchingSearch::FindTopCandidates(
     const float loopPreference = Math::Max(settings.LoopPreference, 0.0f);
     const bool wantLoop = settings.LoopFilter == MotionLoopFilter::LoopOnly;
     const bool wantOneShot = settings.LoopFilter == MotionLoopFilter::OneShotOnly;
-    // Same Exclusion bans as the hot pass (top-N must rank what runtime plays).
+    // Same Wave 1 bans as the hot pass (top-N must rank what runtime plays).
     const float twinBan = Math::Max(settings.TwinBanWindow, 0.0f);
     const float tailExclusion = Math::Max(settings.LoopTailExclusion, 0.0f);
     const bool useReselectBan = settings.ReselectClip >= 0 && settings.ReselectClip < clipCount &&
@@ -1576,17 +1618,17 @@ void MotionMatchingSearch::FindTopCandidates(
     const float reselectWindow = Math::Max(settings.ReselectBanWindow, 0.0f);
     const Array<float>& clipLengths = database->GetClipLengths();
     const bool haveLengths = clipLengths.Count() == clipCount;
-    // Same structural-validity cut as the hot pass: top-N must
+    // Same structural validity cut as the hot pass (S1 �7.2/�18.6): top-N must
     // rank what runtime could actually play, so a non-loop clamped-future
     // candidate is excluded here too.
     const float trajectoryHorizon = GetTrajectoryHorizon(*database);
     const bool excludeNonLoopTail = settings.ExcludeNonLoopTail;
-    const int32 oneShotBand = settings.OneShotBand;
+    const int32 oneShotGroup = settings.OneShotGroup;
 
     int32 cachedLoopClip = -1;
     bool cachedLoopFlag = false;
     float cachedTurnAngle = 0.0f;
-    int32 cachedSpeedBand = 0;
+    int32 cachedGroup = 0;
     float cachedTailStart = -1.0f;
     // Tooling path too: tags resolve once per clip, not per sample.
     const bool checkTags = !allowedTags.IsEmpty();
@@ -1601,7 +1643,7 @@ void MotionMatchingSearch::FindTopCandidates(
             cachedLoopClip = clipIndex;
             cachedLoopFlag = database->GetClipLoop(clipIndex);
             cachedTurnAngle = database->GetClipTurnAngle(clipIndex);
-            cachedSpeedBand = database->GetClipSpeedBand(clipIndex);
+            cachedGroup = database->GetClipGroup(clipIndex);
             const Array<String>& clipTagSet = database->GetClipTags(clipIndex);
             cachedTagOk = !checkTags || (TagAllowed(allowedTags, clipTagSet) && !TagExcluded(settings.ExcludeTags, clipTagSet));
             cachedTailStart = -1.0f;
@@ -1611,8 +1653,8 @@ void MotionMatchingSearch::FindTopCandidates(
         }
         if ((wantLoop && !cachedLoopFlag) || (wantOneShot && cachedLoopFlag))
             continue;
-        if (oneShotBand != 0 && !cachedLoopFlag && cachedSpeedBand != 0 &&
-            cachedSpeedBand != oneShotBand)
+        if (oneShotGroup != 0 && !cachedLoopFlag && cachedGroup != 0 &&
+            cachedGroup != oneShotGroup)
             continue;
         if (!cachedTagOk)
             continue;
@@ -1716,7 +1758,7 @@ void MotionMatchingSearch::FindBest(
     if (!IsReadyForQuery(*database, error))
         return;
 
-    // Index bootstrap: tag-partition stats + per-tag KD-trees (built once per DB).
+    // Phase 0+1: tag-partition stats + per-tag KD-trees (built once per DB).
     const TagPartitionCache& partition = EnsureTagPartition(*database);
 
     const int32 poseFeatureSize = database->GetPoseFeatureSize();
@@ -1779,22 +1821,22 @@ void MotionMatchingSearch::FindBest(
     const bool hasCurrent = currentClipIndex >= 0 && currentClipIndex < clipCount;
     const bool lockSwitch = hasCurrent && timeSinceSwitch < settings.MinSwitchTime;
 
-    // Revision 3: the query stays raw. Build one per-dim scale array
+    // N1b rev 3: the query stays raw. Build one per-dim scale array
     // (sqrt(sum-normalized weight)/deviation) ONCE; the hot loop then squares
     // scale*(raw query - raw baked). Fixed stack caps cover the v3 layout
     // (44 + 30); larger future schemas fall back to heap. Shared with the
     // top-N/tooling path.
-    float stackPoseScale[PoseSearchSchema::GetPoseFeatureSize()];
-    float stackTrajectoryScale[PoseSearchSchema::GetTrajectoryFeatureSize()];
+    float stackPoseScale[FeatureLayout::MaxPoseFeatureSize];
+    float stackTrajectoryScale[FeatureLayout::MaxTrajectoryFeatureSize];
     Array<float> heapPoseScale, heapTrajectoryScale;
     float* poseScale = stackPoseScale;
     float* trajectoryScale = stackTrajectoryScale;
-    if (poseFeatureSize > PoseSearchSchema::GetPoseFeatureSize())
+    if (poseFeatureSize > FeatureLayout::MaxPoseFeatureSize)
     {
         heapPoseScale.Resize(poseFeatureSize);
         poseScale = heapPoseScale.Get();
     }
-    if (trajectoryFeatureSize > PoseSearchSchema::GetTrajectoryFeatureSize())
+    if (trajectoryFeatureSize > FeatureLayout::MaxTrajectoryFeatureSize)
     {
         heapTrajectoryScale.Resize(trajectoryFeatureSize);
         trajectoryScale = heapTrajectoryScale.Get();
@@ -1803,10 +1845,10 @@ void MotionMatchingSearch::FindBest(
     const float* rawPose = queryPose.Get();
     const float* rawTrajectory = queryTrajectory.Get();
 
-    // Indexed retrieval: indexed retrieval + exact rerank behind a default-off flag.
+    // Phase 1: indexed retrieval + exact rerank behind a default-off flag.
     // Falls back to the brute-force reference whenever it cannot score a
     // valid winner (missing tag tree, filters exhausting top-K, ...).
-    // Verify: with VerifyIndexedSearch the reference ALSO runs, divergence
+    // Phase 2: with VerifyIndexedSearch the reference ALSO runs, divergence
     // is counted to the log, and the BRUTE-FORCE winner is kept (behavior
     // unchanged during verify).
     MotionMatchingResult indexedResult;
@@ -1940,11 +1982,10 @@ bool MotionMatchingSearch::SampleCost(
         }
     }
 
-    // Term parity: the fast-path estimate uses the same FullSampleCost term
+    // S1 term parity: the fast-path estimate uses the same FullSampleCost term
     // definitions as the hot pass, with no playback context (continuity/loop
     // disabled exactly as before: raw pose + trajectory + straightness).
-    // turn prior weights ride explicit params (trace-recorded tuning).
-    // foot-lock prior deleted (was zero here too).
+    // Turn prior weights ride explicit params (trace-recorded tuning).
     MotionMatchingSearchSettings costSettings;
     costSettings.PoseWeight = poseWeight;
     costSettings.TrajectoryWeight = trajectoryWeight;
@@ -1957,14 +1998,14 @@ bool MotionMatchingSearch::SampleCost(
     costSettings.ContinuingBias = 0.0f;
     costSettings.LoopPreference = 0.0f;
 
-    // Revision 3: raw query; FullSampleCost builds its own scale pass.
+    // N1b rev 3: raw query; FullSampleCost builds its own scale pass.
     cost = FullSampleCost(
         *database, costSettings, queryPose.Get(), queryTrajectory.Get(),
         -1, sampleIndex, applyTurnPenalty);
     return true;
 }
 
-// RunSelfTest implementation moved to MotionMatchingSearch.SelfTest.cpp
-// (editor-only, #if USE_EDITOR guarded header + impl). Game Release contains
-// no self-test code or strings. This translation unit keeps only the live
+// RunSelfTest lives in MotionMatchingSearch.SelfTest.cpp (editor-only,
+// #if USE_EDITOR guarded header + impl). Release builds contain no self-test
+// code or strings. This translation unit keeps only the live
 // search (FindBest/SampleCost/FindTopCandidates + indexed/scratch/verify).

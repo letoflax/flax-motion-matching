@@ -18,8 +18,8 @@ disabled and produces an actionable log.
 
 The host owns the tick order: update provider state, build the frame, call
 `Update`, read observations/base pose, then apply host-owned pose passes. The
-controller samples the base/search pose, builds trajectory data, runs the
-continuation fast path or a full search, and advances playback.
+controller samples the base/search pose, runs the continuation fast path or a
+full search over the trajectory the host supplied, and advances playback.
 
 ## Reset and discontinuity
 
@@ -32,10 +32,12 @@ controller.ResetPlayback();
 
 `ResetPlayback` clears trajectory/chooser history while preserving the current
 playback clip and pose continuity. The next real query is a zero-velocity
-reseed and is forced to `LoopOnly`; see the neutral invariant in
-PLUGIN_CONTRACT.md. It does not require a transform argument. The runtime
-also detects a large unannounced actor displacement and applies the same
-structural reset.
+reseed and is forced to `LoopOnly` for as long as the frame's
+`HoldReseedFilter` is true (the host sets it while its own motion state is
+still settling), and for that first scan at least; see the neutral invariant in
+`PLUGIN_CONTRACT.md`. It does not require a transform argument. The runtime
+also detects an actor displacement larger than the `TeleportDistance` tuning
+value and applies the same structural reset.
 
 ## Rebind
 

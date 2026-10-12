@@ -1,6 +1,3 @@
-// MotionMatchingSearch.h: pose search backends (MotionMatchingSearch::FindBest/SampleCost/FindTopCandidates/RunSelfTest).
-// Ownership: plugin runtime, no game/host references.
-// Key invariants: the brute-force pass is the reference backend (strictly-less comparison keeps ties on the lowest sample index); the indexed path retrieves top-K then exact-reranks with the same term helpers and falls back on any miss; SampleCost scores one baked sample with the hot-pass model for the policy continuation check; FindTopCandidates reports the unpruned raw cost landscape for tooling.
 #pragma once
 
 #include "Engine/Core/Collections/Array.h"
@@ -10,7 +7,7 @@
 class MotionMatchingDatabase;
 
 /// <summary>
-/// Brute-force pose search over the baked database.
+/// Brute-force pose search over the baked database (plan Milestone 2).
 /// This is the reference backend: every future index (KD/ANN/learned) must
 /// reproduce its winners. Deterministic by construction — ties break toward
 /// the lowest sample index via strictly-less comparison, so a captured query
@@ -24,7 +21,7 @@ class MOTIONMATCHING_API MotionMatchingSearch
 public:
     /// <summary>
     /// Finds the lowest-cost sample for raw (unnormalized) query features.
-    /// Applies the per-dimension weight pipeline (sqrt of sum-normalized per-dim weight
+    /// Applies the N1b weight pipeline (sqrt of sum-normalized per-dim weight
     /// divided by the stored deviation) to the raw query vs raw baked values,
     /// an optional tag filter, a clip-change continuity penalty and a minimum
     /// switch lock. Early-exits blocks once the partial cost exceeds the best.
@@ -53,7 +50,7 @@ public:
 
     /// <summary>
     /// Editor-only self-test without playback: rebuilds raw queries from
-    /// baked samples (a straight copy, since the database stores raw values) and
+    /// baked samples (a straight copy, since rev-3 stores raw values) and
     /// requires the search to return the source sample with ~zero cost.
     /// Proves the weight pipeline, cost math and tie-breaks.
     /// Guarded by USE_EDITOR (verified Flax 1.12 macro: Engine/Core/Config.h
@@ -71,12 +68,12 @@ public:
 #endif
 
     /// <summary>
-    /// Continuing fast-path: raw cost of ONE baked sample
+    /// Phase 3 UE-parity continuing fast-path: raw cost of ONE baked sample
     /// (same model as the hot pass: pose + trajectory blocks with the given
     /// weights plus the straightness prior, no continuity/loop terms). The
     /// policy scores the expected next sample of the playing clip every tick
     /// and skips the full scan while it stays within threshold.
-    /// Turn-prior weights ride explicit params (provider tuning, trace-
+    /// Turn prior weights ride explicit params (host tuning, trace-
     /// recorded); callers pass them verbatim, never literals.
     /// </summary>
     /// <returns>False with an actionable error on bad database, sizes or index.</returns>
@@ -96,7 +93,7 @@ public:
         API_PARAM(Out) String& error);
 
     /// <summary>
-    /// Diagnostics: exact top-N cost ranking for one query (tuning panel,
+    /// M6 diagnostics: exact top-N cost ranking for one query (tuning panel,
     /// trace analysis). Same filters and final-cost model as the hot pass
     /// (tags, loop filter, temporal exclusion, continuation bias, loop
     /// preference) but NO pruning, NO stride, NO continuity lock and NO

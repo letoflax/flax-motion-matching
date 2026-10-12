@@ -7,18 +7,12 @@ namespace MotionMatching;
 /// <summary>
 /// Scene-detached runtime for the native motion-matching system.
 ///
-/// Purpose: own the animation database, the native policy/playback session
-/// lifecycle, and core-only search tuning.
-/// Ownership: plugin runtime object. The host facade owns this object, feeds
-/// it a prebuilt <see cref="MotionMatchingFrameInput"/> every tick (it calls
-/// the provider's BuildInput itself) and drives the overlay post-pass + pose
-/// write.
-/// Tick/lifecycle role: Initialize loads the database; Update runs one
-/// policy + playback tick; Shutdown releases the native session while this
-/// object stays reusable. Everything locomotion (gait scope, trajectory
-/// prediction, gait speeds) arrives through the frame argument.
-/// This file must never reference game/player/sample types or host drivers
-/// (player state, coordinators, automation, overlays): those live host-side.
+/// Plain C# class, zero scene presence. The host owns this object, feeds it a
+/// prebuilt <see cref="MotionMatchingFrameInput"/> every tick and does its own
+/// post-pass and pose write. This class owns the database, policy/playback
+/// lifecycle and core-only tuning. Everything locomotion (gait scope,
+/// trajectory prediction, gait speeds) arrives through the frame argument.
+/// This file must never reference host types.
 /// </summary>
 public class MotionMatchingController : IDisposable
 {
@@ -43,18 +37,21 @@ public class MotionMatchingController : IDisposable
 
     public int[] AnimationClipCountsByTag = Array.Empty<int>();
 
-    // Host-assigned session config (set by the host facade — this class
-    // never reads host automation itself).
-    public string CacheFolder = string.Empty;
-    public bool TelemetryOverride = false;
-    public bool IndexedVerifyAuto = false;
-    // Trace override for test runs: replay trace stays on even when the
-    // telemetry file is off, so on/off search equivalence can be proven by
-    // comparing winners. Normal play (no flags) leaves both false → no
-    // per-query allocations beyond the fixed rings.
-    public bool TraceOverride = false;
+    // Diagnostics (debug only, off by default): records every query into the
+    // bounded trace ring (Trace) and collects per-class search diagnostics.
+    // Never changes which clip wins. Export the trace with Trace.ExportJson /
+    // ExportCsv to a path the host chooses.
+    public bool Diagnostics = false;
 
     public AnimatedModel CharacterBody;
+
+    // Explicit opt-out of the bind-time checks (debug only). By default a
+    // database whose baked schema or skeleton fingerprint does not fit the
+    // CharacterBody model is refused: the controller stays not ready and
+    // BindingReport names the cause and the fix (Schema.BoneAliases for
+    // renamed bones, offline retarget for other proportions). True binds
+    // anyway and logs a warning instead.
+    public bool AllowBindingMismatch = false;
 
     public float QueryInterval = 0.1f;
 
@@ -65,12 +62,12 @@ public class MotionMatchingController : IDisposable
     // unstrided — same total CPU as cadence, minimal worst-case latency.
     public bool SearchEveryFrame = true;
 
-    // Database samples scored per full scan (rotating stride covers the rest over
+    // Samples scored per full scan (rotating stride covers the rest over
     // following frames). 12000 ≈ 1ms on the reference machine. 0 = unstrided.
     public int FrameSearchBudget = 12000;
 
-    // Indexed path is live by default (earlier audit: 0.33%
-    // same-clip-twin divergence, suite parity gate below).
+    // Phase 3 (KDTREE_PLAN.md): indexed path is live by default (phase-2
+    // audit: 0.33% same-clip-twin divergence, suite parity gate below).
     // Brute force stays as fallback + permanent verify harness.
     public bool UseIndexedSearch = true;
 
@@ -78,18 +75,12 @@ public class MotionMatchingController : IDisposable
     // 2026-09-14: sub-1ms scans, 0/1500 verify divergence, 12/12 suite).
     public int TopKCandidates = 16;
 
-    // Run brute force alongside the indexed path, count divergences, keep
-    // the brute-force winner. Permanent debug harness.
+    // Phase 2 (KDTREE_PLAN.md): run brute force alongside the indexed path,
+    // count divergences, keep the brute-force winner. Permanent debug harness.
     public bool VerifyIndexedSearch = false;
 
-    // Foot-IK solving lives host-side (single-publish pipeline through the
-    // host facade); the core keeps only search contact features (bake +
-    // query), which are untouched.
-
-    // NOTE: layer decisions (procedural angle, bone gate) live host-side
-    // now (post-pass in the host facade): the provider snapshot still
-    // carries the host-authored angle/gate for the host pass, but nothing
-    // is forwarded into the core anymore.
+    // The plugin does no foot IK or pose layering: the host owns the post-pass.
+    // Contact features (bake + query) are search inputs only.
 
     // Switch penalty added to any different-clip winner (continuity block).
     // Rev-3 cost units (N1b shrank dissimilarity ~100x): 0.0025 restores the
@@ -110,24 +101,13 @@ public class MotionMatchingController : IDisposable
 
     public float SwitchMargin = 0.008f;
 
-    // Onset/fair-fight accumulation lives in the host selection policy,
-    // which passes only the resulting filter per tick. Previously tuned
-    // values are preserved host-side (40/0.25).
-
-    // Heuristic thresholds below were hardcoded constants: exposed live so
-    // tuning moves numbers instead of code. No rebake needed. (The old
-    // settle-delay branch is deleted; settle is owned by the host policy.)
+    // Heuristic thresholds below are exposed live so tuning moves numbers
+    // instead of code. No rebake needed. Onset and settle decisions belong to
+    // the host, which passes only the resulting filter per tick.
 
     public float SameClipExclusion = 0.25f;
 
     public float SameClipSeekThreshold = 0.25f;
-
-    // Turn-driver config moved to the host facade (turn angle / lookahead /
-    // settle rate / patient angle / patient time). The native turn machine
-    // is deleted and never reads these; the host-side turn driver is the
-    // only reader. TurnMinSwitchTime died with them: it was never pushed
-    // into the native tuning (no reader in the native headers) and no
-    // driver reads it.
 
     // Cost fuse: a switched winner above this is treated as a corrupted query
     // (observed: single-query pose spike mid steady walk, self-heals next
@@ -135,25 +115,43 @@ public class MotionMatchingController : IDisposable
     // peak ~0.9 measured, so 2.0 keeps headroom without ever firing legally.
     public float CostFuseThreshold = 2.0f;
 
-    // Straightness prior (was hardcoded 0.03/4.0 in MotionMatchingSearch):
-    // host-owned tuning, values preserved from the calibration. Recorded in
-    // the trace so brute-force, indexed and replay share one formula.
+    // Straightness prior: host-owned tuning. Recorded in the trace so
+    // brute-force, indexed and replay share one formula.
     public float TurnPenaltyWeight = 0.03f;
     public float TurnPenaltyYawScale = 4.0f;
+
+    // Speed matching: clip time bends toward FrameInput.TargetSpeed within
+    // [PlayRateMin, PlayRateMax]; off at or below PlayRateMinSpeed.
+    public float PlayRateMin = 0.85f;
+    public float PlayRateMax = 1.15f;
+    public float PlayRateMinSpeed = 10.0f;
+
+    // Structural limits of the search policy (world units follow the rig).
+    // Actor displacement per tick treated as a teleport and reseeded.
+    public float TeleportDistance = 2000.0f;
+    // Seconds after init or reseed before searches start.
+    public float WarmupTime = 0.5f;
+    // Continuation hold: seconds, and minimum frame cap (scaled for high fps).
+    public float FastPathMaxAge = 0.5f;
+    public int FastPathMaxFrames = 5;
+    // A just-left clip cannot win again for ReselectBanHistory seconds (0 =
+    // off); ReselectBanWindow is the clip-time half-width of the ban.
+    public float ReselectBanHistory = 0.6f;
+    public float ReselectBanWindow = 0.35f;
+    // Samples this close (seconds) to the playing pose of the same clip.
+    public float SameSegmentTwinBan = 0.25f;
+    // Seconds at the end of non-loop clips excluded from search (0 = off).
+    public float LoopTailExclusion = 0.0f;
+
+    // Largest skeleton (bone count) the zero-allocation pose read accepts.
+    public const int MaxPoseBones = 512;
 
     // Inertialization decay time (replaces linear-crossfade BlendDuration;
     // single path, no parallel blend modes).
     public float InertializationDuration = 0.25f;
 
-    public bool TelemetryLog = false;
-
-    // Effective switch: the host field above never changes at runtime —
-    // the host flips TelemetryOverride (e.g. from file-driven automation),
-    // so the scene is never dirtied by a play session.
-    public bool EffectiveTelemetry => TelemetryLog || TelemetryOverride;
-
-    // Telemetry mirrors (getters: written only by Update below, read by the
-    // game facade / editor service / bridge).
+    // Observation mirrors (written only by Update below, read by the host,
+    // editor service and tools).
     public string PolicyState { get; private set; } = "Disabled";
     public int WinnerSample { get; private set; } = -1;
     public int WinnerClip { get; private set; } = -1;
@@ -169,10 +167,6 @@ public class MotionMatchingController : IDisposable
     public float LastQueryMs { get; private set; }
     public string ActiveTag { get; private set; } = string.Empty;
 
-    // Turn-driver activity/yaw mirrors were deleted with the native turn
-    // machine. Committed-turn facing is owned host-side (facade driver
-    // facing); the core never steers facing anymore.
-
     public bool WinnerIsLoop { get; private set; }
     public float LoopPreferenceApplied { get; private set; }
     public float BestLoopCost { get; private set; } = float.MaxValue;
@@ -186,36 +180,38 @@ public class MotionMatchingController : IDisposable
     public string LastSwitchReason { get; private set; } = string.Empty;
     public string ChooserStatus { get; private set; } = string.Empty;
     public int TraceEntries { get; private set; }
-    // Additive profiling mirrors (record-only; copied from the native
-    // policy after each Update, never steer anything).
-    // LastTelemetryMs measures bounded-ring enqueue (ns), not file I/O —
-    // Tick never does file I/O; FlushTelemetry (explicit, session end) is
-    // the only file writer. TelemetryCount/Dropped mirror the ring.
+    // Profiling mirrors (record-only; copied from the native policy after
+    // each Update, never steer anything).
     public float LastTickMs { get; private set; }
     public float LastFastPathMs { get; private set; }
-    public float LastTelemetryMs { get; private set; }
     public int TickCount { get; private set; }
     public int FullSearchCount { get; private set; }
     public float TotalTickMs { get; private set; }
     public float TotalFullSearchMs { get; private set; }
     public float TotalFastPathMs { get; private set; }
-    public float TotalTelemetryMs { get; private set; }
-    public int TelemetryCount { get; private set; }
-    public int TelemetryDropped { get; private set; }
 
-    // Machine/overlay/IK telemetry was deleted with their producers
-    // (HoldCount, TurnReplayCount, SettleCount, RecoveryCount, JumpCount,
-    // LayerAngle/Primary/Secondary/GateApplied, FootLockL/R, FootCorrL/R).
-    // Search telemetry above (switches, seeks, query ms, fast path) stays.
     public int FastPathHits { get; private set; }
 
+    // Result of the last bind attempt (native bind-time checks). Kept after
+    // a refused binding so hosts and tools can show why.
+    public string BindingReport { get; private set; } = string.Empty;
+
     private MotionMatchingRuntimePolicy _policy;
-    private bool _telemetryWarned;
+    private bool _diagnosticsWarned;
     private MotionMatchingDatabase _boundDatabase;
     private AnimatedModel _boundBody;
     private SkinnedModel _boundModel;
     private PoseSearchSchema _boundSchema;
     private string _loadedDatabaseFile = string.Empty;
+    // Refused-binding latch: the native policy logs the refusal once; the
+    // controller retries only when the database, body, model, schema or the
+    // opt-out changes (or after RefreshDatabaseStatus/Shutdown).
+    private bool _bindRefused;
+    private MotionMatchingDatabase _refusedDatabase;
+    private AnimatedModel _refusedBody;
+    private SkinnedModel _refusedModel;
+    private PoseSearchSchema _refusedSchema;
+    private bool _refusedAllowMismatch;
 
     public float[] TrajectorySampleTimes
     {
@@ -253,16 +249,15 @@ public class MotionMatchingController : IDisposable
     }
 
     /// <summary>
-    /// Live playback handle for game-side integrations (e.g. pose overlays
-    /// attach here). Null until the first update initializes the policy.
+    /// Live playback handle for host integrations. Null until the first update initializes the policy.
     /// Borrowed handle: reacquire after every rebind/shutdown; never destroy it.
     /// </summary>
     public MotionMatchingPlayback Playback => IsReady ? _policy.GetPlayback() : null;
 
     /// <summary>
-    /// Publishes the existing search-pose path without touching Update.
-    /// Returns the playback's current search locals plus the current winner
-    /// (false + defaults when the policy is not ready).
+    /// Additive-only: publish the existing search-pose path without
+    /// touching Update. Returns the playback's current search locals plus the
+    /// current winner (false + defaults when the policy is not ready).
     /// </summary>
     public bool TryGetBasePose(out Matrix[] locals, out int winnerClip, out float winnerCost)
     {
@@ -302,7 +297,7 @@ public class MotionMatchingController : IDisposable
         if (playback == null)
             return false;
         int n = playback.GetSearchLocalsCount();
-        if (n <= 0 || n > 512 || buffer.Length != n)
+        if (n <= 0 || n > MaxPoseBones || buffer.Length != n)
             return false;
         for (int i = 0; i < n; i++)
         {
@@ -315,86 +310,12 @@ public class MotionMatchingController : IDisposable
     }
 
     /// <summary>
-    /// Single authoritative force-clip hatch (the only hatch besides the
-    /// search-winner Plays inside the native RunQuery). Forwards to the
-    /// native policy ForcePlayClip, which synchronizes playback clip/time,
-    /// policy current clip/time, continuity baseline, fast-path
-    /// invalidation, inertial state, telemetry reason and the trace command
-    /// entry in one call. Search resumes immediately on the next tick with
-    /// the caller filter (no hold). Logs the reason on EVERY call.
-    /// No production callers yet; host drivers are the intended callers.
+    /// Explicit audit command: writes the per-clip travel/turn/speed table
+    /// to <paramref name="filePath"/>. Static native export: runs in edit
+    /// mode with no play/policy instance. Runtime init/play never scans the
+    /// database or writes files.
     /// </summary>
-    public void ForcePlayClip(int clipIndex, float startTime, string reason)
-    {
-        string safeReason = reason ?? string.Empty;
-        Debug.Log("MotionMatchingController.ForcePlayClip: clip=" + clipIndex
-            + " startTime=" + startTime + " reason=" + safeReason);
-        if (!IsReady)
-            return;
-        try
-        {
-            _policy.ForcePlayClip(clipIndex, startTime, safeReason);
-        }
-        catch
-        {
-            // The force-clip command itself must never throw to drivers.
-        }
-    }
-
-    /// <summary>
-    /// Explicit telemetry flush (the ONLY writer of MMTelemetry.jsonl).
-    /// Formats the bounded native ring as JSONL + writes the file. Host
-    /// session-end only (export path), never per-tick. Returns false with a
-    /// visible error when the ring is empty, the cache folder is unset, or
-    /// the file cannot be written. Overwritten drops are counted in
-    /// TelemetryDropped.
-    /// </summary>
-    public bool FlushTelemetry(out string error)
-    {
-        error = string.Empty;
-        if (!IsReady)
-        {
-            error = "Telemetry flush stopped: policy is not ready.";
-            return false;
-        }
-        try
-        {
-            return _policy.FlushTelemetry(out error);
-        }
-        catch (System.Exception ex)
-        {
-            error = "Telemetry flush stopped: " + ex.Message;
-            return false;
-        }
-    }
-
-    /// <summary>
-    /// Explicit telemetry clear (no file deletion: init never touches
-    /// MMTelemetry.jsonl; tools read whatever the last flush left behind).
-    /// Resets the ring head/count/dropped to the bounded disabled state.
-    /// </summary>
-    public void ClearTelemetry()
-    {
-        ReleaseStaleBinding();
-        if (_policy == null)
-            return;
-        try
-        {
-            _policy.ClearTelemetry();
-        }
-        catch
-        {
-        }
-    }
-
-    /// <summary>
-    /// Explicit audit command (the ONLY writer of MMClipAudit.txt).
-    /// Static native export: runs in edit mode with no play/policy instance.
-    /// Runtime init/play never scans the database or writes the file — call
-    /// this from the editor service / bridge clip_audit op when tools need
-    /// per-clip travel/turn/speed data.
-    /// </summary>
-    public bool GenerateClipAudit(out string error)
+    public bool GenerateClipAudit(string filePath, out string error)
     {
         error = string.Empty;
         if (Database == null || !Database.IsBaked)
@@ -405,7 +326,7 @@ public class MotionMatchingController : IDisposable
         try
         {
             return MotionMatchingRuntimePolicy.ExportClipAudit(
-                Database, CacheFolder ?? string.Empty, Schema.SampleRate, out error);
+                Database, filePath ?? string.Empty, Schema.SampleRate, out error);
         }
         catch (System.Exception ex)
         {
@@ -415,7 +336,7 @@ public class MotionMatchingController : IDisposable
     }
 
     /// <summary>
-    /// Explicit init (replaces the Script OnEnable): the host facade
+    /// Explicit init (replaces the Script OnEnable): the game facade
     /// assigns Schema/PlayerModel/DatabasePath/CharacterBody + session
     /// config first, then calls this. Content.Load works outside Scripts —
     /// Globals remain usable here.
@@ -433,7 +354,7 @@ public class MotionMatchingController : IDisposable
     /// <summary>
     /// Releases the owned native policy, playback and trace immediately, then
     /// schedules destruction of the policy object. Idempotent; call on the
-    /// Flax main thread on host disable/destroy. Export traces/telemetry first.
+    /// Flax main thread on host disable/destroy. Export the trace first.
     /// Configuration and host-owned assets are retained for editor tooling and
     /// reuse: a subsequent Update starts a fresh session without requiring Initialize.
     /// Previously borrowed Playback/Trace handles are invalid after this call.
@@ -448,7 +369,11 @@ public class MotionMatchingController : IDisposable
         _boundSchema = default;
         _sampleTimesDb = null;
         _sampleTimesCache = Array.Empty<float>();
-        _telemetryWarned = false;
+        _bindRefused = false;
+        _refusedDatabase = null;
+        _refusedBody = null;
+        _refusedModel = null;
+        _refusedSchema = default;
         ResetRuntimeStatus();
         if (policy)
         {
@@ -503,18 +428,14 @@ public class MotionMatchingController : IDisposable
         WinnerIsLoop = false;
         SwitchCount = SeekCount = LoopScoredCount = OneShotScoredCount = 0;
         LoopTotalCount = OneShotTotalCount = TraceEntries = FastPathHits = 0;
-        LastQueryMs = LastTickMs = LastFastPathMs = LastTelemetryMs = 0.0f;
-        TickCount = FullSearchCount = TelemetryCount = TelemetryDropped = 0;
-        TotalTickMs = TotalFullSearchMs = TotalFastPathMs = TotalTelemetryMs = 0.0f;
+        LastQueryMs = LastTickMs = LastFastPathMs = 0.0f;
+        TickCount = FullSearchCount = 0;
+        TotalTickMs = TotalFullSearchMs = TotalFastPathMs = 0.0f;
     }
 
-    // Note: the old scope reflection-compat shim for the legacy native
-    // scope gate is deleted (the native headers no longer carry it).
-
     /// <summary>
-    /// Clears native playback state. The host facade resets its provider
-    /// (scope + predictor) and drivers separately — this class no longer
-    /// owns any provider reference. Call after teleport/respawn.
+    /// Clears native playback state. The host resets its own scope and
+    /// predictor state separately. Call after teleport/respawn.
     /// </summary>
     public void ResetPlayback()
     {
@@ -523,7 +444,7 @@ public class MotionMatchingController : IDisposable
     }
 
     /// <summary>
-    /// Policy + playback tick. The host facade builds the provider frame
+    /// Policy + playback tick. The game facade builds the provider frame
     /// itself (provider.BuildInput) and passes it in with the actor world
     /// transform — this class never calls a provider. Loads the database on
     /// first tick if Initialize found none.
@@ -539,50 +460,49 @@ public class MotionMatchingController : IDisposable
             EnsureDatabaseLoadedForGame();
             if (!Database || !Database.IsBaked || !CharacterBody.SkinnedModel)
                 return;
+            if (_bindRefused &&
+                ReferenceEquals(Database, _refusedDatabase) &&
+                ReferenceEquals(CharacterBody, _refusedBody) &&
+                ReferenceEquals(CharacterBody.SkinnedModel, _refusedModel) &&
+                AllowBindingMismatch == _refusedAllowMismatch &&
+                SchemaBindingEquals(Schema, _refusedSchema))
+                return;
             _policy = new MotionMatchingRuntimePolicy();
-            // No file deletion in init/update (the offline gate forbids file
-            // deletion on the core path). The native Initialize clears the
-            // bounded telemetry ring to the disabled state; FlushTelemetry
-            // (explicit, session end) is the only file writer. Tools read
-            // whatever the last flush left behind — init never touches
-            // MMTelemetry.jsonl.
-            _policy.Initialize(Database, CharacterBody, Schema,
-                CacheFolder ?? string.Empty, InertializationDuration);
+            _policy.Initialize(Database, CharacterBody, Schema, InertializationDuration, AllowBindingMismatch);
+            string report = _policy.BindingReport ?? string.Empty;
             if (!_policy.IsReady)
             {
                 Shutdown();
+                BindingReport = report;
+                _bindRefused = true;
+                _refusedDatabase = Database;
+                _refusedBody = CharacterBody;
+                _refusedModel = CharacterBody.SkinnedModel;
+                _refusedSchema = SnapshotSchema(Schema);
+                _refusedAllowMismatch = AllowBindingMismatch;
                 return;
             }
+            BindingReport = report;
             _boundDatabase = Database;
             _boundBody = CharacterBody;
             _boundModel = CharacterBody.SkinnedModel;
-            _boundSchema = Schema;
-            // Snapshot array contents too: hosts can edit sample times in place.
-            _boundSchema.TrajectorySampleTimes = Schema.TrajectorySampleTimes != null
-                ? (float[])Schema.TrajectorySampleTimes.Clone() : Array.Empty<float>();
+            // Snapshot array contents too: hosts can edit arrays in place.
+            _boundSchema = SnapshotSchema(Schema);
         }
         if (!_policy.IsReady)
             return;
 
-        // Debug-only trace gate with a visible warning: the host
-        // TelemetryLog field is never written at runtime; the host flips
-        // only TelemetryOverride above.
-        // Trace stays on for test runs (TraceOverride) even when the
-        // telemetry file is off, so on/off search equivalence can be proven
-        // by comparing trace winners. Normal play (no flags) leaves both
-        // false → no per-query allocations beyond the fixed rings.
         if (_policy.GetTrace() != null)
-            _policy.GetTrace().Enabled = EffectiveTelemetry || TraceOverride;
-        if (EffectiveTelemetry && !_telemetryWarned)
+            _policy.GetTrace().Enabled = Diagnostics;
+        if (Diagnostics && !_diagnosticsWarned)
         {
-            _telemetryWarned = true;
-            Debug.LogWarning("Motion matching telemetry/trace is ACTIVE (debug-only: per-query clones + bounded-ring enqueue, file flush at session end only). Turn off TelemetryLog for shipping builds.");
+            _diagnosticsWarned = true;
+            Debug.LogWarning("Motion matching diagnostics are ACTIVE (debug only: every query is recorded into the trace ring). Turn off MotionMatchingController.Diagnostics for shipping builds.");
         }
 
-        // The snapshot carries the caller scope only. LoopFilter/
-        // CandidateBand/YawRate ride explicit Tick params (never inferred);
-        // the core uses them verbatim. No new native struct field (bindings
-        // cap 64).
+        // The snapshot carries the caller scope only. LoopFilter/ClipGroup
+        // ride explicit Tick params (never inferred); the core uses them
+        // verbatim. No new native struct field (bindings cap 64).
         var snapshot = new MotionMatchingPlayerSnapshot
         {
             AllowedTagSet = input.AllowedTagSet ?? string.Empty,
@@ -605,21 +525,31 @@ public class MotionMatchingController : IDisposable
             UseIndexedSearch = UseIndexedSearch,
             TopKCandidates = TopKCandidates,
             VerifyIndexedSearch = VerifyIndexedSearch,
-            IndexedVerifyAuto = IndexedVerifyAuto,
-            EffectiveTelemetry = EffectiveTelemetry,
+            Diagnostics = Diagnostics,
             ContinuityWeight = ContinuityWeight,
             CostFuseThreshold = CostFuseThreshold,
             TurnPenaltyWeight = TurnPenaltyWeight,
             TurnPenaltyYawScale = TurnPenaltyYawScale,
+            PlayRateMin = PlayRateMin,
+            PlayRateMax = PlayRateMax,
+            PlayRateMinSpeed = PlayRateMinSpeed,
+            TeleportDistance = TeleportDistance,
+            WarmupTime = WarmupTime,
+            FastPathMaxAge = FastPathMaxAge,
+            FastPathMaxFrames = FastPathMaxFrames,
+            ReselectBanHistory = ReselectBanHistory,
+            ReselectBanWindow = ReselectBanWindow,
+            SameSegmentTwinBan = SameSegmentTwinBan,
+            LoopTailExclusion = LoopTailExclusion,
         };
         int callerLoop = input.LoopFilter >= 0 && input.LoopFilter <= 2 ? input.LoopFilter : 0;
-        int callerBand = input.CandidateBand >= 0 && input.CandidateBand <= 3 ? input.CandidateBand : 0;
+        int callerGroup = input.ClipGroup >= 0 ? input.ClipGroup : 0;
         float callerYaw = input.QueryYawRate >= 0.0f && input.QueryYawRate < 1e29f ? input.QueryYawRate : 0.0f;
-        float callerPlanar = input.CallerPlanarSpeed >= 0.0f && input.CallerPlanarSpeed < 1e29f ? input.CallerPlanarSpeed : 0.0f;
+        float targetSpeed = input.TargetSpeed >= 0.0f && input.TargetSpeed < 1e29f ? input.TargetSpeed : 0.0f;
         _policy.Tick(deltaTime, snapshot,
             input.Points ?? Array.Empty<TrajectoryPoint>(),
             actorWorld.GetWorld(), TrajectorySampleTimes, tuning,
-            callerLoop, callerBand, callerYaw, callerPlanar);
+            callerLoop, callerGroup, callerYaw, targetSpeed, input.HoldReseedFilter);
 
         PolicyState = _policy.PolicyState;
         WinnerSample = _policy.WinnerSample;
@@ -652,18 +582,14 @@ public class MotionMatchingController : IDisposable
         // Profiling mirrors (record-only).
         LastTickMs = _policy.LastTickMs;
         LastFastPathMs = _policy.LastFastPathMs;
-        LastTelemetryMs = _policy.LastTelemetryMs;
         TickCount = _policy.TickCount;
         FullSearchCount = _policy.FullSearchCount;
         TotalTickMs = _policy.TotalTickMs;
         TotalFullSearchMs = _policy.TotalFullSearchMs;
         TotalFastPathMs = _policy.TotalFastPathMs;
-        TotalTelemetryMs = _policy.TotalTelemetryMs;
-        TelemetryCount = _policy.GetTelemetryCount();
-        TelemetryDropped = _policy.GetTelemetryDropped();
     }
 
-    // The policy's query trace (null until the first play tick). The
+    // M6: the policy's query trace (null until the first play tick). The
     // tuning window reads it for top-N, export, and replay.
     // Borrowed handle, with the same lifetime as Playback.
     public MotionMatchingTraceLog Trace => IsReady ? _policy.GetTrace() : null;
@@ -705,15 +631,32 @@ public class MotionMatchingController : IDisposable
 
     public static PoseSearchSchema CreateDefaultSchema()
     {
-        // Skeleton ships EMPTY on purpose (no baked-in bone names): the host
-        // owning this scene overrides every bone name for its own rig
-        // (Schema → Skeleton). PoseSearchSchema.Default already carries the
-        // empty profile, so nothing is filled in here.
+        // The feature layout ships EMPTY on purpose (no rig-specific names):
+        // the host owning this scene declares RootBone, PoseBones and
+        // ContactBones for its own rig. PoseSearchSchema.Default already
+        // carries the empty declaration, so nothing is filled in here.
         var schema = PoseSearchSchema.Default;
         schema.TrajectorySampleTimes = new float[]{ -0.4f, -0.2f, 0.0f, 0.2f, 0.4f, 0.6f};
         return schema;
     }
 
+    // Copy with private arrays, so in-place host edits of the live schema
+    // arrays never alter a stored snapshot.
+    private static PoseSearchSchema SnapshotSchema(in PoseSearchSchema schema)
+    {
+        var copy = schema;
+        copy.TrajectorySampleTimes = schema.TrajectorySampleTimes != null
+            ? (float[])schema.TrajectorySampleTimes.Clone() : Array.Empty<float>();
+        copy.BoneAliases = schema.BoneAliases != null
+            ? (BoneAlias[])schema.BoneAliases.Clone() : Array.Empty<BoneAlias>();
+        copy.PoseBones = schema.PoseBones != null
+            ? (PoseFeatureBone[])schema.PoseBones.Clone() : Array.Empty<PoseFeatureBone>();
+        copy.ContactBones = schema.ContactBones != null
+            ? (ContactFeatureBone[])schema.ContactBones.Clone() : Array.Empty<ContactFeatureBone>();
+        return copy;
+    }
+
+    // Mirrors PoseSearchSchema::operator== field by field (keep in sync).
     public static bool SchemaEquals(in PoseSearchSchema a, in PoseSearchSchema b)
     {
         float AxisTolerance = 0.001f;
@@ -723,18 +666,43 @@ public class MotionMatchingController : IDisposable
             !Float3.NearEqual(Float3.Normalize(a.RootForwardAxis), Float3.Normalize(b.RootForwardAxis), AxisTolerance) ||
             !Float3.NearEqual(Float3.Normalize(a.RootUpAxis), Float3.Normalize(b.RootUpAxis), AxisTolerance) ||
             a.PoseWeight != b.PoseWeight ||
-            a.TrajectoryWeight != b.TrajectoryWeight)
+            a.TrajectoryWeight != b.TrajectoryWeight ||
+            a.ContactMaxSpeed != b.ContactMaxSpeed ||
+            a.ContactMaxHeight != b.ContactMaxHeight)
             return false;
 
-        if (a.Skeleton.Root != b.Skeleton.Root ||
-            a.Skeleton.Pelvis != b.Skeleton.Pelvis ||
-            a.Skeleton.Spine != b.Skeleton.Spine ||
-            a.Skeleton.Head != b.Skeleton.Head ||
-            a.Skeleton.LeftFoot != b.Skeleton.LeftFoot ||
-            a.Skeleton.RightFoot != b.Skeleton.RightFoot ||
-            a.Skeleton.LeftHand != b.Skeleton.LeftHand ||
-            a.Skeleton.RightHand != b.Skeleton.RightHand)
+        var aa = a.BoneAliases ?? Array.Empty<BoneAlias>();
+        var ab = b.BoneAliases ?? Array.Empty<BoneAlias>();
+        if (aa.Length != ab.Length)
             return false;
+        for (int i = 0; i < aa.Length; i++)
+        {
+            if (!string.Equals(aa[i].Channel ?? string.Empty, ab[i].Channel ?? string.Empty, StringComparison.Ordinal) ||
+                !string.Equals(aa[i].Node ?? string.Empty, ab[i].Node ?? string.Empty, StringComparison.Ordinal))
+                return false;
+        }
+
+        if (!string.Equals(a.RootBone ?? string.Empty, b.RootBone ?? string.Empty, StringComparison.Ordinal))
+            return false;
+        var pa = a.PoseBones ?? Array.Empty<PoseFeatureBone>();
+        var pb = b.PoseBones ?? Array.Empty<PoseFeatureBone>();
+        if (pa.Length != pb.Length)
+            return false;
+        for (int i = 0; i < pa.Length; i++)
+        {
+            if (!string.Equals(pa[i].Node ?? string.Empty, pb[i].Node ?? string.Empty, StringComparison.Ordinal) ||
+                !string.Equals(pa[i].Group ?? string.Empty, pb[i].Group ?? string.Empty, StringComparison.Ordinal))
+                return false;
+        }
+        var ca = a.ContactBones ?? Array.Empty<ContactFeatureBone>();
+        var cb = b.ContactBones ?? Array.Empty<ContactFeatureBone>();
+        if (ca.Length != cb.Length)
+            return false;
+        for (int i = 0; i < ca.Length; i++)
+        {
+            if (!string.Equals(ca[i].Node ?? string.Empty, cb[i].Node ?? string.Empty, StringComparison.Ordinal))
+                return false;
+        }
 
         var ta = a.TrajectorySampleTimes ?? Array.Empty<float>();
         var tb = b.TrajectorySampleTimes ?? Array.Empty<float>();

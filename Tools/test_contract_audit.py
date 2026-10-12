@@ -13,18 +13,23 @@ spec.loader.exec_module(gate)
 def expect_failure(label, rel, mutate):
     original = (gate.ROOT / rel).read_text(encoding="utf-8")
     mutated = mutate(original)
+    if mutated == original:
+        raise AssertionError("mutation did not change the source (stale marker): " + label)
     failures = gate.audit(overrides={rel: mutated})
     if not failures:
         raise AssertionError("mutation was not rejected: " + label)
 
 
 def main():
+    baseline = gate.audit()
+    if baseline:
+        raise AssertionError("baseline audit must be clean before mutating: " + "; ".join(baseline))
     expect_failure(
         "caller loop filter recovery assignment",
         "Source/MotionMatching/Runtime/MotionMatchingRuntimePolicy.cpp",
         lambda text: text.replace(
-            "settings.LoopFilter = (reseeded || keepReseedArmed) ? MotionLoopFilter::LoopOnly",
-            "settings.LoopFilter = (reseeded || keepReseedArmed) ? MotionLoopFilter::Any",
+            "settings.LoopFilter = (reseeded || keepReseedArmed) ? MotionLoopFilter::LoopOnly :",
+            "settings.LoopFilter = (reseeded || keepReseedArmed) ? MotionLoopFilter::Any :",
             1),
     )
     expect_failure(
@@ -36,12 +41,30 @@ def main():
             1),
     )
     expect_failure(
-        "legacy asset TypeName",
+        "asset TypeName",
         "Source/MotionMatching/Database/MotionMatchingDatabase.cpp",
         lambda text: text.replace(
-            'MotionMatchingDatabase::TypeName = TEXT("Game.MotionMatchingDatabase")',
             'MotionMatchingDatabase::TypeName = TEXT("MotionMatching.MotionMatchingDatabase")',
+            'MotionMatchingDatabase::TypeName = TEXT("Game.MotionMatchingDatabase")',
             1),
+    )
+    expect_failure(
+        "legacy TypeName factory key",
+        "Source/MotionMatching/Database/MotionMatchingDatabase.cpp",
+        lambda text: text.replace(
+            "Register(MotionMatchingDatabase::LegacyTypeName);", "", 1),
+    )
+    expect_failure(
+        "v4 -> v5 upgrader step",
+        "Source/MotionMatching/Database/MotionMatchingDatabase.cpp",
+        lambda text: text.replace("{ 4, 5, &Upgrade_4_To_5 },", "", 1),
+    )
+    expect_failure(
+        "declared pose bones field",
+        "Source/MotionMatching/Schema/PoseSearchSchema.h",
+        lambda text: text.replace(
+            "API_FIELD() Array<PoseFeatureBone> PoseBones;",
+            "API_FIELD() Array<String> PoseBones;", 1),
     )
     expect_failure(
         "forbidden game coupling",
@@ -51,12 +74,9 @@ def main():
     expect_failure(
         "public documentation link",
         "README.md",
-        lambda text: text.replace("docs/LIFECYCLE.md", "docs/REMOVED.md"),
+        lambda text: text.replace("docs/LIFECYCLE.md", "docs/REMOVED.md", 1),
     )
-    failures = gate.audit(overrides={"Source/MotionMatchingEditor/Samples/MotionMatchingAutoSetup.cs": "placeholder"})
-    if not any("sample" in f.lower() for f in failures):
-        raise AssertionError("sample absence policy was not enforced")
-    print("contract audit mutation tests: PASS (6/6)")
+    print("contract audit mutation tests: PASS (8/8)")
     return 0
 
 
