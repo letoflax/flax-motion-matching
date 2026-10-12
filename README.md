@@ -17,11 +17,11 @@ input-provider contract. References the engine only — never a game.
 
 ## Platform support
 
-Only Windows x64 (Flax 1.12, Development configuration, installed binary
-engine) has been built and tested. The sources avoid platform-specific code,
-but Linux, macOS, consoles, mobile, other architectures and other
-configurations are **unverified**: treat them as unsupported until someone
-builds and runs the plugin there.
+Windows x64 and Linux x64 (Flax 1.12, Development configuration, installed
+binary engine; Linux = Fedora, verified 2026-10-04) have been built and tested.
+The sources avoid platform-specific code, but macOS, consoles, mobile, other
+architectures and other configurations are **unverified**: treat them as
+unsupported until someone builds and runs the plugin there.
 
 ## Host documentation
 

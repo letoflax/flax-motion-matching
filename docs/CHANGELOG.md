@@ -161,5 +161,5 @@ registry-only (rebake required); see [MIGRATION.md](MIGRATION.md).
   (Development configuration) and checked by the offline gates after every
   milestone. Native self-tests and the live parity checks were run for M0 to M2;
   the M3 live checks (database upgrade, rebake, bind-time scenarios) are
-  tracked in the host repository's `docs/MM_PLUGIN_PRODUCTION.md`.
+  tracked in the host repository's `docs/archive/MM_PLUGIN_PRODUCTION.md`.
 - No other platform or configuration has been built or tested.
