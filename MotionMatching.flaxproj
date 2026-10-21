@@ -10,5 +10,5 @@
 			"Name": "$(EnginePath)/Flax.flaxproj"
 		}
 	],
-	"MinEngineVersion": "1.12.6912"
+	"MinEngineVersion": "1.13.7012"
 }

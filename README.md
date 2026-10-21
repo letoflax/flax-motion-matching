@@ -17,8 +17,10 @@ input-provider contract. References the engine only — never a game.
 
 ## Platform support
 
-Windows x64 and Linux x64 (Flax 1.12, Development configuration, installed
-binary engine; Linux = Fedora, verified 2026-10-04) have been built and tested.
+Windows x64 and Linux x64 (Development configuration, installed binary engine) have
+been built and tested. Windows x64 is built on Flax 1.13.7012 (minimum engine
+version of this branch); the Linux build was verified on Flax 1.12 (Fedora,
+2026-10-04) and is not re-verified on 1.13 yet. Release 0.1.0 targets Flax 1.12.
 The sources avoid platform-specific code, but macOS, consoles, mobile, other
 architectures and other configurations are **unverified**: treat them as
 unsupported until someone builds and runs the plugin there.

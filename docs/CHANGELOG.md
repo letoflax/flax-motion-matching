@@ -12,7 +12,7 @@ changes.
 | Item | Value | Where | Bump when |
 |---|---|---|---|
 | Plugin version | `1.0` (placeholder, release number pending) | `MotionMatching.flaxproj` `Version` | a release is cut |
-| Minimum engine | `1.12.6912` | `MotionMatching.flaxproj` `MinEngineVersion` | the engine API surface used changes |
+| Minimum engine | `1.13.7012` (release 0.1.0: `1.12.6912`) | `MotionMatching.flaxproj` `MinEngineVersion` | the engine API surface used changes |
 | Database `SerializedVersion` | `5` | `DECLARE_BINARY_ASSET_HEADER(MotionMatchingDatabase, 5)` in `Database/MotionMatchingDatabase.h`; upgrader chain `Upgrade_1_To_2` .. `Upgrade_4_To_5` | the binary layout changes (add an upgrader) |
 | Database `TypeName` | `MotionMatching.MotionMatchingDatabase` (legacy key `Game.MotionMatchingDatabase` still loads) | `Database/MotionMatchingDatabase.cpp` | never, unless the asset identity moves |
 | `SchemaContractRevision` | `4` | `MotionMatchingDatabase::SchemaContractRevision` | the schema contract or feature layout changes |
@@ -24,6 +24,10 @@ A database whose stored revisions differ from the compiled ones loads as
 registry-only (rebake required); see [MIGRATION.md](MIGRATION.md).
 
 ## Unreleased: M5 declared feature layout
+
+### Flax 1.13
+
+- `MinEngineVersion` is `1.13.7012`. The native module and the C# shell build unchanged on Flax 1.13.7012 (Windows x64); no source change was needed. Release 0.1.0 stays on Flax 1.12.
 
 ### Breaking changes
 
