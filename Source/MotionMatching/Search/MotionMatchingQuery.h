@@ -42,6 +42,8 @@ enum class MotionRootEvent
     TurnStart = 3,
     /// <summary>The root comes to rest on the ground plane (a stop).</summary>
     Stop = 4,
+    /// <summary>The root's planar travel reverses (a pivot): the slowest sample between the lead-in direction and the opposite one.</summary>
+    Reversal = 5,
 };
 
 /// <summary>

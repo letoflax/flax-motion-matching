@@ -39,6 +39,8 @@ namespace
             return database.GetClipRootTurnStartTime(clipIndex);
         if (kind == MotionRootEvent::Stop)
             return database.GetClipRootStopTime(clipIndex);
+        if (kind == MotionRootEvent::Reversal)
+            return database.GetClipRootReversalTime(clipIndex);
         return -1.0f;
     }
 

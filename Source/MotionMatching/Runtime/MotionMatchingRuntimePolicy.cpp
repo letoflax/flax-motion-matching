@@ -106,7 +106,7 @@ MotionMatchingRuntimePolicy::~MotionMatchingRuntimePolicy()
 
 void MotionMatchingRuntimePolicy::SetRootEventWindow(int32 kind, float timeToEvent, float tolerance)
 {
-    const bool on = kind >= 1 && kind <= 4 && tolerance > 0.0f && std::isfinite(timeToEvent) && std::isfinite(tolerance);
+    const bool on = kind >= 1 && kind <= 5 && tolerance > 0.0f && std::isfinite(timeToEvent) && std::isfinite(tolerance);
     _rootEvent = on ? kind : 0;
     _rootEventTime = on ? timeToEvent : 0.0f;
     _rootEventTolerance = on ? tolerance : 0.0f;

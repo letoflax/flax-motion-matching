@@ -103,7 +103,7 @@ public struct MotionMatchingFrameInput
 
     // 5. Root event window, a host decision like the caller filter (default
     // off): RootEvent mirrors MotionRootEvent (0 none, 1 takeoff, 2 landing,
-    // 3 turn start, 4 stop),
+    // 3 turn start, 4 stop, 5 reversal),
     // RootEventTime is the time left until that event (seconds, negative once
     // it has passed), RootEventTolerance the half-width (seconds, 0 = off).
     // Only candidates whose clip has that root event at the same distance

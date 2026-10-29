@@ -302,6 +302,12 @@ public:
     /// </summary>
     API_FUNCTION() float GetClipRootTurnStartTime(int32 clipIndex) const;
     API_FUNCTION() float GetClipRootStopTime(int32 clipIndex) const;
+    /// <summary>
+    /// Reversal (s): in a one-shot whose planar root travel turns against its lead-in direction (lead-in and
+    /// reversed speed both over the travel floor), the slowest sample between the last one still moving the
+    /// lead-in way and the first one moving the opposite way (a pivot). -1 when the clip has none.
+    /// </summary>
+    API_FUNCTION() float GetClipRootReversalTime(int32 clipIndex) const;
 
     /// <summary>
     /// Bake-statistics revision of the loaded baked data (0 = unknown or
@@ -590,6 +596,7 @@ private:
     Array<float> _clipRootLandTimes;
     Array<float> _clipRootTurnStartTimes;
     Array<float> _clipRootStopTimes;
+    Array<float> _clipRootReversalTimes;
     Array<float> _clipLengths;
     Array<int32> _clipSampleCounts;
 

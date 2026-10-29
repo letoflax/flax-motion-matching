@@ -2532,17 +2532,18 @@ bool MotionMatchingSearch::RunSelfTest(
         s.SwitchMargin = 0.0f;
         s.RootEventTolerance = 0.01f;
         int32 cursor = 0;
-        int32 probes[5] = { 0, 0, 0, 0, 0 };
+        int32 probes[6] = { 0, 0, 0, 0, 0, 0 };
         for (int32 c = 0; c < clipCount; c++)
         {
             const int32 n = clipSampleCounts[c];
             const int32 start = cursor;
             cursor += n;
-            for (int32 kind = 1; kind <= 4; kind++)
+            for (int32 kind = 1; kind <= 5; kind++)
             {
                 const float eventTime = kind == 1 ? database->GetClipRootTakeoffTime(c) :
                     (kind == 2 ? database->GetClipRootLandTime(c) :
-                    (kind == 3 ? database->GetClipRootTurnStartTime(c) : database->GetClipRootStopTime(c)));
+                    (kind == 3 ? database->GetClipRootTurnStartTime(c) :
+                    (kind == 4 ? database->GetClipRootStopTime(c) : database->GetClipRootReversalTime(c))));
                 if (eventTime < 0.0f || probes[kind] >= 3)
                     continue;
                 // The sample about 0.1 s before the event (the event sample itself when it is the first).

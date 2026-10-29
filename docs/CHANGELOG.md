@@ -53,6 +53,13 @@ registry-only (rebake required); see [MIGRATION.md](MIGRATION.md).
   the reselect ban step aside, since the window admits nothing but event samples), and the policy seeks to such a
   same-clip winner (`seek:root-event`) instead of continuing. A host can so ask for the same turn clip twice in a row,
   or re-sync a drifting landing inside its clip.
+- Reversal (2026-10-29, round 3): `MotionRootEvent.Reversal` (5) and `MotionMatchingDatabase.GetClipRootReversalTime`:
+  in a one-shot whose planar root travel turns against its lead-in direction (mean velocity of samples 1-3 over 50
+  units/s, then a sample moving the opposite way at over 50 units/s), the slowest sample between the last one still
+  moving the lead-in way (over 25 units/s) and that one (a pivot). Derived at load like the other events (no rebake,
+  hashes unchanged); the search filter, the self-test Phase S and the trace kind bits take it like the other kinds.
+  Use: a host that drives its capsule by the clip's root through a pivot asks for the reversal a fixed lead ahead,
+  so the pivot clip starts where its own braking does.
 - Use: the host predicts its own touchdown (time to land) and asks for `Landing` at that time, so a landing clip starts
   where its touchdown meets the capsule's; after touchdown it passes the negative time since then.
 

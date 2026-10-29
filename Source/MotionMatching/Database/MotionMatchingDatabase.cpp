@@ -754,6 +754,11 @@ float MotionMatchingDatabase::GetClipRootStopTime(int32 clipIndex) const
     return _clipRootStopTimes.IsValidIndex(clipIndex) ? _clipRootStopTimes[clipIndex] : -1.0f;
 }
 
+float MotionMatchingDatabase::GetClipRootReversalTime(int32 clipIndex) const
+{
+    return _clipRootReversalTimes.IsValidIndex(clipIndex) ? _clipRootReversalTimes[clipIndex] : -1.0f;
+}
+
 // One-time per load/bake, like ComputeClipTurnAngles: root height events of
 // one-shot clips from the baked root positions (height = position along the
 // planar up axis). Derived data, never serialized and never hashed (the
@@ -771,6 +776,8 @@ void MotionMatchingDatabase::ComputeClipRootEvents()
     _clipRootLandTimes.Clear();
     _clipRootTurnStartTimes.Clear();
     _clipRootStopTimes.Clear();
+    _clipRootReversalTimes.Clear();
+    constexpr float reverseSpeed = 50.0f;
     const int32 clipCount = _clipAnimations.Count();
     if (_clipSampleCounts.Count() != clipCount || _rootPositions.Count() != _sampleTimes.Count())
         return;
@@ -782,6 +789,7 @@ void MotionMatchingDatabase::ComputeClipRootEvents()
     _clipRootLandTimes.Resize(clipCount);
     _clipRootTurnStartTimes.Resize(clipCount);
     _clipRootStopTimes.Resize(clipCount);
+    _clipRootReversalTimes.Resize(clipCount);
     const bool haveForwards = _rootForwards.Count() == _rootPositions.Count();
     int32 cursor = 0;
     for (int32 c = 0; c < clipCount; c++)
@@ -790,6 +798,7 @@ void MotionMatchingDatabase::ComputeClipRootEvents()
         float land = -1.0f;
         float turnStart = -1.0f;
         float stop = -1.0f;
+        float reversal = -1.0f;
         const int32 n = _clipSampleCounts[c];
         const bool loop = _clipLooping.IsValidIndex(c) && _clipLooping[c] != 0;
         if (!loop && n >= 3 && cursor + n <= _rootPositions.Count())
@@ -863,11 +872,47 @@ void MotionMatchingDatabase::ComputeClipRootEvents()
                 travel += (planar(i) - planar(i - 1)).Length();
             if (still > 0 && travel > minTravel && times[n - 1] - times[still] >= minGround)
                 stop = times[still];
+            // Reversal: planar velocity by central differences; lead-in direction = the mean of samples 1..3.
+            if (n >= 6)
+            {
+                auto vel = [&](int32 i)
+                {
+                    const int32 a = i > 0 ? i - 1 : 0;
+                    const int32 b = i < n - 1 ? i + 1 : n - 1;
+                    const float dt = times[b] - times[a];
+                    return dt > 0.0f ? (planar(b) - planar(a)) / dt : Float3::Zero;
+                };
+                const Float3 lead = (vel(1) + vel(2) + vel(3)) / 3.0f;
+                const float leadSpeed = lead.Length();
+                if (leadSpeed > reverseSpeed)
+                {
+                    const Float3 dir = lead / leadSpeed;
+                    int32 lastForward = -1;
+                    for (int32 i = 1; i < n; i++)
+                    {
+                        const float along = Float3::Dot(vel(i), dir);
+                        if (along > reverseSpeed * 0.5f)
+                            lastForward = i;
+                        else if (along < -reverseSpeed && lastForward >= 0)
+                        {
+                            int32 slowest = lastForward;
+                            for (int32 k = lastForward; k <= i; k++)
+                            {
+                                if (vel(k).Length() < vel(slowest).Length())
+                                    slowest = k;
+                            }
+                            reversal = times[slowest];
+                            break;
+                        }
+                    }
+                }
+            }
         }
         _clipRootTakeoffTimes[c] = takeoff;
         _clipRootLandTimes[c] = land;
         _clipRootTurnStartTimes[c] = turnStart;
         _clipRootStopTimes[c] = stop;
+        _clipRootReversalTimes[c] = reversal;
         cursor += n;
     }
 }
@@ -1679,6 +1724,7 @@ void MotionMatchingDatabase::ClearBakedData()
     _clipRootLandTimes.Clear();
     _clipRootTurnStartTimes.Clear();
     _clipRootStopTimes.Clear();
+    _clipRootReversalTimes.Clear();
     _clipLengths.Clear();
     _clipSampleCounts.Clear();
     _sampleClipIndices.Clear();
