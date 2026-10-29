@@ -448,7 +448,11 @@ bool MotionMatchingQuery::BuildRawTrajectory(
             const int32 nextIndex = Math::Min(pointIndex + 1, pointCount - 1);
             const float dt = schema.TrajectorySampleTimes[nextIndex] - schema.TrajectorySampleTimes[prevIndex];
             const int32 offset = pointIndex * pointSize;
-            outTrajectory[offset + 4] = MotionMatchingSampler::ComputeYawRate(yaws[prevIndex], yaws[nextIndex], dt);
+            // Sign: the baker measures yaw in the model ground plane (atan2(x, z) of the root forward), while these
+            // yaws come from the feature plane (right = Cross(forward, up), forward). That basis is the mirror image
+            // of the (x, z) plane (2026-10-29: right turns in place matched left turn clips and the reverse, live,
+            // every time), so the yaw sense is opposite: negate to carry the same physical turn as the baked rate.
+            outTrajectory[offset + 4] = -MotionMatchingSampler::ComputeYawRate(yaws[prevIndex], yaws[nextIndex], dt);
         }
     }
 

@@ -25,6 +25,17 @@ registry-only (rebake required); see [MIGRATION.md](MIGRATION.md).
 
 ## Unreleased: M5 declared feature layout
 
+### Query yaw-rate sign (2026-10-29)
+
+- The live query's yaw-rate channel (trajectory float 4 of each point) had the opposite sign of the baked one. The baker
+  measures yaw in the model ground plane (`atan2(x, z)` of the root forward); the query derived it from directions in the
+  feature plane (`right = Cross(forward, up)`, `forward`), which is the mirror image of that plane. Every turn query
+  therefore matched turn clips of the other direction (seen live: right turns in place picked `Turn_*_L` clips and the
+  reverse, every time; the position and facing channels were consistent, so strafes and arcs were not affected).
+  `MotionMatchingQuery` now negates the query yaw rate. No database change, no rebake: `featuresHash` /
+  `clipMetadataHash` are unchanged; search 1388/1388 and playback 9/9 self-tests pass. Non-Y-up schemas use the same
+  rule (unverified on a non-Y-up rig).
+
 ### Flax 1.13
 
 - `MinEngineVersion` is `1.13.7012`. The native module and the C# shell build unchanged on Flax 1.13.7012 (Windows x64); no source change was needed. Release 0.1.0 stays on Flax 1.12.
