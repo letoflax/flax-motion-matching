@@ -260,6 +260,12 @@ bool MotionMatchingTraceLog::ExportJson(const String& path, String& error)
         FormatFloat(sb, e.TurnPenaltyWeight);
         sb.Append(",\"tpscale\":");
         FormatFloat(sb, e.TurnPenaltyYawScale);
+        sb.Append(",\"rev\":");
+        sb.Append((e.TraceFlags & TraceFlag_RootEventMask) >> TraceFlag_RootEventShift);
+        sb.Append(",\"revt\":");
+        FormatFloat(sb, e.RootEventTime);
+        sb.Append(",\"revtol\":");
+        FormatFloat(sb, e.RootEventTolerance);
         sb.Append("}\n");
     }
     String text;
@@ -479,6 +485,14 @@ bool MotionMatchingTraceLog::ParseEntry(const String& line, MotionMatchingTraceE
             flags |= TraceFlag_VerifyIndexedSearch;
         if (GetFloat(text, length, "\"excltail\":") > 0.5f)
             flags |= TraceFlag_ExcludeNonLoopTail;
+        // Root event window: absent in older traces (window off).
+        if (FindKey(text, length, "\"rev\":") >= 0)
+        {
+            const int32 kind = (int32)GetFloat(text, length, "\"rev\":");
+            flags |= (kind & 7) << TraceFlag_RootEventShift;
+            entry.RootEventTime = GetFloat(text, length, "\"revt\":");
+            entry.RootEventTolerance = GetFloat(text, length, "\"revtol\":");
+        }
         // Older traces carry firm-lock keys; they are ignored (the plugin has
         // no foot-lock prior).
         entry.TraceFlags = flags;
@@ -832,6 +846,9 @@ bool MotionMatchingTraceLog::VerifyReplay(MotionMatchingDatabase* database, int3
             settings.QueryYawRate = e.YawRate;
             settings.TurnPenaltyWeight = e.TurnPenaltyWeight;
             settings.TurnPenaltyYawScale = e.TurnPenaltyYawScale;
+            settings.RootEvent = (MotionRootEvent)((e.TraceFlags & TraceFlag_RootEventMask) >> TraceFlag_RootEventShift);
+            settings.RootEventTime = e.RootEventTime;
+            settings.RootEventTolerance = e.RootEventTolerance;
             if (!e.ExcludedTags.IsEmpty())
                 settings.ExcludeTags = MotionMatchingDatabase::SplitTagSet(e.ExcludedTags);
             MotionMatchingResult result;
@@ -841,6 +858,16 @@ bool MotionMatchingTraceLog::VerifyReplay(MotionMatchingDatabase* database, int3
             const bool wantValid = e.Valid;
             bool gotValid = result.IsValid;
             bool same = wantValid == gotValid && (!wantValid || result.SampleIndex == e.SampleIndex);
+            if (!same && e.RetryKind == 3)
+            {
+                // Root event fallback reconstruction: the window admitted
+                // nothing, the runtime re-ran the same query without it.
+                settings.RootEvent = MotionRootEvent::None;
+                MotionMatchingSearch::FindBest(database, e.Pose, e.Trajectory, settings,
+                    e.ContinuityClip, e.SinceSwitch, tags, result, error);
+                gotValid = result.IsValid;
+                same = wantValid == gotValid && (!wantValid || result.SampleIndex == e.SampleIndex);
+            }
             const bool isRetry1 = e.Recovered || e.RetryKind == 1;
             if (!same && isRetry1)
             {
@@ -852,6 +879,7 @@ bool MotionMatchingTraceLog::VerifyReplay(MotionMatchingDatabase* database, int3
                 settings.LoopFilter = MotionLoopFilter::LoopOnly;
                 settings.ReselectClip = -1;
                 settings.ReselectBanWindow = 0.0f;
+                settings.RootEvent = MotionRootEvent::None;
                 MotionMatchingSearch::FindBest(database, e.Pose, e.Trajectory, settings,
                     -1, 999.0f, tags, result, error);
                 gotValid = result.IsValid;

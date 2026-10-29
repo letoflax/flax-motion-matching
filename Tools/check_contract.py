@@ -23,10 +23,12 @@ PUBLIC_REFERENCES = {
         "struct MotionMatchingFrameInput", "public int LoopFilter;",
         "public int ClipGroup;", "public float QueryYawRate;",
         "public float TargetSpeed;", "public bool HoldReseedFilter;",
+        "public int RootEvent;", "public float RootEventTime;", "public float RootEventTolerance;",
     ),
     "Source/MotionMatching/Runtime/MotionMatchingRuntimePolicy.h": (
         "API_FUNCTION() void Initialize(", "API_FUNCTION() void Shutdown()",
         "API_FUNCTION() void ResetOnTeleport()", "API_FUNCTION() void Tick(",
+        "API_FUNCTION() void SetRootEventWindow(",
     ),
     "Source/MotionMatching/Runtime/MotionMatchingPlayback.h": (
         "API_FUNCTION() void Setup(", "API_FUNCTION() void Stop()",
@@ -45,7 +47,7 @@ PUBLIC_REFERENCES = {
         "class MOTIONMATCHING_API MotionMatchingDatabase", "GetClipTags",
         "GetClipLoop", "GetClipGroup", "ValidateSavedDatabase", "CheckSkeleton",
         "GetPoseBoneCount()", "GetContactCount()", "GetTrajectoryPointCount()",
-        "GetPlanarUpAxis()", "GetFeatureLayoutHash()",
+        "GetPlanarUpAxis()", "GetFeatureLayoutHash()", "GetClipRootTakeoffTime", "GetClipRootLandTime",
     ),
     "Source/MotionMatching/Schema/FeatureLayout.h": (
         "struct MOTIONMATCHING_API FeatureLayout", "PoseFloatsPerBone = 6",

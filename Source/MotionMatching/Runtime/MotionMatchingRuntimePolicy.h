@@ -196,6 +196,17 @@ public:
         float callerYawRate,
         float callerTargetSpeed,
         bool holdReseedFilter);
+    /// <summary>
+    /// Root event window of the following searches
+    /// (MotionMatchingSearchSettings.RootEvent / RootEventTime /
+    /// RootEventTolerance): kind 0 = off, 1 = takeoff, 2 = landing,
+    /// 3 = turn start, 4 = stop;
+    /// timeToEvent in seconds (negative once the event has passed). A host
+    /// decision per tick like the caller filter; it stays until the next
+    /// call. A window that admits no candidate in scope falls back to the
+    /// same query without it (trace retry kind 3). Reseed queries ignore it.
+    /// </summary>
+    API_FUNCTION() void SetRootEventWindow(int32 kind, float timeToEvent, float tolerance);
     API_FUNCTION() MotionMatchingPlayback* GetPlayback();
     API_FUNCTION() MotionMatchingTraceLog* GetTrace();
     API_FUNCTION() MotionMatchingTraceEntry GetLastEntry() const;
@@ -220,6 +231,7 @@ private:
         int32 Clip = -1;
         int32 ClipTime = 0;
         int32 DatabaseId = 0;
+        int32 RootEvent = 0;
     };
 
     MotionMatchingDatabase* _database = nullptr;
@@ -280,6 +292,10 @@ private:
     float _callerTargetSpeed = 0.0f;
     // Host asks to keep the structural reseed LoopOnly filter armed.
     bool _holdReseedFilter = false;
+    // Root event window (SetRootEventWindow); 0 = off.
+    int32 _rootEvent = 0;
+    float _rootEventTime = 0.0f;
+    float _rootEventTolerance = 0.0f;
 
     // Init-time tag cache only (no motion scan, no audit file).
     Array<Array<String>> _clipTags;

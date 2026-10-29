@@ -546,6 +546,7 @@ public class MotionMatchingController : IDisposable
         int callerGroup = input.ClipGroup >= 0 ? input.ClipGroup : 0;
         float callerYaw = input.QueryYawRate >= 0.0f && input.QueryYawRate < 1e29f ? input.QueryYawRate : 0.0f;
         float targetSpeed = input.TargetSpeed >= 0.0f && input.TargetSpeed < 1e29f ? input.TargetSpeed : 0.0f;
+        _policy.SetRootEventWindow(input.RootEvent, input.RootEventTime, input.RootEventTolerance);
         _policy.Tick(deltaTime, snapshot,
             input.Points ?? Array.Empty<TrajectoryPoint>(),
             actorWorld.GetWorld(), TrajectorySampleTimes, tuning,

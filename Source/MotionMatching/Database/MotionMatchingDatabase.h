@@ -249,6 +249,13 @@ public:
     API_FUNCTION()
     String GetClipTag(int32 clipIndex) const;
 
+    /// <summary>
+    /// True when the baked clip's tag set contains the tag (compared
+    /// lowercase, like the search scope). False for an invalid index.
+    /// </summary>
+    API_FUNCTION()
+    bool HasClipTag(int32 clipIndex, const String& tag) const;
+
     API_FUNCTION()
     bool GetClipLoop(int32 clipIndex) const;
 
@@ -270,6 +277,31 @@ public:
     /// at load/bake (never serialized), so no asset format change.
     /// </summary>
     float GetClipTurnAngle(int32 clipIndex) const;
+
+    /// <summary>
+    /// Root height events of a one-shot clip (seconds into the clip, -1 =
+    /// none), derived at load / bake from the baked root positions along the
+    /// planar up axis (never serialized, no asset format change). Takeoff:
+    /// the last sample still at the start height before the root rises more
+    /// than 15 units above it (a jump start). Landing: the first sample from
+    /// which the root stays within 2 units of its end height for at least
+    /// 0.2 s, after being more than 15 units above it (a landing). Loop clips
+    /// have none. The search's root event window
+    /// (MotionMatchingSearchSettings.RootEvent) reads them.
+    /// </summary>
+    API_FUNCTION() float GetClipRootTakeoffTime(int32 clipIndex) const;
+    API_FUNCTION() float GetClipRootLandTime(int32 clipIndex) const;
+
+    /// <summary>
+    /// Root yaw / planar events of a one-shot clip (seconds, -1 = none),
+    /// derived like the height events. Turn start: the last sample before
+    /// the root yaw leaves its start value by more than 3 degrees, for clips
+    /// whose total turn is at least 20 degrees. Stop: the first sample from
+    /// which the root stays within 2 units of its end position on the ground
+    /// plane for at least 0.2 s, after travelling more than 30 units.
+    /// </summary>
+    API_FUNCTION() float GetClipRootTurnStartTime(int32 clipIndex) const;
+    API_FUNCTION() float GetClipRootStopTime(int32 clipIndex) const;
 
     /// <summary>
     /// Bake-statistics revision of the loaded baked data (0 = unknown or
@@ -554,6 +586,10 @@ private:
     // speed-band slot of the byte layout (same int domain for ids 0-3).
     Array<int32> _clipGroups;
     Array<float> _clipTurnAngles;
+    Array<float> _clipRootTakeoffTimes;
+    Array<float> _clipRootLandTimes;
+    Array<float> _clipRootTurnStartTimes;
+    Array<float> _clipRootStopTimes;
     Array<float> _clipLengths;
     Array<int32> _clipSampleCounts;
 
@@ -598,6 +634,7 @@ private:
     void RebuildLayout();
     void RebuildTagCounts();
     void ComputeClipTurnAngles();
+    void ComputeClipRootEvents();
 
     // D1 §18.5 tiny pure FNV-1a helpers (no engine state, no T1 sampler
     // semantics touched). Sampling hash covers schema sampling values + the

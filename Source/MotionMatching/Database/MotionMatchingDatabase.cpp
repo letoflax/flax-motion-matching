@@ -659,6 +659,19 @@ String MotionMatchingDatabase::GetClipTag(int32 clipIndex) const
     return set.HasItems() ? set[0] : String::Empty;
 }
 
+bool MotionMatchingDatabase::HasClipTag(int32 clipIndex, const String& tag) const
+{
+    if (tag.IsEmpty())
+        return false;
+    const String lowered = tag.ToLower();
+    for (const String& t : GetClipTags(clipIndex))
+    {
+        if (t == lowered)
+            return true;
+    }
+    return false;
+}
+
 bool MotionMatchingDatabase::GetClipLoop(int32 clipIndex) const
 {
     return _clipLooping.IsValidIndex(clipIndex) &&
@@ -717,6 +730,144 @@ void MotionMatchingDatabase::ComputeClipTurnAngles()
             }
         }
         _clipTurnAngles.Add(yaw);
+        cursor += n;
+    }
+}
+
+float MotionMatchingDatabase::GetClipRootTakeoffTime(int32 clipIndex) const
+{
+    return _clipRootTakeoffTimes.IsValidIndex(clipIndex) ? _clipRootTakeoffTimes[clipIndex] : -1.0f;
+}
+
+float MotionMatchingDatabase::GetClipRootLandTime(int32 clipIndex) const
+{
+    return _clipRootLandTimes.IsValidIndex(clipIndex) ? _clipRootLandTimes[clipIndex] : -1.0f;
+}
+
+float MotionMatchingDatabase::GetClipRootTurnStartTime(int32 clipIndex) const
+{
+    return _clipRootTurnStartTimes.IsValidIndex(clipIndex) ? _clipRootTurnStartTimes[clipIndex] : -1.0f;
+}
+
+float MotionMatchingDatabase::GetClipRootStopTime(int32 clipIndex) const
+{
+    return _clipRootStopTimes.IsValidIndex(clipIndex) ? _clipRootStopTimes[clipIndex] : -1.0f;
+}
+
+// One-time per load/bake, like ComputeClipTurnAngles: root height events of
+// one-shot clips from the baked root positions (height = position along the
+// planar up axis). Derived data, never serialized and never hashed (the
+// clip metadata hash stays what the bake wrote). Thresholds in world units
+// (cm with Flax defaults) and seconds.
+void MotionMatchingDatabase::ComputeClipRootEvents()
+{
+    constexpr float rise = 15.0f;
+    constexpr float epsilon = 2.0f;
+    constexpr float minGround = 0.2f;
+    constexpr float turnLeave = 3.0f * PI / 180.0f;
+    constexpr float turnMin = 20.0f * PI / 180.0f;
+    constexpr float minTravel = 30.0f;
+    _clipRootTakeoffTimes.Clear();
+    _clipRootLandTimes.Clear();
+    _clipRootTurnStartTimes.Clear();
+    _clipRootStopTimes.Clear();
+    const int32 clipCount = _clipAnimations.Count();
+    if (_clipSampleCounts.Count() != clipCount || _rootPositions.Count() != _sampleTimes.Count())
+        return;
+    Float3 up = _planarUpAxis;
+    if (up.LengthSquared() < 0.000001f)
+        up = Float3(0.0f, 1.0f, 0.0f);
+    up.Normalize();
+    _clipRootTakeoffTimes.Resize(clipCount);
+    _clipRootLandTimes.Resize(clipCount);
+    _clipRootTurnStartTimes.Resize(clipCount);
+    _clipRootStopTimes.Resize(clipCount);
+    const bool haveForwards = _rootForwards.Count() == _rootPositions.Count();
+    int32 cursor = 0;
+    for (int32 c = 0; c < clipCount; c++)
+    {
+        float takeoff = -1.0f;
+        float land = -1.0f;
+        float turnStart = -1.0f;
+        float stop = -1.0f;
+        const int32 n = _clipSampleCounts[c];
+        const bool loop = _clipLooping.IsValidIndex(c) && _clipLooping[c] != 0;
+        if (!loop && n >= 3 && cursor + n <= _rootPositions.Count())
+        {
+            const Float3* positions = _rootPositions.Get() + cursor;
+            const float* times = _sampleTimes.Get() + cursor;
+            // Takeoff: the last sample at the start height before the rise.
+            const float h0 = Float3::Dot(positions[0], up);
+            int32 lastGround = 0;
+            for (int32 i = 0; i < n; i++)
+            {
+                const float d = Float3::Dot(positions[i], up) - h0;
+                if (d > rise)
+                {
+                    takeoff = times[lastGround];
+                    break;
+                }
+                if (d <= epsilon)
+                    lastGround = i;
+            }
+            // Landing: the start of the trailing run at the end height, held
+            // long enough, with the root well above it before.
+            const float hEnd = Float3::Dot(positions[n - 1], up);
+            int32 first = n - 1;
+            while (first > 0 && Math::Abs(Float3::Dot(positions[first - 1], up) - hEnd) <= epsilon)
+                first--;
+            float highest = -MAX_float;
+            for (int32 i = 0; i < first; i++)
+                highest = Math::Max(highest, Float3::Dot(positions[i], up));
+            if (first > 0 && highest - hEnd > rise && times[n - 1] - times[first] >= minGround)
+                land = times[first];
+            // Turn start: the last sample before the yaw leaves its start value
+            // (unwrapped on the ground plane, ComputeClipTurnAngles convention).
+            if (haveForwards && Math::Abs(GetClipTurnAngle(c)) >= turnMin)
+            {
+                const Float3* forwards = _rootForwards.Get() + cursor;
+                const Float2 f0 = PlanarFrame::Project(forwards[0], _planarUpAxis);
+                const float yaw0 = Math::Atan2(f0.X, f0.Y);
+                float yaw = yaw0;
+                float prev = yaw0;
+                int32 lastStill = 0;
+                for (int32 i = 1; i < n; i++)
+                {
+                    const Float2 f = PlanarFrame::Project(forwards[i], _planarUpAxis);
+                    if (f.X * f.X + f.Y * f.Y < 0.000001f)
+                        continue;
+                    float d = Math::Atan2(f.X, f.Y) - prev;
+                    while (d > PI)
+                        d -= TWO_PI;
+                    while (d < -PI)
+                        d += TWO_PI;
+                    prev += d;
+                    yaw = prev;
+                    if (Math::Abs(yaw - yaw0) > turnLeave)
+                    {
+                        turnStart = times[lastStill];
+                        break;
+                    }
+                    lastStill = i;
+                }
+            }
+            // Stop: the start of the trailing run at the end position on the
+            // ground plane, held long enough, after real travel.
+            auto planar = [&](int32 i) { const Float3 p = positions[i]; return p - up * Float3::Dot(p, up); };
+            const Float3 end = planar(n - 1);
+            int32 still = n - 1;
+            while (still > 0 && (planar(still - 1) - end).Length() <= epsilon)
+                still--;
+            float travel = 0.0f;
+            for (int32 i = 1; i <= still; i++)
+                travel += (planar(i) - planar(i - 1)).Length();
+            if (still > 0 && travel > minTravel && times[n - 1] - times[still] >= minGround)
+                stop = times[still];
+        }
+        _clipRootTakeoffTimes[c] = takeoff;
+        _clipRootLandTimes[c] = land;
+        _clipRootTurnStartTimes[c] = turnStart;
+        _clipRootStopTimes[c] = stop;
         cursor += n;
     }
 }
@@ -1524,6 +1675,10 @@ void MotionMatchingDatabase::ClearBakedData()
     _clipLooping.Clear();
     _clipGroups.Clear();
     _clipTurnAngles.Clear();
+    _clipRootTakeoffTimes.Clear();
+    _clipRootLandTimes.Clear();
+    _clipRootTurnStartTimes.Clear();
+    _clipRootStopTimes.Clear();
     _clipLengths.Clear();
     _clipSampleCounts.Clear();
     _sampleClipIndices.Clear();
@@ -1746,6 +1901,7 @@ Asset::LoadResult MotionMatchingDatabase::load()
     }
 
     ComputeClipTurnAngles();
+    ComputeClipRootEvents();
 
     if (stream.HasError() || !ValidateData())
     {

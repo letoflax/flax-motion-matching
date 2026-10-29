@@ -138,6 +138,7 @@ void MotionMatchingDatabase::SetBakedData(
     _sourceManifestHash = ComputeSourceManifestHash();
     _bakeToolBuildId = BakeToolBuildId;
     ComputeClipTurnAngles();
+    ComputeClipRootEvents();
 }
 
 void MotionMatchingDatabase::GetReferences(

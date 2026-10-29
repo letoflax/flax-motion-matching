@@ -81,6 +81,16 @@ Two further frame fields are host decisions the core never derives:
   plays at its authored speed. It has no other effect.
 - `HoldReseedFilter` keeps the structural reseed recovery armed (see below) for
   as long as it is true.
+- `RootEvent` / `RootEventTime` / `RootEventTolerance` set the root event
+  window (default off): `RootEvent` is `MotionRootEvent` (`0` none, `1`
+  takeoff, `2` landing, `3` turn start, `4` stop), `RootEventTime` the seconds left until that event
+  (negative once it has passed), `RootEventTolerance` the half-width in
+  seconds. Only candidates whose clip has that root event at that distance
+  rank (`MotionMatchingDatabase.GetClipRootTakeoffTime` /
+  `GetClipRootLandTime` / `GetClipRootTurnStartTime` / `GetClipRootStopTime`,
+  derived from the baked root height, yaw and planar position). A window that
+  admits nothing in scope falls back to the same query without it; reseed
+  queries ignore it. The core never decides when a window applies.
 
 ## Neutral LoopOnly invariant
 

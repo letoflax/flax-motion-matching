@@ -104,6 +104,14 @@ MotionMatchingRuntimePolicy::~MotionMatchingRuntimePolicy()
     Shutdown();
 }
 
+void MotionMatchingRuntimePolicy::SetRootEventWindow(int32 kind, float timeToEvent, float tolerance)
+{
+    const bool on = kind >= 1 && kind <= 4 && tolerance > 0.0f && std::isfinite(timeToEvent) && std::isfinite(tolerance);
+    _rootEvent = on ? kind : 0;
+    _rootEventTime = on ? timeToEvent : 0.0f;
+    _rootEventTolerance = on ? tolerance : 0.0f;
+}
+
 MotionMatchingPlayback* MotionMatchingRuntimePolicy::GetPlayback()
 {
     return _playback;
@@ -1238,6 +1246,14 @@ void MotionMatchingRuntimePolicy::RunQuery(const Array<TrajectoryPoint>& traject
     if (!_snapshot.ExcludedTagSet.IsEmpty())
         settings.ExcludeTags = GetCachedExcluded();
     settings.CollectClassDiagnostics = _tuning.Diagnostics;
+    // Root event window (host decision, SetRootEventWindow); never on a
+    // reseed query (loops carry no events).
+    if (_rootEvent != 0 && !reseeded && !keepReseedArmed)
+    {
+        settings.RootEvent = (MotionRootEvent)_rootEvent;
+        settings.RootEventTime = _rootEventTime;
+        settings.RootEventTolerance = _rootEventTolerance;
+    }
 
     // §18.8: capture the query signature this full scan anchors the fast
     // path against (clip/time cannot change until Play below).
@@ -1262,9 +1278,28 @@ void MotionMatchingRuntimePolicy::RunQuery(const Array<TrajectoryPoint>& traject
     // yaw or intent — and never widens the tag scope (same tags).
     bool recovered = false;
     int32 retryKind = 0;
+    // Root event fallback: a window that admits nothing in scope (an event
+    // nearer than every clip offers) must not hold the playing clip; re-run
+    // the same query without it. Same scope, same filters.
+    if (!result.IsValid && settings.RootEvent != MotionRootEvent::None)
+    {
+        MotionMatchingSearchSettings plain = settings;
+        plain.RootEvent = MotionRootEvent::None;
+        MotionMatchingResult plainResult;
+        String plainError;
+        MotionMatchingSearch::FindBest(_database, _latestPose, trajectory, plain,
+            continuityClip, sinceSwitch, tags, plainResult, plainError);
+        if (plainResult.IsValid)
+        {
+            result = plainResult;
+            error = plainError;
+            retryKind = 3;
+        }
+    }
     if (!result.IsValid && _playback != nullptr && _playback->IsAtEnd)
     {
         MotionMatchingSearchSettings retry = settings;
+        retry.RootEvent = MotionRootEvent::None;
         retry.CurrentTime = -1.0f;
         retry.SameClipExclusionWindow = 0.0f;
         // Recovery must always have somewhere to go: drop the reselect
@@ -1422,7 +1457,19 @@ void MotionMatchingRuntimePolicy::RunQuery(const Array<TrajectoryPoint>& traject
             _database->GetClipLoop(result.ClipIndex);
         const bool atEnd = _playback->IsAtEnd;
         const float jump = AbsF(result.SampleTime - _playback->CurrentTime);
-        if (atEnd && winnerIsLoop)
+        if (!winnerIsLoop && retryKind == 0 && settings.RootEvent != MotionRootEvent::None &&
+            jump > _tuning.SameClipSeekThreshold)
+        {
+            // Root event restart: the window admitted only event samples, so
+            // a far same-clip one-shot winner is that clip's event asked for
+            // again by the host (a second turn in place, a re-synced
+            // landing), not a stale winner.
+            _timeSinceSwitch = 0.0f;
+            SeekCount++;
+            _playback->Play(result.ClipIndex, result.SampleTime, atEnd);
+            LastSwitchReason = String(TEXT("seek:root-event"));
+        }
+        else if (atEnd && winnerIsLoop)
         {
             _timeSinceSwitch = 0.0f;
             SeekCount++;
@@ -1737,6 +1784,7 @@ MotionMatchingRuntimePolicy::FastPathSignature MotionMatchingRuntimePolicy::Capt
     sig.Clip = _currentClip;
     sig.ClipTime = Quantize(_playback != nullptr ? _playback->CurrentTime : 0.0f, 0.5f);
     sig.DatabaseId = dbId;
+    sig.RootEvent = _rootEvent;
     return sig;
 }
 
@@ -1744,7 +1792,8 @@ bool MotionMatchingRuntimePolicy::FastPathSignaturesDiffer(const FastPathSignatu
 {
     return a.AllowedHash != b.AllowedHash || a.ExcludedHash != b.ExcludedHash ||
         a.LoopFilter != b.LoopFilter || a.ClipGroup != b.ClipGroup ||
-        a.Clip != b.Clip || a.ClipTime != b.ClipTime || a.DatabaseId != b.DatabaseId;
+        a.Clip != b.Clip || a.ClipTime != b.ClipTime || a.DatabaseId != b.DatabaseId ||
+        a.RootEvent != b.RootEvent;
 }
 
 // Shared change-only scope caches: Split/Join run only when the joined
@@ -1891,6 +1940,9 @@ void MotionMatchingRuntimePolicy::RecordTrace(float speed, float yawRate, const 
     entry.QueryFrame = settings.QueryFrame;
     entry.TraceFlags = PackTraceFlags(forcedEdge, reseeded, fairFight, oneshotWindow,
         settings.UseIndexedSearch, settings.VerifyIndexedSearch, settings.ExcludeNonLoopTail);
+    entry.TraceFlags |= ((int32)settings.RootEvent & 7) << TraceFlag_RootEventShift;
+    entry.RootEventTime = settings.RootEventTime;
+    entry.RootEventTolerance = settings.RootEventTolerance;
     entry.TopKCandidates = settings.TopKCandidates;
     // Settings.ExcludeTags is always the shared change-only cache (all
     // three RunQuery call sites assign GetCachedExcluded()), so the joined

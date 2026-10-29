@@ -25,6 +25,37 @@ registry-only (rebake required); see [MIGRATION.md](MIGRATION.md).
 
 ## Unreleased: M5 declared feature layout
 
+### Root event window (2026-10-29)
+
+- New per-clip root height events, derived at load / bake from the baked root positions along the planar up axis
+  (never serialized, not hashed; no asset format change, no rebake): `MotionMatchingDatabase.GetClipRootTakeoffTime`
+  (the last sample at the start height before the root rises more than 15 units) and `GetClipRootLandTime` (the first
+  sample from which the root holds its end height, within 2 units for at least 0.2 s, after being more than 15 units
+  above it), plus `GetClipRootTurnStartTime` (the last sample before the root yaw leaves its start value by more
+  than 3 degrees, clips turning at least 20 degrees) and `GetClipRootStopTime` (the first sample from which the root
+  holds its end position on the ground plane, within 2 units for at least 0.2 s, after more than 30 units of travel).
+  Loops have none; `-1` = none.
+- New search filter `MotionMatchingSearchSettings.RootEvent` / `RootEventTime` / `RootEventTolerance` (enum
+  `MotionRootEvent`: `None`, `Takeoff`, `Landing`, `TurnStart`, `Stop`): with a kind and a positive tolerance, only candidates whose clip has
+  that event at `RootEventTime` +- `RootEventTolerance` seconds ahead of the sample rank (negative = the event has
+  passed). Brute force, indexed and top-candidate passes apply it alike. Default off, so existing hosts and the
+  self-tests see no change; `featuresHash` / `clipMetadataHash` are unchanged.
+- Host input: `MotionMatchingFrameInput.RootEvent` / `RootEventTime` / `RootEventTolerance`, passed through
+  `MotionMatchingRuntimePolicy.SetRootEventWindow` each tick. A window that admits nothing in scope re-runs the same
+  query without it (trace `retry` 3); reseed queries ignore it. The fast-path signature includes the kind.
+- Trace v3 lines gain `rev` / `revt` / `revtol` (kind in `TraceFlags` bits 7-9, two new entry fields: 63 of the 64
+  allowed); older lines import with the window off and replay unchanged.
+- `MotionMatchingDatabase.HasClipTag(clip, tag)` (scripting API): tag-set membership of a baked clip, so a host can
+  tell which clip of a scope it is playing.
+- Search self-test Phase S: an exact query a little before a clip's event wins on that sample under the window, and an
+  impossible window returns nothing.
+- Restarts: under a window, the event samples of the playing one-shot are admitted (the one-shot progression guard and
+  the reselect ban step aside, since the window admits nothing but event samples), and the policy seeks to such a
+  same-clip winner (`seek:root-event`) instead of continuing. A host can so ask for the same turn clip twice in a row,
+  or re-sync a drifting landing inside its clip.
+- Use: the host predicts its own touchdown (time to land) and asks for `Landing` at that time, so a landing clip starts
+  where its touchdown meets the capsule's; after touchdown it passes the negative time since then.
+
 ### Query yaw-rate sign (2026-10-29)
 
 - The live query's yaw-rate channel (trajectory float 4 of each point) had the opposite sign of the baked one. The baker

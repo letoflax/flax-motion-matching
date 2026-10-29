@@ -25,6 +25,26 @@ enum class MotionLoopFilter
 };
 
 /// <summary>
+/// Root height event of a one-shot clip, derived at load from the baked root
+/// positions along the planar up axis (MotionMatchingDatabase
+/// GetClipRootTakeoffTime / GetClipRootLandTime). Carries no gameplay
+/// meaning: the host decides when a window on one of them applies.
+/// </summary>
+API_ENUM()
+enum class MotionRootEvent
+{
+    None = 0,
+    /// <summary>The root leaves the height it starts at (a jump start).</summary>
+    Takeoff = 1,
+    /// <summary>The root comes down onto the height it ends at (a landing).</summary>
+    Landing = 2,
+    /// <summary>The root starts to turn (a turn clip; total yaw of at least 20 degrees).</summary>
+    TurnStart = 3,
+    /// <summary>The root comes to rest on the ground plane (a stop).</summary>
+    Stop = 4,
+};
+
+/// <summary>
 /// Search-time weights and policy. Defaults mirror the plan's Milestone 0 contract.
 /// These are per-query overrides: the C# policy layer is responsible for seeding
 /// them from the database schema snapshot (schema weights are stored, never baked).
@@ -215,6 +235,19 @@ struct MOTIONMATCHING_API MotionMatchingSearchSettings
 
     /// <summary>Collects exact loop/one-shot diagnostics with an extra full scan.</summary>
     API_FIELD() bool CollectClassDiagnostics = false;
+
+    /// <summary>
+    /// Root event window (time-to-event matching): with RootEvent set and
+    /// RootEventTolerance &gt; 0, a candidate is admissible only when its clip
+    /// has that root event and (event time - sample time) lies within
+    /// RootEventTolerance seconds of RootEventTime. RootEventTime is the time
+    /// left until the event (negative once it has passed), so a landing clip
+    /// can be entered where its own touchdown meets the predicted one. Clips
+    /// without the event are skipped while the window is on. Default off.
+    /// </summary>
+    API_FIELD() MotionRootEvent RootEvent = MotionRootEvent::None;
+    API_FIELD() float RootEventTime = 0.0f;
+    API_FIELD() float RootEventTolerance = 0.0f;
 
     /// <summary>
     /// Multi-tag exclusion set: candidates carrying ANY of these tags are

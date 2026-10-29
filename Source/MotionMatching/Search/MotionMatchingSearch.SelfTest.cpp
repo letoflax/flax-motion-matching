@@ -711,8 +711,13 @@ bool MotionMatchingSearch::RunSelfTest(
             phaseDTest++;
             tested++;
             probes++;
-            // Same verdict contract as exact queries (ties allowed but ordered).
-            bool ok = error.IsEmpty() && result.IsValid && result.Cost <= SelfTestMaxCost;
+            // Same verdict contract as exact queries (ties allowed but ordered),
+            // including the source clip's own straightness prior like Phase A:
+            // a probe that lands on a turn clip pays its prior even on the exact
+            // sample (seen when a rebake reordered the clips).
+            const float sourcePenalty = TurnPenalty(database->GetClipTurnAngle(sourceClip), noExcl.QueryYawRate,
+                noExcl.TurnPenaltyWeight, noExcl.TurnPenaltyYawScale);
+            bool ok = error.IsEmpty() && result.IsValid && result.Cost <= sourcePenalty + SelfTestMaxCost;
             if (ok)
             {
                 phaseDPass++;
@@ -2507,6 +2512,78 @@ bool MotionMatchingSearch::RunSelfTest(
         }
     }
     log += String::Format(TEXT("Phase R (one-shot progression/back-exclude): {}/{} passed.\n"), phaseRPass, phaseRTest);
+
+    // Phase S: root event window. An exact query of a sample some time before
+    // its clip's root event, with the window set to that time, must win on
+    // that sample (admissible, zero cost); the same query with a window no
+    // clip can meet must return nothing (the policy, not the search, owns the
+    // fallback). Databases without root events skip the phase.
+    int32 phaseSTest = 0;
+    int32 phaseSPass = 0;
+    {
+        const Array<float>& sampleTimesArr = database->GetSampleTimes();
+        MotionMatchingSearchSettings s = settings;
+        s.ExcludeNonLoopTail = false;
+        s.LoopTailExclusion = 0.0f;
+        s.CurrentTime = -1.0f;
+        s.ExpectedTime = -1.0f;
+        s.SameClipExclusionWindow = 0.0f;
+        s.ContinuingBias = 0.0f;
+        s.SwitchMargin = 0.0f;
+        s.RootEventTolerance = 0.01f;
+        int32 cursor = 0;
+        int32 probes[5] = { 0, 0, 0, 0, 0 };
+        for (int32 c = 0; c < clipCount; c++)
+        {
+            const int32 n = clipSampleCounts[c];
+            const int32 start = cursor;
+            cursor += n;
+            for (int32 kind = 1; kind <= 4; kind++)
+            {
+                const float eventTime = kind == 1 ? database->GetClipRootTakeoffTime(c) :
+                    (kind == 2 ? database->GetClipRootLandTime(c) :
+                    (kind == 3 ? database->GetClipRootTurnStartTime(c) : database->GetClipRootStopTime(c)));
+                if (eventTime < 0.0f || probes[kind] >= 3)
+                    continue;
+                // The sample about 0.1 s before the event (the event sample itself when it is the first).
+                int32 source = -1;
+                for (int32 i = 0; i < n; i++)
+                {
+                    if (sampleTimesArr[start + i] <= eventTime - 0.1f || source < 0)
+                        source = start + i;
+                }
+                if (source < 0)
+                    continue;
+                probes[kind]++;
+                buildExactQuery(source, queryPose, queryTrajectory);
+                s.RootEvent = (MotionRootEvent)kind;
+                s.RootEventTime = eventTime - sampleTimesArr[source];
+                MotionMatchingResult result;
+                String error;
+                FindBest(database, queryPose, queryTrajectory, s, -1, MAX_float, noTags, result, error);
+                phaseSTest++;
+                tested++;
+                const bool hit = error.IsEmpty() && result.IsValid && result.SampleIndex == source;
+                MotionMatchingSearchSettings never = s;
+                never.RootEventTime = 1000.0f;
+                MotionMatchingResult none;
+                String noneError;
+                FindBest(database, queryPose, queryTrajectory, never, -1, MAX_float, noTags, none, noneError);
+                if (hit && !none.IsValid)
+                {
+                    phaseSPass++;
+                    passed++;
+                }
+                else
+                {
+                    log += String::Format(
+                        TEXT("Root-event FAIL: kind {} clip {} source {} (winner={} valid={} err='{}', impossible window valid={}).\n"),
+                        kind, c, source, result.SampleIndex, result.IsValid, error, none.IsValid);
+                }
+            }
+        }
+    }
+    log += String::Format(TEXT("Phase S (root event window): {}/{} passed.\n"), phaseSPass, phaseSTest);
 
     const auto endTime = std::chrono::high_resolution_clock::now();
     const double milliseconds = std::chrono::duration<double, std::milli>(endTime - startTime).count();

@@ -100,6 +100,20 @@ public struct MotionMatchingFrameInput
     // still settling after ResetPlayback or a teleport.
     public float TargetSpeed;
     public bool HoldReseedFilter;
+
+    // 5. Root event window, a host decision like the caller filter (default
+    // off): RootEvent mirrors MotionRootEvent (0 none, 1 takeoff, 2 landing,
+    // 3 turn start, 4 stop),
+    // RootEventTime is the time left until that event (seconds, negative once
+    // it has passed), RootEventTolerance the half-width (seconds, 0 = off).
+    // Only candidates whose clip has that root event at the same distance
+    // rank, so a landing clip can start where its own touchdown meets the
+    // predicted one; a window that admits nothing falls back to the plain
+    // query. Event times are derived from the baked root height
+    // (MotionMatchingDatabase.GetClipRootTakeoffTime / GetClipRootLandTime).
+    public int RootEvent;
+    public float RootEventTime;
+    public float RootEventTolerance;
 }
 
 // Scope crosses into the core only through MotionMatchingFrameInput above;

@@ -19,6 +19,37 @@ namespace
     constexpr float MinimumStandardDeviation = 0.000001f;
     constexpr float SelfTestMaxCost = 0.0001f;
 
+    // Root event window (settings.RootEvent): on only with a kind, a positive
+    // tolerance and finite values. Exclusion-only (never lowers a cost), so
+    // block pruning needs no headroom; the same rule runs in every pass.
+    bool RootEventWindowOn(const MotionMatchingSearchSettings& settings)
+    {
+        return settings.RootEvent != MotionRootEvent::None && settings.RootEventTolerance > 0.0f &&
+            std::isfinite(settings.RootEventTime) && std::isfinite(settings.RootEventTolerance);
+    }
+
+    // Event time of one clip for the window's kind (-1 = the clip has none).
+    float RootEventTimeOf(const MotionMatchingDatabase& database, MotionRootEvent kind, int32 clipIndex)
+    {
+        if (kind == MotionRootEvent::Takeoff)
+            return database.GetClipRootTakeoffTime(clipIndex);
+        if (kind == MotionRootEvent::Landing)
+            return database.GetClipRootLandTime(clipIndex);
+        if (kind == MotionRootEvent::TurnStart)
+            return database.GetClipRootTurnStartTime(clipIndex);
+        if (kind == MotionRootEvent::Stop)
+            return database.GetClipRootStopTime(clipIndex);
+        return -1.0f;
+    }
+
+    // Admissible under the window: the clip has the event and the time left
+    // to it from this sample is within tolerance of the requested time.
+    bool RootEventAdmits(const MotionMatchingSearchSettings& settings, float clipEventTime, float sampleTime)
+    {
+        return clipEventTime >= 0.0f &&
+            Math::Abs(clipEventTime - sampleTime - settings.RootEventTime) <= settings.RootEventTolerance;
+    }
+
     // Straightness prior (host-owned tuning via settings): penalty = |clipTurnAngle| * Weight /
     // (1 + yawRate * YawScale). Recorded in the trace; brute-force, indexed
     // and replay share this one definition.
@@ -520,6 +551,11 @@ namespace
             return true;
         if (settings.CurrentTime < 0.0f || settings.ExpectedTime < 0.0f)
             return true;
+        // A root event window admits only event samples (checked before this
+        // in every pass): one of the playing one-shot is a restart at its
+        // event (a second turn in place, a re-synced landing), not a reseek.
+        if (RootEventWindowOn(settings))
+            return true;
         const float window = Math::Max(settings.ContinuingWindow, 0.0f);
         return Math::Abs(sampleTime - settings.ExpectedTime) <= window;
     }
@@ -853,6 +889,8 @@ namespace
         int32 cachedGroup = 0;
         // Start of the non-searchable tail for the cached clip (-1 = none).
         float cachedTailStart = -1.0f;
+        const bool eventWindow = RootEventWindowOn(settings);
+        float cachedEventTime = -1.0f;
         const bool wantLoop = settings.LoopFilter == MotionLoopFilter::LoopOnly;
         const bool wantOneShot = settings.LoopFilter == MotionLoopFilter::OneShotOnly;
         // One-shot group filter: restrict ONE-SHOTs to the requested clip
@@ -884,6 +922,7 @@ namespace
                 if (tailExclusion > 0.0f && !cachedLoopFlag && haveLengths &&
                     clipLengths[clipIndex] > tailExclusion)
                     cachedTailStart = clipLengths[clipIndex] - tailExclusion;
+                cachedEventTime = eventWindow ? RootEventTimeOf(database, settings.RootEvent, clipIndex) : -1.0f;
             }
             if ((wantLoop && !cachedLoopFlag) || (wantOneShot && cachedLoopFlag))
                 continue;
@@ -908,11 +947,13 @@ namespace
                 MotionMatchingSampler::IsNonLoopFutureOutside(
                     sampleTimes[sampleIndex], trajectoryHorizon, clipLengths[clipIndex], cachedLoopFlag))
                 continue;
+            if (eventWindow && !RootEventAdmits(settings, cachedEventTime, sampleTimes[sampleIndex]))
+                continue;
             // Reselect-history ban (UE PoseReselectHistory): the recently
             // played (clip,sample) neighborhood cannot re-win. Kills A->B->A
             // chatter between near-twins; legitimate returns at another phase
             // (outside the window) still win fairly.
-            if (useReselectBan && clipIndex == settings.ReselectClip &&
+            if (useReselectBan && clipIndex == settings.ReselectClip && !(eventWindow && clipIndex == currentClipIndex) &&
                 TimeDistance(database, clipIndex, settings.ReselectSampleTime, sampleTimes[sampleIndex]) <= reselectWindow)
                 continue;
             // Natural continuation: same clip, near the expected playback
@@ -1346,6 +1387,8 @@ namespace
         float cachedTurnAngle = 0.0f;
         int32 cachedGroup = 0;
         float cachedTailStart = -1.0f;
+        const bool eventWindow = RootEventWindowOn(settings);
+        float cachedEventTime = -1.0f;
         // Tags resolve on the clip-change tick below (candidates arrive in
         // ascending sample order, still clip-grouped); empty scope skips it.
         const bool checkTags = !allowedTags.IsEmpty() || !settings.ExcludeTags.IsEmpty();
@@ -1371,6 +1414,7 @@ namespace
                 if (tailExclusion > 0.0f && !cachedLoopFlag && haveLengths &&
                     clipLengths[clipIndex] > tailExclusion)
                     cachedTailStart = clipLengths[clipIndex] - tailExclusion;
+                cachedEventTime = eventWindow ? RootEventTimeOf(database, settings.RootEvent, clipIndex) : -1.0f;
             }
             if ((wantLoop && !cachedLoopFlag) || (wantOneShot && cachedLoopFlag))
                 continue;
@@ -1387,7 +1431,9 @@ namespace
                 MotionMatchingSampler::IsNonLoopFutureOutside(
                     sampleTimes[sampleIndex], trajectoryHorizon, clipLengths[clipIndex], cachedLoopFlag))
                 continue;
-            if (useReselectBan && clipIndex == settings.ReselectClip &&
+            if (eventWindow && !RootEventAdmits(settings, cachedEventTime, sampleTimes[sampleIndex]))
+                continue;
+            if (useReselectBan && clipIndex == settings.ReselectClip && !(eventWindow && clipIndex == currentClipIndex) &&
                 TimeDistance(database, clipIndex, settings.ReselectSampleTime, sampleTimes[sampleIndex]) <= reselectWindow)
                 continue;
             const bool isContinuation = IsContinuationSample(
@@ -1630,6 +1676,8 @@ void MotionMatchingSearch::FindTopCandidates(
     float cachedTurnAngle = 0.0f;
     int32 cachedGroup = 0;
     float cachedTailStart = -1.0f;
+    const bool eventWindow = RootEventWindowOn(settings);
+    float cachedEventTime = -1.0f;
     // Tooling path too: tags resolve once per clip, not per sample.
     const bool checkTags = !allowedTags.IsEmpty();
     bool cachedTagOk = true;
@@ -1650,6 +1698,7 @@ void MotionMatchingSearch::FindTopCandidates(
             if (tailExclusion > 0.0f && !cachedLoopFlag && haveLengths &&
                 clipLengths[clipIndex] > tailExclusion)
                 cachedTailStart = clipLengths[clipIndex] - tailExclusion;
+            cachedEventTime = eventWindow ? RootEventTimeOf(*database, settings.RootEvent, clipIndex) : -1.0f;
         }
         if ((wantLoop && !cachedLoopFlag) || (wantOneShot && cachedLoopFlag))
             continue;
@@ -1664,7 +1713,9 @@ void MotionMatchingSearch::FindTopCandidates(
             MotionMatchingSampler::IsNonLoopFutureOutside(
                 sampleTimes[sampleIndex], trajectoryHorizon, clipLengths[clipIndex], cachedLoopFlag))
             continue;
-        if (useReselectBan && clipIndex == settings.ReselectClip &&
+        if (eventWindow && !RootEventAdmits(settings, cachedEventTime, sampleTimes[sampleIndex]))
+            continue;
+        if (useReselectBan && clipIndex == settings.ReselectClip && !(eventWindow && clipIndex == currentClipIndex) &&
             TimeDistance(*database, clipIndex, settings.ReselectSampleTime, sampleTimes[sampleIndex]) <= reselectWindow)
             continue;
         const bool isContinuation = IsContinuationSample(

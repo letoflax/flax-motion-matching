@@ -23,6 +23,9 @@ constexpr int32 TraceFlag_OneshotWindow = 1 << 3;
 constexpr int32 TraceFlag_UseIndexedSearch = 1 << 4;
 constexpr int32 TraceFlag_VerifyIndexedSearch = 1 << 5;
 constexpr int32 TraceFlag_ExcludeNonLoopTail = 1 << 6;
+// Three bits: the MotionRootEvent kind of the query's root event window.
+constexpr int32 TraceFlag_RootEventShift = 7;
+constexpr int32 TraceFlag_RootEventMask = 7 << TraceFlag_RootEventShift;
 
 /// <summary>
 /// One recorded search: everything needed to re-run it bit-exactly.
@@ -132,6 +135,9 @@ struct MOTIONMATCHING_API MotionMatchingTraceEntry
     // indexed and replay share one formula.
     API_FIELD() float TurnPenaltyWeight = 0.03f;
     API_FIELD() float TurnPenaltyYawScale = 4.0f;
+    // Root event window actually applied (kind in TraceFlags bits 7-9).
+    API_FIELD() float RootEventTime = 0.0f;
+    API_FIELD() float RootEventTolerance = 0.0f;
 };
 
 /// <summary>
